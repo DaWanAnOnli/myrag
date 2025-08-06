@@ -1,1 +1,10 @@
 fastapi[standard]
+requests
+paddlepaddle==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+paddleocr
+setuptools
+PyMuPDF
+pillow
+easyocr
+pdf2image
+PyPDF2
