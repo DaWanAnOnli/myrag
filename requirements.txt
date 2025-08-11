@@ -8,3 +8,9 @@ pillow
 easyocr
 pdf2image
 PyPDF2
+google-generativeai
+neo4j
+tenacity
+python-dotenv
+tiktoken
+langchain

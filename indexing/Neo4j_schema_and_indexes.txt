@@ -1,0 +1,19 @@
+// Uniqueness constraints
+CREATE CONSTRAINT entity_key IF NOT EXISTS
+FOR (e:Entity) REQUIRE e.key IS UNIQUE;
+
+CREATE CONSTRAINT triple_uid IF NOT EXISTS
+FOR (t:Triple) REQUIRE t.triple_uid IS UNIQUE;
+
+// Vector indexes (768 dims for text-embedding-004; cosine similarity)
+CREATE VECTOR INDEX entity_vec IF NOT EXISTS
+FOR (e:Entity) ON (e.embedding)
+OPTIONS { indexConfig: { `vector.dimensions`: 768, `vector.similarity_function`: 'cosine' } };
+
+CREATE VECTOR INDEX triple_vec IF NOT EXISTS
+FOR (t:Triple) ON (t.embedding)
+OPTIONS { indexConfig: { `vector.dimensions`: 768, `vector.similarity_function`: 'cosine' } };
+
+// Optional: full-text on entity names
+CREATE FULLTEXT INDEX entity_name_fts IF NOT EXISTS
+FOR (e:Entity) ON EACH [e.name];
