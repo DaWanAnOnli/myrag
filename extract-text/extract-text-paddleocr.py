@@ -11,6 +11,7 @@ import numpy as np
 from PyPDF2 import PdfReader
 import difflib
 import re
+import paddle
 
 # ======================
 # OCR/Rendering Configuration (new)
@@ -561,6 +562,18 @@ def save_pdf_result_to_json(pdf_result, output_dir, pdf_filename):
         print(f"  ❌ Error saving {pdf_filename} results: {e}")
         return False
 
+
+def check_gpu():
+    if paddle.is_compiled_with_cuda():
+        print("PaddlePaddle is compiled with CUDA support.")
+        if paddle.get_device() == "gpu":
+            print("PaddlePaddle is using the GPU.")
+        else:
+            print("PaddlePaddle is using the CPU.")
+    else:
+        print("PaddlePaddle is not compiled with CUDA support. Using CPU.")
+
+check_gpu()
 
 def main():
     # ======================

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import fitz  # PyMuPDF
 from paddleocr import PaddleOCR
+import paddle
 
 # -------------------- Configuration --------------------
 PDF_PATH = "../dataset/pdfs/samples/UU Nomor 44 Tahun 2007.pdf"
@@ -27,6 +28,17 @@ OCR_OPTIONS = dict(
 )
 # -------------------------------------------------------
 
+def check_gpu():
+    if paddle.is_compiled_with_cuda():
+        print("PaddlePaddle is compiled with CUDA support.")
+        if paddle.get_device() == "gpu":
+            print("PaddlePaddle is using the GPU.")
+        else:
+            print("PaddlePaddle is using the CPU.")
+    else:
+        print("PaddlePaddle is not compiled with CUDA support. Using CPU.")
+
+check_gpu()
 
 def main():
     base_dir = Path(__file__).parent if "__file__" in globals() else Path.cwd()

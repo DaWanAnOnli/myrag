@@ -1,6 +1,5 @@
 fastapi[standard]
 requests
-paddlepaddle==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
 paddleocr
 setuptools
 PyMuPDF
@@ -14,3 +13,6 @@ tenacity
 python-dotenv
 tiktoken
 langchain
+wheel
+numpy
+opencv-python
