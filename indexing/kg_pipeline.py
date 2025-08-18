@@ -16,13 +16,12 @@ load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
 # ----------------- Config from env with sensible defaults -----------------
 GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY"]
 
-GEN_MODEL = os.getenv("GEN_MODEL", "models/gemini-2.5-flash")
+GEN_MODEL = os.getenv("GEN_MODEL", "models/gemini-2.5-flash-lite")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "models/text-embedding-004")
 
 # Directory of LangChain per-document pickle files
 DEFAULT_LANGCHAIN_DIR = (Path(__file__).resolve().parent / "../dataset/langchain-results/samples").resolve()
-LANGCHAIN_DIR = Path(os.getenv("LANGCHAIN_DIR") or str(DEFAULT_LANGCHAIN_DIR))
-
+LANGCHAIN_DIR = DEFAULT_LANGCHAIN_DIR
 # Neo4j
 NEO4J_URI  = os.getenv("NEO4J_URI",  "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
@@ -44,7 +43,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 ENFORCE_API_BUDGET = _env_bool("ENFORCE_API_BUDGET", True)
 # Set the default budget to 20 as requested
-API_BUDGET_TOTAL = int(os.getenv("API_BUDGET_TOTAL", "100"))
+API_BUDGET_TOTAL = int(os.getenv("API_BUDGET_TOTAL", "150"))
 COUNT_EMBEDDINGS_IN_BUDGET = _env_bool("COUNT_EMBEDDINGS_IN_BUDGET", False)
 
 # Files to skip explicitly

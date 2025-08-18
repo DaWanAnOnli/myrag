@@ -160,3 +160,9 @@ act.json
 
 # dataset
 dataset
+
+# retrieval logs
+retrieval/*.txt
+
+# generate kg pipeline codes
+indexing/.kg_runs

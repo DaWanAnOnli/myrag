@@ -8,8 +8,8 @@ from threading import Barrier
 MODEL = "gemini-2.5-flash-lite"
 ENDPOINT = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
 
-API_KEY_1 = "AIzaSyAGFGYlU-RtARNjPkbSWbNSrkfJCsNf3hc"
-API_KEY_2 = "AIzaSyAMDDFO9E0ze_7UOOJbqJvV_h-mIQ67-OM"
+API_KEY_1 = "AIzaSyBaa9146OHSEQ05jZWSX61ipsxgAy3s56k"
+API_KEY_2 = "AIzaSyAYe82NWwBA18QrvicPVIQgKE9HBjp4_gA"
 
 if not API_KEY_1 or not API_KEY_2:
     raise SystemExit("Please set GEMINI_API_KEY_1 and GEMINI_API_KEY_2 in your environment.")
