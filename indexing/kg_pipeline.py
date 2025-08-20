@@ -1,4 +1,4 @@
-import os, json, hashlib, time, threading, pickle, math
+import os, json, hashlib, time, threading, pickle, math, re
 from collections import deque
 from typing import Dict, Any, List, Tuple, Optional
 from pathlib import Path
@@ -7,7 +7,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 import google.generativeai as genai
 from google.generativeai.types import GenerationConfig
-from tenacity import retry, wait_exponential, stop_after_attempt, RetryError
 from neo4j import GraphDatabase
 
 # ----------------- Load .env from the parent directory -----------------
@@ -31,7 +30,6 @@ NEO4J_PASS = os.getenv("NEO4J_PASS", "@ik4nkus")
 LLM_MAX_CALLS_PER_MIN = int(os.getenv("LLM_MAX_CALLS_PER_MIN", "13"))
 
 # Parallelism
-# Set to 13 as requested (still gated by the rate limiter)
 INDEX_WORKERS = int(os.getenv("INDEX_WORKERS", "13"))
 
 # API budget controls
@@ -42,7 +40,6 @@ def _env_bool(name: str, default: bool) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "y", "on")
 
 ENFORCE_API_BUDGET = _env_bool("ENFORCE_API_BUDGET", True)
-# Set the default budget to 20 as requested
 API_BUDGET_TOTAL = int(os.getenv("API_BUDGET_TOTAL", "150"))
 COUNT_EMBEDDINGS_IN_BUDGET = _env_bool("COUNT_EMBEDDINGS_IN_BUDGET", False)
 
@@ -56,11 +53,20 @@ EMBED_DIM = 768
 PROMPT_TOKEN_LIMIT = int(os.getenv("PROMPT_TOKEN_LIMIT", "8000"))
 PRACTICAL_MAX_ITEMS_PER_BATCH = int(os.getenv("PRACTICAL_MAX_ITEMS_PER_BATCH", "40"))
 
+# Single-chunk parse error split threshold
+SINGLE_PARSE_SPLIT_AFTER = int(os.getenv("SINGLE_PARSE_SPLIT_AFTER", "2"))
+
+# JSON output directory (must already exist; do not create it)
+JSON_OUTPUT_DIR = Path(os.getenv("JSON_OUTPUT_DIR", str((Path(__file__).resolve().parent / "../../dataset/llm-json-outputs").resolve())))
+if not JSON_OUTPUT_DIR.exists() or not JSON_OUTPUT_DIR.is_dir():
+    raise FileNotFoundError(f"JSON_OUTPUT_DIR does not exist or is not a directory: {JSON_OUTPUT_DIR}. Please create it or set JSON_OUTPUT_DIR.")
+
 # ----------------- Initialize SDKs -----------------
 genai.configure(api_key=GOOGLE_API_KEY)
 try:
     gen_model = genai.GenerativeModel(GEN_MODEL)
     print(f"Using generation model: {GEN_MODEL}")
+    print(f"LLM JSON outputs directory: {JSON_OUTPUT_DIR}")
 except Exception as e:
     raise RuntimeError(f"Failed to initialize GenerativeModel {GEN_MODEL}: {e}")
 
@@ -223,6 +229,12 @@ API_BUDGET = ApiBudget(total=API_BUDGET_TOTAL, enforce=ENFORCE_API_BUDGET, count
 def _slug(s: str) -> str:
     return " ".join((s or "").strip().split()).lower()
 
+def sanitize_filename_component(s: str) -> str:
+    s = (s or "").strip().lower().replace(" ", "-")
+    s = re.sub(r"[^a-z0-9_\-+]", "", s)
+    s = re.sub(r"-{2,}", "-", s)
+    return s or "unknown"
+
 def normalize_entity_key(text: str, etype: str, uu_number: Optional[str] = None) -> str:
     if etype in ("UU", "PASAL", "AYAT") and uu_number:
         return f"{etype}::{_slug(uu_number)}::{_slug(text)}"
@@ -242,6 +254,93 @@ def deterministic_triple_uid(
 def estimate_tokens_for_text(text: str) -> int:
     # Rough heuristic: ~3.5 chars/token to be conservative
     return max(1, int(len(text) / 3.5))
+
+def aggregate_pages(items_metas: List[Dict[str, Any]]) -> List[int]:
+    pages: set[int] = set()
+    for m in items_metas:
+        p = m.get("pages")
+        if isinstance(p, (list, tuple, set)):
+            for x in p:
+                if isinstance(x, int):
+                    pages.add(x)
+                elif isinstance(x, str):
+                    for tok in re.split(r"[,\s\-]+", x):
+                        if tok.isdigit():
+                            pages.add(int(tok))
+        elif isinstance(p, int):
+            pages.add(p)
+        elif isinstance(p, str):
+            for tok in re.split(r"[,\s\-]+", p):
+                if tok.isdigit():
+                    pages.add(int(tok))
+    return sorted(pages)
+
+def build_json_output_filename(context: Dict[str, Any]) -> Path:
+    kind = context.get("kind", "batch")
+    items_metas: List[Dict[str, Any]] = context.get("items_metas", [])
+    items_count = context.get("items_count", len(items_metas) or "?")
+
+    uu_set = {m.get("uu_number") for m in items_metas if m.get("uu_number")}
+    if len(uu_set) == 1:
+        uu_lab = f"uu-{sanitize_filename_component(list(uu_set)[0])}"
+    elif len(uu_set) == 0:
+        uu_lab = "uu-unknown"
+    else:
+        uu_lab = "uu-multi"
+
+    pages_sorted = aggregate_pages(items_metas)
+    if pages_sorted:
+        pmin, pmax = pages_sorted[0], pages_sorted[-1]
+        pages_lab = f"p-{pmin}" if pmin == pmax else f"p-{pmin}-{pmax}"
+    else:
+        pages_lab = "p-unknown"
+
+    chunk_ids = [m.get("chunk_id") or "" for m in items_metas]
+    short = hashlib.sha1("|".join(sorted(chunk_ids)).encode("utf-8")).hexdigest()[:8]
+    ts = time.strftime("%Y%m%d-%H%M%S")
+
+    fname = f"{uu_lab}__{pages_lab}__{kind}__n{items_count}__{ts}_{short}.json"
+    return (JSON_OUTPUT_DIR / fname)
+
+def save_llm_json_output(data: Dict[str, Any], context: Dict[str, Any]) -> None:
+    try:
+        out_path = build_json_output_filename(context)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print(f"[LLM] Saved JSON output: {out_path}")
+    except Exception as e:
+        print(f"[LLM] Warning: failed to save JSON output: {e}")
+
+def split_text_in_two(text: str) -> Tuple[str, str]:
+    """
+    Split text into two halves near the middle, preferring paragraph/sentence/space boundaries.
+    """
+    n = len(text)
+    if n <= 1:
+        return text, ""
+    mid = n // 2
+    window = 300
+    start = max(0, mid - window)
+    end = min(n, mid + window)
+    seps = ["\n\n", "\n", ". ", " "]
+    best_idx = None
+    for sep in seps:
+        li = text.rfind(sep, 0, mid)
+        ri = text.find(sep, mid, end)
+        candidates = []
+        if li != -1:
+            candidates.append((abs(mid - (li + len(sep)//2)), li + len(sep)))
+        if ri != -1:
+            candidates.append((abs(ri - mid), ri + len(sep)))
+        if candidates:
+            candidates.sort(key=lambda x: x[0])
+            best_idx = candidates[0][1]
+            break
+    if best_idx is None:
+        best_idx = mid
+    left = text[:best_idx].strip()
+    right = text[best_idx:].strip()
+    return left, right
 
 # ----------------- Prompt builders -----------------
 def build_single_prompt(meta: Dict[str, Any], chunk_text: str) -> str:
@@ -269,25 +368,68 @@ def build_batch_prompt(items: List[Dict[str, Any]]) -> str:
         )
     return intro + "\n\nChunks:\n" + "\n\n".join(lines)
 
-# ----------------- LLM Extraction -----------------
-@retry(wait=wait_exponential(multiplier=1, min=2, max=30), stop=stop_after_attempt(5), reraise=True)
-def extract_triples_from_chunk(chunk_text: str, meta: Dict[str, Any], prompt_override: Optional[str] = None) -> Tuple[List[Dict[str, Any]], float]:
+# ----------------- Error classification -----------------
+class RateLimitError(Exception):
+    pass
+
+class JsonParseError(Exception):
+    pass
+
+def is_rate_limit_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    if "429" in msg or "rate limit" in msg or "too many requests" in msg or "quota" in msg or "resourceexhausted" in msg or "resource exhausted" in msg:
+        return True
+    code = getattr(e, "code", None)
+    if code == 429:
+        return True
+    status = getattr(e, "status", None) or getattr(e, "reason", None)
+    if isinstance(status, str) and ("exhausted" in status.lower() or "429" in status):
+        return True
+    return False
+
+# ----------------- LLM call wrapper (logs every attempt) -----------------
+def run_llm_json(prompt: str, schema: dict, context: Dict[str, Any]) -> Tuple[Dict[str, Any], float]:
+    """
+    Makes a single LLM call with JSON schema and returns parsed JSON and duration.
+    Raises RateLimitError, JsonParseError, or RuntimeError on other failures.
+    Logs every attempt before calling the LLM.
+    Budget note: budget is charged ONLY after successful call and JSON parsing.
+    Also saves the successful JSON output to a file (one file per batch).
+    """
+    # Budget gate (we only check; we will register after success)
     if not API_BUDGET.will_allow("llm", 1):
         raise RuntimeError("API budget would be exceeded by another LLM call; stopping extraction.")
+
+    # Respect client-side rate limiter
     LLM_RATE_LIMITER.acquire()
-    API_BUDGET.register("llm", 1)
+
+    # Log the attempt
+    try:
+        kind = context.get("kind", "unknown")
+        items_count = context.get("items_count", "?")
+        token_est = estimate_tokens_for_text(prompt)
+        print(f"[LLM] Attempt: model={GEN_MODEL} | kind={kind} | items={items_count} | est_tokens≈{token_est}")
+    except Exception:
+        print(f"[LLM] Attempt: model={GEN_MODEL}")
 
     cfg = GenerationConfig(
         temperature=0,
         response_mime_type="application/json",
-        response_schema=TRIPLE_SCHEMA,
+        response_schema=schema,
     )
-    prompt = prompt_override or build_single_prompt(meta, chunk_text)
 
-    gemini_start = time.time()
-    resp = gen_model.generate_content(prompt, generation_config=cfg)
-    gemini_duration = time.time() - gemini_start
+    start = time.time()
+    try:
+        resp = gen_model.generate_content(prompt, generation_config=cfg)
+    except Exception as e:
+        dur = time.time() - start
+        if is_rate_limit_error(e):
+            raise RateLimitError(str(e)) from e
+        raise RuntimeError(f"LLM call failed: {e}") from e
 
+    dur = time.time() - start
+
+    # Parse JSON
     raw = None
     try:
         raw = resp.text
@@ -298,7 +440,23 @@ def extract_triples_from_chunk(chunk_text: str, meta: Dict[str, Any], prompt_ove
             data = json.loads(raw)
         except Exception as e:
             preview = raw[:200] if isinstance(raw, str) else "None"
-            raise RuntimeError(f"Failed to parse model JSON: {e}; raw={preview}")
+            raise JsonParseError(f"Failed to parse model JSON: {e}; raw={preview}") from e
+
+    # Budget: count only successful, parsed responses
+    API_BUDGET.register("llm", 1)
+
+    # Save JSON output to file
+    save_llm_json_output(data, context)
+
+    return data, dur
+
+# ----------------- LLM Extraction (single attempt) -----------------
+def extract_triples_from_chunk(chunk_text: str, meta: Dict[str, Any], prompt_override: Optional[str] = None) -> Tuple[List[Dict[str, Any]], float]:
+    prompt = prompt_override or build_single_prompt(meta, chunk_text)
+    data, gemini_duration = run_llm_json(
+        prompt, TRIPLE_SCHEMA,
+        context={"kind": "single", "items_count": 1, "chunk_id": meta.get("chunk_id"), "items_metas": [meta]}
+    )
 
     uu_number = meta.get("uu_number")
     triples: List[Dict[str, Any]] = []
@@ -334,34 +492,12 @@ def extract_triples_from_chunk(chunk_text: str, meta: Dict[str, Any], prompt_ove
         })
     return triples, gemini_duration
 
-@retry(wait=wait_exponential(multiplier=1, min=2, max=30), stop=stop_after_attempt(5), reraise=True)
 def extract_triples_from_chunks_batch(items: List[Dict[str, Any]], prompt: str) -> Tuple[Dict[str, List[Dict[str, Any]]], float]:
-    if not API_BUDGET.will_allow("llm", 1):
-        raise RuntimeError("API budget would be exceeded by another LLM call; stopping extraction.")
-    LLM_RATE_LIMITER.acquire()
-    API_BUDGET.register("llm", 1)
-
-    cfg = GenerationConfig(
-        temperature=0,
-        response_mime_type="application/json",
-        response_schema=BATCH_SCHEMA,
+    metas = [it["meta"] for it in items]
+    data, gemini_duration = run_llm_json(
+        prompt, BATCH_SCHEMA,
+        context={"kind": "batch", "items_count": len(items), "items_metas": metas}
     )
-
-    gemini_start = time.time()
-    resp = gen_model.generate_content(prompt, generation_config=cfg)
-    gemini_duration = time.time() - gemini_start
-
-    raw = None
-    try:
-        raw = resp.text
-        data = json.loads(raw)
-    except Exception:
-        try:
-            raw = resp.candidates[0].content.parts[0].text
-            data = json.loads(raw)
-        except Exception as e:
-            preview = raw[:200] if isinstance(raw, str) else "None"
-            raise RuntimeError(f"Failed to parse batch JSON: {e}; raw={preview}")
 
     results_map: Dict[str, List[Dict[str, Any]]] = {}
     meta_map = {it["meta"]["chunk_id"]: it["meta"] for it in items}
@@ -413,20 +549,28 @@ def embed_text(text: str) -> Tuple[List[float], float]:
         raise RuntimeError("API budget would be exceeded by another embedding call; stopping embedding.")
     start = time.time()
     res = genai.embed_content(model=EMBED_MODEL, content=text)
-    API_BUDGET.register("embed", 1)
     dur = time.time() - start
+
+    vec: Optional[List[float]] = None
 
     if isinstance(res, dict):
         emb = res.get("embedding")
         if isinstance(emb, dict) and "values" in emb:
-            return emb["values"], dur
-        if isinstance(emb, list):
-            return emb, dur
-    try:
-        return res.embedding.values, dur  # type: ignore[attr-defined]
-    except Exception:
-        pass
-    raise RuntimeError("Unexpected embedding response shape")
+            vec = emb["values"]
+        elif isinstance(emb, list):
+            vec = emb
+    if vec is None:
+        try:
+            vec = res.embedding.values  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    if vec is None:
+        raise RuntimeError("Unexpected embedding response shape")
+
+    # Budget: count only successful embedding responses (if embeddings are counted)
+    API_BUDGET.register("embed", 1)
+
+    return vec, dur
 
 def node_embedding_text(name: str, etype: str) -> str:
     return f"{(name or '').strip()} | {etype}"
@@ -597,7 +741,6 @@ def try_merge_batches(b1: Tuple[List[Dict[str, Any]], int], b2: Tuple[List[Dict[
     merged = items1 + items2
     if len(merged) > PRACTICAL_MAX_ITEMS_PER_BATCH:
         return None
-    # recompute token estimate for merged
     merged_prompt = build_batch_prompt(merged) if len(merged) > 1 else build_single_prompt(merged[0]["meta"], merged[0]["text"])
     tokens = estimate_tokens_for_text(merged_prompt)
     if tokens <= PROMPT_TOKEN_LIMIT:
@@ -647,85 +790,225 @@ def pack_batches_with_cap(use_items: List[Dict[str, Any]], max_batches_allowed: 
 
     return batches, 0
 
-# ----------------- Processing helper (with recursive split on failure) -----------------
-def process_items(items: List[Dict[str, Any]]) -> Tuple[int, int, float, Dict[str, Dict[str, float]]]:
+# ----------------- Processing helper (rate-limit retry + parse-error split) -----------------
+def process_items(items: List[Dict[str, Any]]) -> Tuple[int, int, float, Dict[str, Dict[str, float]], Dict[str, int]]:
     """
-    Processes a list of items (chunks) either as a single batch call or by splitting recursively on failure.
+    Processes a list of items (chunks). Implements:
+    - Rate-limit errors (429): retry the same batch indefinitely with backoff.
+    - JSON parse errors:
+        * For batch (len>1): split into halves and process recursively.
+        * For single-chunk (len==1): after N JSON parse errors, split the chunk text into two halves,
+          and process each half as its own 'batch' (counted in final_batches).
 
     Returns:
     - num_chunks_processed
     - num_triples_stored
     - gemini_duration_total
     - per_chunk_stats: {chunk_id: {"gemini": x, "embed": y, "neo4j": z, "triples": n}}
+    - extra_counters: {"final_batches": b, "rate_limit_retries": r, "json_parse_errors": j, "llm_calls": c}
     """
     if not items:
-        return 0, 0, 0.0, {}
+        return 0, 0, 0.0, {}, {"final_batches": 0, "rate_limit_retries": 0, "json_parse_errors": 0, "llm_calls": 0}
 
+    # If no budget remains for even a single attempt, skip
     if ENFORCE_API_BUDGET and not API_BUDGET.will_allow("llm", 1):
         print("    ! Stopping: API budget for LLM calls would be exceeded.")
-        return 0, 0, 0.0, {}
+        return 0, 0, 0.0, {}, {"final_batches": 0, "rate_limit_retries": 0, "json_parse_errors": 0, "llm_calls": 0}
 
-    prompt = build_batch_prompt(items) if len(items) > 1 else build_single_prompt(items[0]["meta"], items[0]["text"])
+    rate_limit_retries = 0
+    json_parse_errors = 0
+    llm_calls = 0
 
-    try:
-        if len(items) == 1:
-            triples, gemini_dur = extract_triples_from_chunk(items[0]["text"], items[0]["meta"], prompt_override=prompt)
-            written, emb_dur, neo4j_dur = write_triples_for_chunk(triples)
-            cid = items[0]["meta"]["chunk_id"]
-            per_chunk = {
-                cid: {"gemini": gemini_dur, "embed": emb_dur, "neo4j": neo4j_dur, "triples": written}
-            }
-            return 1, written, gemini_dur, per_chunk
-
-        results_map, gemini_dur = extract_triples_from_chunks_batch(items, prompt)
-
-        per_chunk_gemini = gemini_dur / max(1, len(items))
-        num_chunks_processed = 0
-        num_triples_stored = 0
+    # Single item case: retry; on repeated parse errors, split text and recurse on halves (recursively)
+    if len(items) == 1:
+        item = items[0]
+        meta = item["meta"]
+        text = item["text"]
+        chunk_id = meta.get("chunk_id")
         per_chunk: Dict[str, Dict[str, float]] = {}
+        backoff = 2.0  # seconds, exponential for rate-limit
+        single_parse_err_count = 0
 
-        for it in items:
-            cid = it["meta"]["chunk_id"]
-            triples = results_map.get(cid, [])
-            written, emb_dur, neo4j_dur = write_triples_for_chunk(triples)
-            per_chunk[cid] = {"gemini": per_chunk_gemini, "embed": emb_dur, "neo4j": neo4j_dur, "triples": written}
-            num_chunks_processed += 1
-            num_triples_stored += written
+        while True:
+            if ENFORCE_API_BUDGET and not API_BUDGET.will_allow("llm", 1):
+                print(f"    ! Stopping (budget exhausted) before LLM call for single chunk {chunk_id}")
+                return 0, 0, 0.0, {}, {"final_batches": 0, "rate_limit_retries": rate_limit_retries, "json_parse_errors": json_parse_errors, "llm_calls": llm_calls}
 
-        return num_chunks_processed, num_triples_stored, gemini_dur, per_chunk
+            prompt = build_single_prompt(meta, text)
+            llm_calls += 1
+            try:
+                triples, gemini_dur = extract_triples_from_chunk(text, meta, prompt_override=prompt)
+                written, emb_dur, neo4j_dur = write_triples_for_chunk(triples)
+                per_chunk[chunk_id] = {"gemini": gemini_dur, "embed": emb_dur, "neo4j": neo4j_dur, "triples": written}
+                return 1, written, gemini_dur, per_chunk, {"final_batches": 1, "rate_limit_retries": rate_limit_retries, "json_parse_errors": json_parse_errors, "llm_calls": llm_calls}
+            except RateLimitError:
+                rate_limit_retries += 1
+                sleep_for = min(backoff, 60.0)
+                print(f"    ! Rate-limit on single chunk {chunk_id}. Retrying after {sleep_for:.1f}s (attempt {rate_limit_retries}).")
+                time.sleep(sleep_for)
+                backoff = min(backoff * 2.0, 60.0)
+            except JsonParseError as e:
+                json_parse_errors += 1
+                single_parse_err_count += 1
+                if single_parse_err_count >= SINGLE_PARSE_SPLIT_AFTER:
+                    # Split the text into two halves and process each as its own batch (recursively)
+                    left_text, right_text = split_text_in_two(text)
+                    if not right_text:
+                        print(f"    ! JSON parse error on single chunk {chunk_id}, but could not split text further. Continuing retries. Detail: {e}")
+                        time.sleep(1.0)
+                        continue
+                    left_meta = dict(meta); left_meta["chunk_id"] = f"{chunk_id}::part1"
+                    right_meta = dict(meta); right_meta["chunk_id"] = f"{chunk_id}::part2"
+                    print(f"    ! JSON parse error repeated {single_parse_err_count} times on {chunk_id}. Splitting single chunk into 2 parts: {len(left_text)} + {len(right_text)} chars.")
+                    l_chunks, l_triples, l_gemini, l_stats, l_extra = process_items([{"text": left_text, "meta": left_meta}])
+                    r_chunks, r_triples, r_gemini, r_stats, r_extra = process_items([{"text": right_text, "meta": right_meta}])
 
-    except RetryError:
-        if len(items) == 1:
-            cid = items[0]["meta"]["chunk_id"]
-            print(f"    ! Single-chunk extraction failed after retries (chunk_id={cid}). Skipping this chunk.")
-            return 0, 0, 0.0, {}
-        mid = len(items) // 2
-        left = items[:mid]
-        right = items[mid:]
-        print(f"    ! Batch failed (size={len(items)}). Splitting into {len(left)} + {len(right)}.")
-        l_chunks, l_triples, l_gemini, l_stats = process_items(left)
-        r_chunks, r_triples, r_gemini, r_stats = process_items(right)
-        chunks = l_chunks + r_chunks
-        triples = l_triples + r_triples
-        gemini_total = l_gemini + r_gemini
-        l_stats.update(r_stats)
-        return chunks, triples, gemini_total, l_stats
-    except Exception as e:
-        if len(items) == 1:
-            cid = items[0]["meta"]["chunk_id"]
-            print(f"    ! Unexpected error on single chunk (chunk_id={cid}): {e}. Skipping.")
-            return 0, 0, 0.0, {}
-        mid = len(items) // 2
-        left = items[:mid]
-        right = items[mid:]
-        print(f"    ! Batch error (size={len(items)}): {e}. Splitting into {len(left)} + {len(right)}.")
-        l_chunks, l_triples, l_gemini, l_stats = process_items(left)
-        r_chunks, r_triples, r_gemini, r_stats = process_items(right)
-        chunks = l_chunks + r_chunks
-        triples = l_triples + r_triples
-        gemini_total = l_gemini + r_gemini
-        l_stats.update(r_stats)
-        return chunks, triples, gemini_total, l_stats
+                    per_chunk_agg: Dict[str, Dict[str, float]] = {}
+                    per_chunk_agg.update(l_stats)
+                    per_chunk_agg.update(r_stats)
+
+                    return (
+                        l_chunks + r_chunks,
+                        l_triples + r_triples,
+                        l_gemini + r_gemini,
+                        per_chunk_agg,
+                        {
+                            "final_batches": l_extra.get("final_batches", 0) + r_extra.get("final_batches", 0),
+                            "rate_limit_retries": rate_limit_retries + l_extra.get("rate_limit_retries", 0) + r_extra.get("rate_limit_retries", 0),
+                            "json_parse_errors": json_parse_errors + l_extra.get("json_parse_errors", 0) + r_extra.get("json_parse_errors", 0),
+                            "llm_calls": llm_calls + l_extra.get("llm_calls", 0) + r_extra.get("llm_calls", 0),
+                        }
+                    )
+                else:
+                    print(f"    ! JSON parse error on single chunk {chunk_id}. Retrying. Detail: {e}")
+                    time.sleep(1.0)
+            except RuntimeError as e:
+                if "API budget would be exceeded" in str(e):
+                    print(f"    ! Budget exhausted while processing single chunk {chunk_id}")
+                    return 0, 0, 0.0, {}, {"final_batches": 0, "rate_limit_retries": rate_limit_retries, "json_parse_errors": json_parse_errors, "llm_calls": llm_calls}
+                json_parse_errors += 1
+                print(f"    ! Runtime error on single chunk {chunk_id}. Treating as parse error and retrying. Detail: {e}")
+                time.sleep(1.0)
+            except Exception as e:
+                json_parse_errors += 1
+                print(f"    ! Unexpected error on single chunk {chunk_id}. Treating as parse error and retrying. Detail: {e}")
+                time.sleep(1.0)
+
+    # Batch case: retry on rate limit indefinitely; split on JSON parse error
+    else:
+        per_chunk: Dict[str, Dict[str, float]] = {}
+        backoff = 2.0  # seconds, exponential for rate-limit
+
+        while True:
+            if ENFORCE_API_BUDGET and not API_BUDGET.will_allow("llm", 1):
+                print("    ! Stopping: API budget for LLM calls would be exceeded (batch).")
+                return 0, 0, 0.0, {}, {"final_batches": 0, "rate_limit_retries": 0, "json_parse_errors": 0, "llm_calls": 0}
+
+            prompt = build_batch_prompt(items)
+            llm_calls += 1
+            try:
+                results_map, gemini_dur = extract_triples_from_chunks_batch(items, prompt)
+                # Success: write each chunk's triples
+                num_chunks_processed = 0
+                num_triples_stored = 0
+                for it in items:
+                    cid = it["meta"]["chunk_id"]
+                    triples = results_map.get(cid, [])
+                    written, emb_dur, neo4j_dur = write_triples_for_chunk(triples)
+                    per_chunk[cid] = {"gemini": gemini_dur / max(1, len(items)), "embed": emb_dur, "neo4j": neo4j_dur, "triples": written}
+                    num_chunks_processed += 1
+                    num_triples_stored += written
+
+                return num_chunks_processed, num_triples_stored, gemini_dur, per_chunk, {
+                    "final_batches": 1,
+                    "rate_limit_retries": rate_limit_retries,
+                    "json_parse_errors": json_parse_errors,
+                    "llm_calls": llm_calls
+                }
+
+            except RateLimitError:
+                rate_limit_retries += 1
+                sleep_for = min(backoff, 60.0)
+                print(f"    ! Rate-limit on batch (size={len(items)}). Retrying after {sleep_for:.1f}s (attempt {rate_limit_retries}).")
+                time.sleep(sleep_for)
+                backoff = min(backoff * 2.0, 60.0)
+                continue
+            except JsonParseError as e:
+                json_parse_errors += 1
+                # Split the batch into two halves and process recursively
+                mid = max(1, len(items) // 2)
+                left = items[:mid]
+                right = items[mid:]
+                print(f"    ! JSON parse error on batch (size={len(items)}). Splitting into {len(left)} + {len(right)}. Detail: {e}")
+                l_chunks, l_triples, l_gemini, l_stats, l_extra = process_items(left)
+                r_chunks, r_triples, r_gemini, r_stats, r_extra = process_items(right)
+
+                # Aggregate
+                per_chunk_agg = {}
+                per_chunk_agg.update(l_stats)
+                per_chunk_agg.update(r_stats)
+
+                return (l_chunks + r_chunks,
+                        l_triples + r_triples,
+                        l_gemini + r_gemini,
+                        per_chunk_agg,
+                        {
+                            "final_batches": l_extra.get("final_batches", 0) + r_extra.get("final_batches", 0),
+                            "rate_limit_retries": rate_limit_retries + l_extra.get("rate_limit_retries", 0) + r_extra.get("rate_limit_retries", 0),
+                            "json_parse_errors": json_parse_errors + l_extra.get("json_parse_errors", 0) + r_extra.get("json_parse_errors", 0),
+                            "llm_calls": llm_calls + l_extra.get("llm_calls", 0) + r_extra.get("llm_calls", 0),
+                        })
+            except RuntimeError as e:
+                if "API budget would be exceeded" in str(e):
+                    print("    ! Budget exhausted during batch processing.")
+                    return 0, 0, 0.0, {}, {"final_batches": 0, "rate_limit_retries": rate_limit_retries, "json_parse_errors": json_parse_errors, "llm_calls": llm_calls}
+                # Treat unknown runtime errors as parse errors triggering split
+                json_parse_errors += 1
+                mid = max(1, len(items) // 2)
+                left = items[:mid]
+                right = items[mid:]
+                print(f"    ! Runtime error on batch (size={len(items)}). Splitting into {len(left)} + {len(right)}. Detail: {e}")
+                l_chunks, l_triples, l_gemini, l_stats, l_extra = process_items(left)
+                r_chunks, r_triples, r_gemini, r_stats, r_extra = process_items(right)
+
+                per_chunk_agg = {}
+                per_chunk_agg.update(l_stats)
+                per_chunk_agg.update(r_stats)
+
+                return (l_chunks + r_chunks,
+                        l_triples + r_triples,
+                        l_gemini + r_gemini,
+                        per_chunk_agg,
+                        {
+                            "final_batches": l_extra.get("final_batches", 0) + r_extra.get("final_batches", 0),
+                            "rate_limit_retries": rate_limit_retries + l_extra.get("rate_limit_retries", 0) + r_extra.get("rate_limit_retries", 0),
+                            "json_parse_errors": json_parse_errors + l_extra.get("json_parse_errors", 0) + r_extra.get("json_parse_errors", 0),
+                            "llm_calls": llm_calls + l_extra.get("llm_calls", 0) + r_extra.get("llm_calls", 0),
+                        })
+            except Exception as e:
+                # Treat as parse error and split
+                json_parse_errors += 1
+                mid = max(1, len(items) // 2)
+                left = items[:mid]
+                right = items[mid:]
+                print(f"    ! Unexpected error on batch (size={len(items)}). Splitting into {len(left)} + {len(right)}. Detail: {e}")
+                l_chunks, l_triples, l_gemini, l_stats, l_extra = process_items(left)
+                r_chunks, r_triples, r_gemini, r_stats, r_extra = process_items(right)
+
+                per_chunk_agg = {}
+                per_chunk_agg.update(l_stats)
+                per_chunk_agg.update(r_stats)
+
+                return (l_chunks + r_chunks,
+                        l_triples + r_triples,
+                        l_gemini + r_gemini,
+                        per_chunk_agg,
+                        {
+                            "final_batches": l_extra.get("final_batches", 0) + r_extra.get("final_batches", 0),
+                            "rate_limit_retries": rate_limit_retries + l_extra.get("rate_limit_retries", 0) + r_extra.get("rate_limit_retries", 0),
+                            "json_parse_errors": json_parse_errors + l_extra.get("json_parse_errors", 0) + r_extra.get("json_parse_errors", 0),
+                            "llm_calls": llm_calls + l_extra.get("llm_calls", 0) + r_extra.get("llm_calls", 0),
+                        })
 
 # ----------------- Main pipeline (parallel, budget-capped batching) -----------------
 def run_kg_pipeline_over_folder(
@@ -813,12 +1096,18 @@ def run_kg_pipeline_over_folder(
     per_batch_wall_times: Dict[int, float] = {}
     per_batch_sizes: Dict[int, int] = {}
 
+    # Aggregated counters
+    global_final_batches = 0
+    global_rate_limit_retries = 0
+    global_json_parse_errors = 0
+    global_llm_call_attempts = 0
+
     overall_start = time.time()
 
     def batch_desc(idx: int, size: int, tokens: int) -> str:
         return f"[Batch {idx+1}/{total_batches_planned}] size={size}, est_tokens≈{tokens}"
 
-    # Budget-aware lazy scheduling (still guarded inside extract calls)
+    # Budget-aware lazy scheduling
     next_idx = 0
     futures_set = set()
     futures_meta: Dict[Any, Tuple[int, int, List[Dict[str, Any]], float]] = {}
@@ -853,7 +1142,7 @@ def run_kg_pipeline_over_folder(
 
                 start_label = batch_desc(b_idx, len(items_batch), est_tokens)
                 try:
-                    chunks_processed, triples_stored, gemini_dur, per_chunk_stats = fut.result()
+                    chunks_processed, triples_stored, gemini_dur, per_chunk_stats, extra = fut.result()
                 except Exception as e:
                     print(f"    ! {start_label} failed with error: {e}")
                     # Try to submit the next batch if any remain and budget allows
@@ -879,6 +1168,17 @@ def run_kg_pipeline_over_folder(
                 total_embedding_duration += embed_total
                 total_neo4j_duration += neo4j_total
 
+                # Aggregate new counters
+                final_batches = extra.get("final_batches", 0)
+                rate_limit_retries = extra.get("rate_limit_retries", 0)
+                json_parse_errors = extra.get("json_parse_errors", 0)
+                llm_calls = extra.get("llm_calls", 0)
+
+                global_final_batches += final_batches
+                global_rate_limit_retries += rate_limit_retries
+                global_json_parse_errors += json_parse_errors
+                global_llm_call_attempts += llm_calls
+
                 per_batch_component_sums[b_idx] = comp_sum
                 per_batch_wall_times[b_idx] = wall_time
                 per_batch_sizes[b_idx] = len(items_batch)
@@ -902,6 +1202,7 @@ def run_kg_pipeline_over_folder(
                     print(f"        - Batch wall time:     {wall_time:.2f}s")
                     print(f"        - Overhead (wall - components): {overhead:+.2f}s")
                     print(f"        - Chunks processed: {chunks_processed} | Triples stored: {triples_stored}")
+                    print(f"        - Attempts: llm_calls={llm_calls}, rate_limit_retries={rate_limit_retries}, json_parse_errors={json_parse_errors}, final_batches={final_batches}")
 
                 # Submit next batch if any remain and budget allows
                 while next_idx < total_batches_planned:
@@ -927,10 +1228,14 @@ def run_kg_pipeline_over_folder(
     speedup = (sequential_estimate / total_time_real) if total_time_real > 0 else float('inf')
 
     print("\nSummary")
-    print(f"- Batches planned (capped): {total_batches_planned}")
+    print(f"- Batches planned (initial, capped): {total_batches_planned}")
+    print(f"- Batches processed after JSON-split: {global_final_batches} (extra from splits: {max(0, global_final_batches - total_batches_planned)})")
     print(f"- Chunks processed: {total_chunks_done}/{total_chunks_planned}")
     print(f"- Triples stored: {total_triples_stored}")
-    print(f"- LLM calls used: {total_llm_calls_used}{' (budget enforced)' if ENFORCE_API_BUDGET else ''}")
+    print(f"- LLM calls attempted (total): {global_llm_call_attempts}")
+    print(f"- Rate-limit retries (429): {global_rate_limit_retries}")
+    print(f"- JSON parse errors encountered: {global_json_parse_errors}")
+    print(f"- LLM calls used (budget counter): {total_llm_calls_used}{' (budget enforced)' if ENFORCE_API_BUDGET else ''}")
     print(f"- Total Gemini time (sum of batch LLM times): {total_gemini_duration:.2f}s")
     print(f"- Total Embedding time (sum): {total_embedding_duration:.2f}s")
     print(f"- Total Neo4j time (sum): {total_neo4j_duration:.2f}s")
@@ -943,6 +1248,6 @@ def run_kg_pipeline_over_folder(
 if __name__ == "__main__":
     run_kg_pipeline_over_folder(
         LANGCHAIN_DIR,
-        max_files=40,          # set to 10 as requested
+        max_files=40,
         max_chunks_per_file=None
     )

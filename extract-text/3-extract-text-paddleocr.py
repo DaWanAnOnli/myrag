@@ -193,12 +193,7 @@ def perform_ocr_on_image_region(pil_image, ocr_reader, page_num, block_num):
     Implements the 'predict + save_to_json + read rec_texts' flow from your example.
     """
     try:
-        # Skip very small images
         img_array = np.array(pil_image)
-        if img_array.shape[0] < 50 or img_array.shape[1] < 50:
-            print(f"      Skipping small image region {block_num}: {img_array.shape}")
-            return ""
-        
         print(f"      Performing OCR on region {block_num} ({img_array.shape})...")
         
         # Save region to a temporary PNG
@@ -599,8 +594,8 @@ def main():
     print("=" * 60)
     print(f"OCR Rendering DPI: {RENDER_DPI}")
     
-    pdf_directory = Path("../dataset/pdfs-with-metadata/samples")
-    output_directory = Path("../dataset/extract-results/samples")
+    pdf_directory = Path("../dataset/pdfs-with-metadata")
+    output_directory = Path("../dataset/extract-results")
     
     if not pdf_directory.exists():
         print(f"❌ ERROR: Input directory {pdf_directory} does not exist!")

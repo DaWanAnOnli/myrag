@@ -23,7 +23,7 @@ from typing import Dict, List, Tuple
 # -------------------
 # Hardcoded parameters
 # -------------------
-NUM_FOLDERS = 9  # Change this to your desired number of folders
+NUM_FOLDERS = 5  # Change this to your desired number of folders
 SOURCE_DIR = (Path(__file__).resolve().parent / "../dataset/langchain-results/samples").resolve()
 DEST_DIR = (Path(__file__).resolve().parent / "../dataset/langchain-batches/samples").resolve()
 FILE_PATTERN = "*.pkl"  # Only .pkl files are processed

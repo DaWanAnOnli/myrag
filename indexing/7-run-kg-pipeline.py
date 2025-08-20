@@ -11,6 +11,8 @@ Concurrent runner for kg_pipeline.py.
     DEFAULT_LANGCHAIN_DIR = Path(".../langchain-batches/samples/i").resolve()
   and runs them concurrently.
 - Per-run logs at .kg_runs/logs/run_i.log (UTF-8) with live prefixed console tail.
+- At start, ensures ../dataset/llm-json-outputs exists; if it exists and is not empty,
+  warns and requires user confirmation to proceed.
 
 Run:
   python run-kg-pipeline.py
@@ -31,6 +33,9 @@ PROJECT_ROOT = HERE
 KG_PIPELINE = (PROJECT_ROOT / "kg_pipeline.py").resolve()
 BATCHES_ROOT = (PROJECT_ROOT / "../dataset/langchain-batches/samples").resolve()
 RUNS_DIR = (PROJECT_ROOT / ".kg_runs").resolve()
+
+# New: LLM JSON outputs directory to check at startup
+LLM_JSON_OUTPUTS_DIR = (PROJECT_ROOT / "../dataset/llm-json-outputs").resolve()
 
 # .env is in the parent folder of this script
 DOTENV_PATH = (HERE.parent / ".env").resolve()
@@ -218,6 +223,26 @@ def tail_log_live(log_path: Path, idx: int, proc: subprocess.Popen) -> None:
         safe_print_console(f"[{idx}] Tail error for {log_path}: {e}")
 
 def main() -> int:
+    # New startup check: ensure ../dataset/llm-json-outputs exists; if non-empty, prompt to continue
+    try:
+        if not LLM_JSON_OUTPUTS_DIR.exists():
+            LLM_JSON_OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+            print(f"Created output directory: {LLM_JSON_OUTPUTS_DIR}")
+        else:
+            if not LLM_JSON_OUTPUTS_DIR.is_dir():
+                print(f"Error: Path exists but is not a directory: {LLM_JSON_OUTPUTS_DIR}", file=sys.stderr)
+                return 2
+            if any(LLM_JSON_OUTPUTS_DIR.iterdir()):
+                print(f"Warning: Directory exists and is not empty: {LLM_JSON_OUTPUTS_DIR}")
+                print("Continuing may overwrite or append files in this directory.")
+                response = input("Proceed? [y/N]: ").strip().lower()
+                if response not in ("y", "yes"):
+                    print("Aborted by user.")
+                    return 1
+    except Exception as e:
+        print(f"Error while checking/creating output directory {LLM_JSON_OUTPUTS_DIR}: {e}", file=sys.stderr)
+        return 2
+
     loaded = load_dotenv_file(DOTENV_PATH, overwrite=False)
     if loaded:
         print(f"Loaded {loaded} env var(s) from {DOTENV_PATH}")
