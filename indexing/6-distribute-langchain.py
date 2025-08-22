@@ -23,9 +23,11 @@ from typing import Dict, List, Tuple
 # -------------------
 # Hardcoded parameters
 # -------------------
-NUM_FOLDERS = 5  # Change this to your desired number of folders
-SOURCE_DIR = (Path(__file__).resolve().parent / "../dataset/langchain-results/samples").resolve()
-DEST_DIR = (Path(__file__).resolve().parent / "../dataset/langchain-batches/samples").resolve()
+NUM_FOLDERS = 15  # Change this to your desired number of folders
+# SOURCE_DIR = (Path(__file__).resolve().parent / "../dataset/samples/langchain-results/").resolve()
+# DEST_DIR = (Path(__file__).resolve().parent / "../dataset/samples/langchain-batches/").resolve()
+SOURCE_DIR = (Path(__file__).resolve().parent / "../dataset/langchain-results/").resolve()
+DEST_DIR = (Path(__file__).resolve().parent / "../dataset/langchain-batches/").resolve()
 FILE_PATTERN = "*.pkl"  # Only .pkl files are processed
 SKIP_FILES = {"all_langchain_documents.pkl"}  # Exact filenames to skip
 

@@ -13,8 +13,8 @@ from datetime import datetime
 # CONFIGURATION CONSTANTS
 # =============================================================================
 
-INPUT_DIR = "../dataset/extract-results/samples"
-OUTPUT_DIR = "../dataset/langchain-results/samples"
+INPUT_DIR = "../dataset/samples/extract-results"
+OUTPUT_DIR = "../dataset/samples/langchain-results"
 
 LIMIT_FILES = None  # Set to integer to limit files processed, None for all files
 MIN_CHUNK_SIZE = 400   # tokens

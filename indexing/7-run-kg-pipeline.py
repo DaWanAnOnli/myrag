@@ -1,349 +1,190 @@
 #!/usr/bin/env python3
-"""
-Concurrent runner for kg_pipeline.py.
-
-- Loads env vars from the .env file in this script's parent folder.
-- Uses venv Python at ../env (Windows: ../env/Scripts/python.exe, Unix: ../env/bin/python).
-- Counts numeric subfolders in ../dataset/langchain-batches/samples and requires 1..n with no gaps.
-- Verifies GOOGLE_API_KEY_1..GOOGLE_API_KEY_n exist (after loading .env).
-- For each i in 1..n, rewrites a temp copy of kg_pipeline.py to set:
-    GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY_i"]
-    DEFAULT_LANGCHAIN_DIR = Path(".../langchain-batches/samples/i").resolve()
-  and runs them concurrently.
-- Per-run logs at .kg_runs/logs/run_i.log (UTF-8) with live prefixed console tail.
-- At start, ensures ../dataset/llm-json-outputs exists; if it exists and is not empty,
-  warns and requires user confirmation to proceed.
-
-Run:
-  python run-kg-pipeline.py
-"""
-
 import os
-import re
 import sys
-import time
-import shutil
-import threading
+import re
+import signal
 import subprocess
 from pathlib import Path
-from typing import List, Tuple
+from datetime import datetime
+from typing import List, Tuple, Dict
 
-HERE = Path(__file__).resolve().parent
-PROJECT_ROOT = HERE
-KG_PIPELINE = (PROJECT_ROOT / "kg_pipeline.py").resolve()
-BATCHES_ROOT = (PROJECT_ROOT / "../dataset/langchain-batches/samples").resolve()
-RUNS_DIR = (PROJECT_ROOT / ".kg_runs").resolve()
+try:
+    from dotenv import find_dotenv, dotenv_values
+except ImportError:
+    print("This script requires python-dotenv. Install it with: pip install python-dotenv")
+    sys.exit(1)
 
-# New: LLM JSON outputs directory to check at startup
-LLM_JSON_OUTPUTS_DIR = (PROJECT_ROOT / "../dataset/llm-json-outputs").resolve()
 
-# .env is in the parent folder of this script
-DOTENV_PATH = (HERE.parent / ".env").resolve()
+def mask_key(k: str, visible: int = 4) -> str:
+    if not k:
+        return ""
+    if len(k) <= visible:
+        return "*" * len(k)
+    return "*" * (len(k) - visible) + k[-visible:]
 
-# Use the venv in the parent folder of this script
-VENV_DIR = (HERE.parent / "env").resolve()
-if os.name == "nt":
-    VENV_PYTHON = (VENV_DIR / "Scripts" / "python.exe").resolve()
-else:
-    VENV_PYTHON = (VENV_DIR / "bin" / "python").resolve()
 
-FOLLOW_LOGS = True
+def find_env_path() -> Path:
+    # Try to locate .env by walking up from CWD
+    p = find_dotenv(usecwd=True)
+    if p:
+        return Path(p)
+    # Fallbacks: next to this script, or one/two directories up
+    here = Path(__file__).resolve().parent
+    for cand in [here / ".env", here.parent / ".env", here.parent.parent / ".env"]:
+        if cand.exists():
+            return cand
+    return Path()
 
-COLORS = [
-    "\033[38;5;39m",   # blue
-    "\033[38;5;208m",  # orange
-    "\033[38;5;34m",   # green
-    "\033[38;5;199m",  # magenta
-    "\033[38;5;124m",  # red
-    "\033[38;5;44m",   # cyan
-    "\033[38;5;136m",  # brown-ish
-    "\033[38;5;63m",   # purple-blue
-    "\033[38;5;28m",   # dark green
-    "\033[38;5;160m",  # dark red
-]
-RESET = "\033[0m"
 
-def color_for(idx: int) -> str:
-    return COLORS[(idx - 1) % len(COLORS)]
+def load_numbered_google_keys(dotenv_path: Path) -> List[Tuple[int, str]]:
+    # Parse .env without mutating os.environ
+    values: Dict[str, str] = dotenv_values(str(dotenv_path)) if dotenv_path and dotenv_path.exists() else {}
+    pat = re.compile(r"^GOOGLE_API_KEY_(\d+)$", re.IGNORECASE)
+    keys: List[Tuple[int, str]] = []
+    for name, val in values.items():
+        if not name or val is None:
+            continue
+        m = pat.match(name.strip())
+        if m:
+            idx = int(m.group(1))
+            v = val.strip()
+            if v:
+                keys.append((idx, v))
+    keys.sort(key=lambda t: t[0])
+    return keys
 
-def load_dotenv_file(path: Path, overwrite: bool = False) -> int:
-    if not path.exists():
-        return 0
 
-    def parse_line(line: str):
-        s = line.strip()
-        if not s or s.startswith("#"):
-            return None
-        if s.startswith("export "):
-            s = s[len("export "):]
-        if "=" not in s:
-            return None
-        k, v = s.split("=", 1)
-        key = k.strip()
-        val = v.strip()
-        if (val and val[0] not in ["'", '"']) and "#" in val:
-            val = val.split("#", 1)[0].rstrip()
-        if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
-            val = val[1:-1]
-        return key, val
+def determine_json_output_dir(kg_path: Path) -> Path:
+    # Respect JSON_OUTPUT_DIR env if set; otherwise mirror kg_pipeline default
+    env_dir = os.environ.get("JSON_OUTPUT_DIR")
+    if env_dir:
+        return Path(env_dir).expanduser().resolve()
+    # kg_pipeline default: Path(__file__).parent / "../../dataset/llm-json-outputs"
+    return (kg_path.parent / "../../dataset/llm-json-outputs").resolve()
 
-    count = 0
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for raw in f:
-            parsed = parse_line(raw)
-            if not parsed:
-                continue
-            key, val = parsed
-            if overwrite or key not in os.environ:
-                os.environ[key] = val
-                count += 1
-    return count
 
-def find_numeric_subfolders(root: Path) -> List[Tuple[int, Path]]:
-    if not root.exists() or not root.is_dir():
-        return []
-    items = []
-    for d in root.iterdir():
-        if d.is_dir() and d.name.isdigit():
-            items.append((int(d.name), d.resolve()))
-    items.sort(key=lambda t: t[0])
-    return items
-
-def ensure_sequential(indices: List[int]) -> None:
-    if not indices:
+def ensure_output_dir(json_dir: Path) -> None:
+    if not json_dir.exists():
+        json_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Created JSON output directory: {json_dir}")
         return
-    expected = list(range(1, len(indices) + 1))
-    if indices != expected:
-        raise RuntimeError(
-            f"Expected batch folders named 1..{len(indices)}, found: {', '.join(map(str, indices))}"
-        )
 
-def check_api_keys(n: int) -> None:
-    pattern = re.compile(r"^GOOGLE_API_KEY_(\d+)$")
-    present = {}
-    for k, v in os.environ.items():
-        m = pattern.match(k)
-        if m and v:
-            present[int(m.group(1))] = v
+    # If exists and not empty, warn and ask for confirmation
+    non_empty = any(json_dir.iterdir())
+    if non_empty:
+        print(f"Warning: {json_dir} exists and is not empty.")
+        print("Continuing will add new JSON files to this directory.")
+        ans = input("Proceed? [y/N]: ").strip().lower()
+        if ans not in ("y", "yes"):
+            print("Aborted by user.")
+            sys.exit(0)
 
-    expected = list(range(1, n + 1))
-    missing = [i for i in expected if i not in present]
-    extra = sorted([i for i in present if i not in expected])
 
-    if missing or extra or len(present) != n:
-        msg = [
-            f"Mismatch between folder count ({n}) and GOOGLE_API_KEY_i env vars.",
-            "Expected: " + ", ".join(f"GOOGLE_API_KEY_{i}" for i in expected),
-            "Found: " + (", ".join(f"GOOGLE_API_KEY_{i}" for i in sorted(present.keys())) or "(none)"),
-        ]
-        if missing:
-            msg.append("Missing: " + ", ".join(f"GOOGLE_API_KEY_{i}" for i in missing))
-        if extra:
-            msg.append("Extra: " + ", ".join(f"GOOGLE_API_KEY_{i}" for i in extra))
-        raise RuntimeError("\n".join(msg))
-
-def ensure_runs_dirs() -> Tuple[Path, Path]:
-    if RUNS_DIR.exists():
-        shutil.rmtree(RUNS_DIR)
-    RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    logs = RUNS_DIR / "logs"
-    logs.mkdir(parents=True, exist_ok=True)
-    return RUNS_DIR, logs
-
-def escape_path_literal(p: Path) -> str:
-    # Use forward slashes to avoid Windows backslash escapes
-    return repr(p.as_posix())
-
-def ensure_import(code: str, import_line: str) -> str:
-    if import_line in code:
-        return code
-    lines = code.splitlines(keepends=True)
-    if lines and lines[0].startswith("#!"):
-        return lines[0] + import_line + "\n" + "".join(lines[1:])
-    return import_line + "\n" + code
-
-def rewrite_default_dir(src_code: str, new_dir: Path) -> str:
-    src_code = ensure_import(src_code, "from pathlib import Path")
-    pattern = re.compile(r"^[ \t]*DEFAULT_LANGCHAIN_DIR[ \t]*=.*$", re.MULTILINE)
-    replacement = f'DEFAULT_LANGCHAIN_DIR = Path({escape_path_literal(new_dir)}).resolve()'
-    new_code, count = pattern.subn(replacement, src_code, count=1)
-    if count == 0:
-        raise RuntimeError("Could not find DEFAULT_LANGCHAIN_DIR assignment in kg_pipeline.py")
-    return new_code
-
-def rewrite_google_key(src_code: str, idx: int) -> str:
-    src_code = ensure_import(src_code, "import os")
-    pattern = re.compile(r"^[ \t]*GOOGLE_API_KEY[ \t]*=.*$", re.MULTILINE)
-    replacement = f'GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY_{idx}"]'
-    new_code, count = pattern.subn(replacement, src_code, count=1)
-    if count == 0:
-        raise RuntimeError("Could not find GOOGLE_API_KEY assignment in kg_pipeline.py")
-    return new_code
-
-def prepare_modified_pipeline(original: Path, run_index: int, folder_path: Path) -> Path:
-    code = original.read_text(encoding="utf-8")
-    code = rewrite_google_key(code, run_index)
-    code = rewrite_default_dir(code, folder_path)
-    target = RUNS_DIR / f"kg_pipeline_{run_index}.py"
-    target.write_text(code, encoding="utf-8")
-    return target
-
-def safe_print_console(s: str) -> None:
-    """
-    Print to console without crashing on unencodable characters.
-    Falls back to 'replace' for the current stdout encoding.
-    """
+def kill_process_tree(proc: subprocess.Popen):
     try:
-        print(s)
-    except UnicodeEncodeError:
-        enc = sys.stdout.encoding or "utf-8"
-        sys.stdout.buffer.write((s + "\n").encode(enc, errors="replace"))
-        sys.stdout.flush()
+        if proc.poll() is None:
+            # Try terminate first
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                # Force kill
+                proc.kill()
+    except Exception:
+        pass
 
-def tail_log_live(log_path: Path, idx: int, proc: subprocess.Popen) -> None:
-    prefix = f"[{idx}] "
-    color = color_for(idx)
-    try:
-        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-            while True:
-                line = f.readline()
-                if line:
-                    if line.endswith("\n"):
-                        line = line[:-1]
-                    safe_print_console(f"{color}{prefix}{line}{RESET}")
-                else:
-                    if proc.poll() is not None:
-                        rest = f.read()
-                        if rest:
-                            for l in rest.splitlines():
-                                safe_print_console(f"{color}{prefix}{l}{RESET}")
-                        break
-                    time.sleep(0.1)
-    except Exception as e:
-        safe_print_console(f"[{idx}] Tail error for {log_path}: {e}")
 
-def main() -> int:
-    # New startup check: ensure ../dataset/llm-json-outputs exists; if non-empty, prompt to continue
-    try:
-        if not LLM_JSON_OUTPUTS_DIR.exists():
-            LLM_JSON_OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
-            print(f"Created output directory: {LLM_JSON_OUTPUTS_DIR}")
-        else:
-            if not LLM_JSON_OUTPUTS_DIR.is_dir():
-                print(f"Error: Path exists but is not a directory: {LLM_JSON_OUTPUTS_DIR}", file=sys.stderr)
-                return 2
-            if any(LLM_JSON_OUTPUTS_DIR.iterdir()):
-                print(f"Warning: Directory exists and is not empty: {LLM_JSON_OUTPUTS_DIR}")
-                print("Continuing may overwrite or append files in this directory.")
-                response = input("Proceed? [y/N]: ").strip().lower()
-                if response not in ("y", "yes"):
-                    print("Aborted by user.")
-                    return 1
-    except Exception as e:
-        print(f"Error while checking/creating output directory {LLM_JSON_OUTPUTS_DIR}: {e}", file=sys.stderr)
-        return 2
+def main():
+    script_dir = Path(__file__).resolve().parent
+    kg_path = script_dir / "kg_pipeline.py"
+    if not kg_path.exists():
+        print(f"Error: kg_pipeline.py not found at {kg_path}")
+        print("Place this script next to kg_pipeline.py or pass the correct path.")
+        sys.exit(1)
 
-    loaded = load_dotenv_file(DOTENV_PATH, overwrite=False)
-    if loaded:
-        print(f"Loaded {loaded} env var(s) from {DOTENV_PATH}")
-    else:
-        print(f"No .env loaded from {DOTENV_PATH} (file missing or empty)")
+    # Determine and prepare JSON output directory
+    json_dir = determine_json_output_dir(kg_path)
+    ensure_output_dir(json_dir)
 
-    if not VENV_PYTHON.exists():
-        print(f"Error: Could not find virtualenv Python at: {VENV_PYTHON}", file=sys.stderr)
-        print("Ensure the parent folder contains 'env' and it is a valid virtual environment.")
-        print("On Windows, activate with: ..\\env\\Scripts\\activate")
-        return 2
+    # Load numbered GOOGLE_API_KEY_N from .env
+    dotenv_path = find_env_path()
+    if not dotenv_path or not dotenv_path.exists():
+        print("Error: .env file not found. Please create one with GOOGLE_API_KEY_1, GOOGLE_API_KEY_2, ...")
+        sys.exit(1)
 
-    if not KG_PIPELINE.exists():
-        print(f"Error: kg_pipeline.py not found at: {KG_PIPELINE}", file=sys.stderr)
-        return 2
+    numbered_keys = load_numbered_google_keys(dotenv_path)
+    if not numbered_keys:
+        print("Error: No numbered GOOGLE_API_KEY_N entries found in .env (e.g., GOOGLE_API_KEY_1, GOOGLE_API_KEY_2).")
+        sys.exit(1)
 
-    subfolders = find_numeric_subfolders(BATCHES_ROOT)
-    if not subfolders:
-        print(f"No numeric subfolders found in {BATCHES_ROOT}. Nothing to run.")
-        return 0
+    print(f"Found {len(numbered_keys)} API key(s) in {dotenv_path}")
 
-    indices = [i for i, _ in subfolders]
-    try:
-        ensure_sequential(indices)
-    except RuntimeError as e:
-        print(str(e), file=sys.stderr)
-        return 2
+    # Logs directory
+    logs_dir = script_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    n = len(subfolders)
-    try:
-        check_api_keys(n)
-    except RuntimeError as e:
-        print(str(e), file=sys.stderr)
-        return 2
+    procs: List[Tuple[subprocess.Popen, Path, int]] = []
+    log_files = []  # keep handles to close later
 
-    _, logs_dir = ensure_runs_dirs()
+    # Handle Ctrl+C gracefully
+    interrupted = {"flag": False}
 
-    print(f"Using venv Python: {VENV_PYTHON}")
-    print(f"Discovered {n} batch folder(s): " + ", ".join(str(i) for i in indices))
-    print(f"Logs directory: {logs_dir}")
+    def handle_sigint(signum, frame):
+        if interrupted["flag"]:
+            return
+        interrupted["flag"] = True
+        print("\nInterrupt received. Stopping all child processes...")
+        for p, _, _ in procs:
+            kill_process_tree(p)
 
-    procs = []
-    tails: List[threading.Thread] = []
+    signal.signal(signal.SIGINT, handle_sigint)
 
-    for idx, folder in subfolders:
-        try:
-            modified_script = prepare_modified_pipeline(KG_PIPELINE, idx, folder)
-        except Exception as e:
-            print(f"Failed to prepare modified pipeline for folder {idx}: {e}", file=sys.stderr)
-            return 2
-
+    # Start one kg_pipeline.py process per key
+    for idx, key in numbered_keys:
         env = os.environ.copy()
-        key_name = f"GOOGLE_API_KEY_{idx}"
-        if not env.get(key_name):
-            print(f"Missing environment variable: {key_name}", file=sys.stderr)
-            return 2
+        env["GOOGLE_API_KEY"] = key
+        # Ensure kg_pipeline uses this output dir (so our pre-checks match)
+        env["JSON_OUTPUT_DIR"] = str(json_dir)
+        # Improve real-time logging
+        env["PYTHONUNBUFFERED"] = "1"
 
-        # Force UTF-8 in child process to avoid UnicodeEncodeError on Windows consoles
-        env["PYTHONIOENCODING"] = "utf-8"
-        env["PYTHONUTF8"] = "1"
+        log_path = logs_dir / f"kg_run_{ts}_key{idx}.txt"
+        lf = open(log_path, "w", encoding="utf-8")
+        log_files.append(lf)
 
-        log_path = logs_dir / f"run_{idx}.log"
-        log_fh = open(log_path, "w", encoding="utf-8", buffering=1)
-        print(f"Starting run {idx} -> folder={folder} | log={log_path}")
+        print(f"- Starting run for GOOGLE_API_KEY_{idx} ({mask_key(key)}) -> {log_path}")
+
+        # Launch kg_pipeline.py as a child process
+        p = subprocess.Popen(
+            [sys.executable, str(kg_path)],
+            stdout=lf,
+            stderr=subprocess.STDOUT,
+            env=env,
+            cwd=str(kg_path.parent),
+        )
+        procs.append((p, log_path, idx))
+
+    # Wait for all to complete
+    exit_codes: List[Tuple[int, int, Path]] = []
+    for p, log_path, idx in procs:
+        rc = p.wait()
+        exit_codes.append((idx, rc, log_path))
+
+    # Close logs
+    for lf in log_files:
         try:
-            p = subprocess.Popen(
-                [str(VENV_PYTHON), "-u", str(modified_script)],
-                cwd=KG_PIPELINE.parent,
-                env=env,
-                stdout=log_fh,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-        except Exception as e:
-            log_fh.close()
-            print(f"Failed to start run {idx}: {e}", file=sys.stderr)
-            return 2
+            lf.flush()
+            lf.close()
+        except Exception:
+            pass
 
-        procs.append((idx, p, log_fh, log_path))
+    # Summary
+    print("\nAll runs finished. Summary:")
+    for idx, rc, log_path in sorted(exit_codes, key=lambda x: x[0]):
+        status = "OK" if rc == 0 else f"Failed (rc={rc})"
+        print(f"  - Key {idx}: {status} | Log: {log_path}")
 
-    if FOLLOW_LOGS:
-        for idx, p, _, log_path in procs:
-            t = threading.Thread(target=tail_log_live, args=(log_path, idx, p), daemon=True)
-            t.start()
-            tails.append(t)
-
-    exit_code = 0
-    for idx, p, log_fh, _ in procs:
-        ret = p.wait()
-        log_fh.close()
-        status = "OK" if ret == 0 else f"FAIL (exit {ret})"
-        print(f"{color_for(idx)}[{idx}] finished: {status}{RESET}")
-        if ret != 0 and exit_code == 0:
-            exit_code = ret
-
-    time.sleep(0.2)
-    print("All runs complete.")
-    for idx, _, _, log_path in procs:
-        print(f"  [{idx}] log: {log_path}")
-
-    return exit_code
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
