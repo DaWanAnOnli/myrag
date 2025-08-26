@@ -1,5 +1,5 @@
 # graph_rag_agentic.py
-import os, time, json, math, pickle
+import os, time, json, math, pickle, re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional, Set
 
@@ -23,7 +23,7 @@ GEN_MODEL = os.getenv("GEN_MODEL", "models/gemini-2.5-flash")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "models/text-embedding-004")
 
 # Dataset folder for original chunk pickles (same as ingestion)
-DEFAULT_LANGCHAIN_DIR = (Path(__file__).resolve().parent / "../dataset/langchain-results/samples").resolve()
+DEFAULT_LANGCHAIN_DIR = (Path(__file__).resolve().parent / "../dataset/samples/langchain-results/").resolve()
 LANGCHAIN_DIR = Path(os.getenv("LANGCHAIN_DIR") or str(DEFAULT_LANGCHAIN_DIR))
 SKIP_FILES = {"all_langchain_documents.pkl"}
 
@@ -35,7 +35,9 @@ PER_HOP_LIMIT = 2000            # Guardrail per hop
 MAX_EDGES = 200                 # Cap on triples/edges after rerank
 MAX_CHUNKS = 40                 # Cap on chunks included in context
 
-OUTPUT_LANG = "id"              # "id" or "en"
+# OUTPUT_LANG is retained for compatibility but no longer drives the answer language.
+# The answer language is now auto-detected from the user's query.
+OUTPUT_LANG = "id"
 ANSWER_MAX_TOKENS = 4096
 
 # Agentic loop max iterations
@@ -121,6 +123,40 @@ def cos_sim(a: List[float], b: List[float]) -> float:
         return 0.0
     return dot / (na * nb)
 
+# ----------------- Simple language detection (ID vs EN) -----------------
+def detect_user_language(text: str) -> str:
+    """
+    Lightweight heuristic to detect Indonesian ('id') vs English ('en')
+    for the purpose of matching the user's query language in the final answer.
+    """
+    t = (text or "").lower()
+
+    # Strong hints
+    if re.search(r"\b(pasal|undang[- ]?undang|uu\s*\d|peraturan|menteri|ayat|bab|bagian|paragraf|ketentuan|sebagaimana|dimaksud)\b", t):
+        return "id"
+    if re.search(r"\b(article|act|law|regulation|minister|section|paragraph|chapter|pursuant|provided that)\b", t):
+        return "en"
+
+    # Token-based scoring
+    id_tokens = {
+        "yang","dan","atau","tidak","adalah","berdasarkan","sebagaimana","pada","dalam","dapat","harus","wajib",
+        "pasal","undang","peraturan","menteri","ayat","bab","bagian","paragraf","ketentuan","pengundangan","apabila","jika"
+    }
+    en_tokens = {
+        "the","and","or","not","is","based","as","provided","pursuant","in","may","must","shall",
+        "article","act","law","regulation","minister","section","paragraph","chapter","whereas"
+    }
+    words = re.findall(r"[a-z]+", t)
+    score_id = sum(1 for w in words if w in id_tokens)
+    score_en = sum(1 for w in words if w in en_tokens)
+    if score_id > score_en:
+        return "id"
+    if score_en > score_id:
+        return "en"
+
+    # Fallback: prefer English for safety
+    return "en"
+
 # ----------------- Safe LLM helpers -----------------
 def get_finish_info(resp) -> Dict[str, Any]:
     info = {}
@@ -195,6 +231,7 @@ def safe_generate_text(prompt: str, max_tokens: int, temperature: float = 0.2) -
     return f"(Model returned no text. finish_info={info})"
 
 # ----------------- Agent 1: entity/predicate extraction -----------------
+# Note: Agent logic and vocab kept unchanged to preserve behavior.
 LEGAL_ENTITY_TYPES = [
     "UU", "PASAL", "AYAT", "INSTANSI", "ORANG", "ISTILAH", "SANKSI", "NOMINAL", "TANGGAL"
 ]
@@ -228,14 +265,16 @@ QUERY_SCHEMA = {
 
 def agent1_extract_entities_predicates(query: str) -> Dict[str, Any]:
     prompt = f"""
-Anda adalah Agent 1. Tugas: ekstrak entitas dan predikat hukum yang dirujuk/diimplikasikan dari pertanyaan pengguna.
+You are Agent 1. Task: extract the legal entities and predicates referenced or implied by the user's question.
 
-Keluaran:
-- JSON dengan "entities" (array objek: {{text, type(optional)}}) dan "predicates" (array string Indonesia, snake_case bila relevan).
-- Jenis entitas, bila diisi, HARUS salah satu dari: {", ".join(LEGAL_ENTITY_TYPES)}.
-- Predikat sebaiknya salah satu dari: {", ".join(LEGAL_PREDICATES)}.
+Output format:
+- JSON with:
+  - "entities": array of objects with fields {{text, type(optional)}}
+  - "predicates": array of strings (Indonesian, snake_case when applicable)
+- If entity type is provided, it MUST be one of: {", ".join(LEGAL_ENTITY_TYPES)}.
+- Predicates should ideally be one of: {", ".join(LEGAL_PREDICATES)}.
 
-Pertanyaan:
+User question:
 \"\"\"{query}\"\"\"
 """
     est_tokens = estimate_tokens_for_text(prompt)
@@ -248,32 +287,73 @@ Pertanyaan:
     log(f"[Agent 1] Output: entities={ [e.get('text') for e in data['entities']] }, predicates={ data['predicates'] }")
     return data
 
-# ----------------- Neo4j vector search -----------------
-def search_similar_entities(q_emb: List[float], k: int) -> List[Dict[str, Any]]:
+# ----------------- Neo4j vector search (updated for LexID) -----------------
+def _vector_query_nodes(index_name: str, q_emb: List[float], k: int) -> List[Dict[str, Any]]:
+    """
+    Query a specific vector index and return rows as dictionaries with common fields.
+    """
     cypher = """
-    CALL db.index.vector.queryNodes('entity_vec', $k, $q_emb) YIELD node AS e, score
-    RETURN e, score
+    CALL db.index.vector.queryNodes($index_name, $k, $q_emb) YIELD node AS n, score
+    RETURN n, score
     ORDER BY score DESC
     LIMIT $k
     """
     with driver.session() as session:
-        res = session.run(cypher, k=k, q_emb=q_emb)
+        res = session.run(cypher, index_name=index_name, k=k, q_emb=q_emb)
         rows = []
         for r in res:
-            e = r["e"]
+            n = r["n"]
             rows.append({
-                "key": e.get("key"),
-                "name": e.get("name"),
-                "type": e.get("type"),
+                "key": n.get("key"),
+                "name": n.get("name"),
+                "type": n.get("type"),
                 "score": r["score"],
             })
         return rows
 
+def search_similar_entities(q_emb: List[float], k: int) -> List[Dict[str, Any]]:
+    """
+    In the LexID graph there is no :Entity label nor 'entity_vec' index.
+    We search across:
+      - document_vec (LegalDocument and subtypes)
+      - content_vec (LegalDocumentContent and subtypes)
+      - expression_vec (RuleExpression and subtypes)
+    Then we merge and take the global top-k by score.
+    """
+    candidates: List[Dict[str, Any]] = []
+    try:
+        candidates.extend(_vector_query_nodes("document_vec", q_emb, k))
+    except Exception as e:
+        log(f"[Warn] document_vec query failed: {e}")
+    try:
+        candidates.extend(_vector_query_nodes("content_vec", q_emb, k))
+    except Exception as e:
+        log(f"[Warn] content_vec query failed: {e}")
+    try:
+        candidates.extend(_vector_query_nodes("expression_vec", q_emb, k))
+    except Exception as e:
+        log(f"[Warn] expression_vec query failed: {e}")
+
+    # Deduplicate by (key, type) while keeping the best score
+    best: Dict[Tuple[Optional[str], Optional[str]], Dict[str, Any]] = {}
+    for row in candidates:
+        key = (row.get("key"), row.get("type"))
+        if key not in best or (row.get("score", -1) > best[key].get("score", -1)):
+            best[key] = row
+
+    merged = list(best.values())
+    merged.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+    return merged[:k]
+
 def search_similar_triples(q_emb: List[float], k: int) -> List[Dict[str, Any]]:
+    """
+    Triple search remains the same, but we no longer assume :Entity labels
+    on SUBJECT/OBJECT links.
+    """
     cypher = """
     CALL db.index.vector.queryNodes('triple_vec', $k, $q_emb) YIELD node AS tr, score
-    OPTIONAL MATCH (tr)-[:SUBJECT]->(s:Entity)
-    OPTIONAL MATCH (tr)-[:OBJECT]->(o:Entity)
+    OPTIONAL MATCH (tr)-[:SUBJECT]->(s)
+    OPTIONAL MATCH (tr)-[:OBJECT]->(o)
     RETURN tr, s, o, score
     ORDER BY score DESC
     LIMIT $k
@@ -302,8 +382,14 @@ def search_similar_triples(q_emb: List[float], k: int) -> List[Dict[str, Any]]:
             })
         return rows
 
-# ----------------- Graph expansion -----------------
+# ----------------- Graph expansion (updated for LexID) -----------------
 def expand_from_entities(entity_keys: List[str], hops: int, per_hop_limit: int) -> List[Dict[str, Any]]:
+    """
+    No :Entity label nor :REL relationship. We:
+      - match nodes by property key (any label)
+      - traverse any relationship [r] that carries r.triple_uid
+      - fetch the Triple node and its SUBJECT/OBJECT (unlabeled)
+    """
     triples: Dict[str, Dict[str, Any]] = {}
     current_seeds = list(set(k for k in entity_keys if k))
     for _ in range(hops):
@@ -311,11 +397,12 @@ def expand_from_entities(entity_keys: List[str], hops: int, per_hop_limit: int) 
             break
         cypher = """
         UNWIND $keys AS k
-        MATCH (e:Entity {key:k})-[r:REL]->(nbr:Entity)
+        MATCH (e {key:k})-[r]->(nbr)
+        WHERE r.triple_uid IS NOT NULL
         WITH DISTINCT r LIMIT $limit
         MATCH (tr:Triple {triple_uid:r.triple_uid})
-        OPTIONAL MATCH (tr)-[:SUBJECT]->(s:Entity)
-        OPTIONAL MATCH (tr)-[:OBJECT]->(o:Entity)
+        OPTIONAL MATCH (tr)-[:SUBJECT]->(s)
+        OPTIONAL MATCH (tr)-[:OBJECT]->(o)
         RETURN tr, s, o
         """
         with driver.session() as session:
@@ -347,12 +434,15 @@ def expand_from_entities(entity_keys: List[str], hops: int, per_hop_limit: int) 
     return list(triples.values())
 
 def expand_from_triples(triple_ids: List[str], hops: int, per_hop_limit: int) -> List[Dict[str, Any]]:
+    """
+    Same semantics as before, but don't assume :Entity labels.
+    """
     triples: Dict[str, Dict[str, Any]] = {}
     with driver.session() as session:
         res = session.run("""
         UNWIND $uids AS uid
-        MATCH (tr:Triple {triple_uid:uid})-[:SUBJECT]->(s:Entity)
-        MATCH (tr)-[:OBJECT]->(o:Entity)
+        MATCH (tr:Triple {triple_uid:uid})-[:SUBJECT]->(s)
+        MATCH (tr)-[:OBJECT]->(o)
         RETURN DISTINCT s.key AS s_key, o.key AS o_key
         """, uids=triple_ids)
         seeds = set()
@@ -399,7 +489,17 @@ class ChunkStore:
     def get_chunk(self, document_id: Any, chunk_id: Any) -> Optional[str]:
         if not self._built:
             self._build_index()
-        return self._index.get((document_id, chunk_id))
+        # Direct lookup
+        val = self._index.get((document_id, chunk_id))
+        if val is not None:
+            return val
+        # Fallback: if chunk_id has split suffix like "::part1", try base chunk_id
+        if isinstance(chunk_id, str) and "::" in chunk_id:
+            base_id = chunk_id.split("::", 1)[0]
+            val = self._index.get((document_id, base_id))
+            if val is not None:
+                return val
+        return None
 
 # ----------------- Context builder -----------------
 def build_context_from_triples(triples: List[Dict[str, Any]], chunk_store: ChunkStore, max_chunks: int, q_emb: List[float]) -> Tuple[str, str, List[Dict[str, Any]]]:
@@ -440,7 +540,7 @@ def build_context_from_triples(triples: List[Dict[str, Any]], chunk_store: Chunk
         if len(selected_chunks) >= max_chunks:
             break
 
-    # Triple summary
+    # Triple summary (kept similar for debugging)
     summary_lines = []
     summary_lines.append("Ringkasan triple yang relevan:")
     for t in ranked[:min(50, len(ranked))]:
@@ -465,25 +565,31 @@ def build_context_from_triples(triples: List[Dict[str, Any]], chunk_store: Chunk
 
 # ----------------- Agent 2 (Intermediate answer) -----------------
 def agent2_answer(query_original: str, context: str, guidance: Optional[str], output_lang: str = "id") -> str:
-    instr_id = "Jawab pertanyaan pengguna dalam Bahasa Indonesia secara ringkas, akurat, dan hanya berdasarkan konteks. Cantumkan rujukan UU/Pasal bila jelas."
-    instr_en = "Answer concisely and accurately in English based strictly on the provided context. Cite UU/Article references when clear."
-    instructions = instr_id if output_lang.lower().startswith("id") else instr_en
+    """
+    Instructions are in English. The model is explicitly asked to answer
+    in the same language as the user's question.
+    """
+    instructions = (
+        "Answer concisely and accurately based strictly on the provided context. "
+        "Cite UU/Article references when they are clear. "
+        "Respond in the same language as the user's question."
+    )
 
-    guidance_text = guidance.strip() if isinstance(guidance, str) and guidance.strip() else "(Tidak ada instruksi tambahan dari juri pada iterasi sebelumnya.)"
+    guidance_text = guidance.strip() if isinstance(guidance, str) and guidance.strip() else "(No additional guidance from the Judge in the previous iteration.)"
 
     prompt = f"""
-Anda adalah Agent 2 (Penjawab). Tugas: beri jawaban berbasis konteks.
+You are Agent 2 (Answerer). Task: provide an answer based on the context only.
 
-Instruksi dasar:
+Core instructions:
 {instructions}
 
-Instruksi tambahan dari Juri (jika ada):
+Additional guidance from Judge (if any):
 \"\"\"{guidance_text}\"\"\"
 
-Pertanyaan pengguna (ORIGINAL):
+Original user question:
 \"\"\"{query_original}\"\"\"
 
-Konteks:
+Context:
 \"\"\"{context}\"\"\"
 """
     est_tokens = estimate_tokens_for_text(prompt)
@@ -513,30 +619,27 @@ JUDGE_SCHEMA = {
 }
 
 def agent3_judge(query_original: str, intermediate_answer: str, context_summary: str, output_lang: str = "id") -> Dict[str, Any]:
-    lang_hint = "Berikan penilaian dalam Bahasa Indonesia." if output_lang.lower().startswith("id") else "Provide the assessment in English."
     prompt = f"""
-Anda adalah Agent 3 (Juri). Tugas: menilai apakah jawaban sementara sudah memadai dan berbasis konteks.
+You are Agent 3 (Judge). Task: evaluate whether the intermediate answer is sufficient and grounded in the context.
 
-Kriteria kecukupan:
-- Menjawab inti pertanyaan secara jelas dan benar.
-- Berbasis bukti dari konteks (ringkasan triple).
-- Menyebut rujukan UU/Pasal bila konklusif.
-- Tidak mengarang di luar konteks.
+Sufficiency criteria:
+- Clearly and correctly addresses the core of the question.
+- Grounded in the provided context (triple summary).
+- Cites UU/Article references when conclusive.
+- Does not fabricate information outside the context.
 
-Jika TIDAK memadai:
-- Tulis "rewritten_query" (versi pertanyaan yang lebih spesifik/terarah).
-- Tulis "guidance_next": instruksi operasional spesifik untuk Agent 2 iterasi berikutnya
-  (contoh: kata kunci yang harus dicari di konteks, tema utama, bagian UU yang perlu diprioritaskan, atau format jawaban yang diharapkan).
+If NOT sufficient:
+- Provide "rewritten_query": a sharper, more targeted version of the user question.
+- Provide "guidance_next": specific operational guidance for the next Agent 2 iteration
+  (e.g., keywords to look for in the context, main theme, which UU/articles to prioritize, or expected answer format).
 
-{lang_hint}
-
-Pertanyaan (ORIGINAL):
+Original user question:
 \"\"\"{query_original}\"\"\"
 
-Ringkasan konteks (triple):
+Context summary (triples):
 \"\"\"{context_summary}\"\"\"
 
-Jawaban sementara:
+Intermediate answer:
 \"\"\"{intermediate_answer}\"\"\"
 """
     est_tokens = estimate_tokens_for_text(prompt)
@@ -577,6 +680,10 @@ def agentic_graph_rag(query_original: str) -> Dict[str, Any]:
         judge_reports: List[Dict[str, Any]] = []
         guidance_prev = None
         query_for_iter = query_original
+
+        # Detect user language once, reuse per iteration
+        user_lang = detect_user_language(query_original)
+        log(f"[Language] Detected user language: {user_lang}")
 
         for it in range(1, MAX_ITERS + 1):
             log(f"\n--- Iteration {it}/{MAX_ITERS} ---")
@@ -649,15 +756,15 @@ def agentic_graph_rag(query_original: str) -> Dict[str, Any]:
             log("\n[Context summary for this iteration]:")
             log(context_summary)
 
-            # Step 6: Agent 2 – Intermediate answer (use ORIGINAL query + context; include prior guidance if any)
+            # Step 6: Agent 2 – Intermediate answer (answer language follows user_lang)
             t6 = now_ms()
-            intermediate_answer = agent2_answer(query_original, context_text, guidance_prev, output_lang=OUTPUT_LANG)
+            intermediate_answer = agent2_answer(query_original, context_text, guidance_prev, output_lang=user_lang)
             t_answer = dur_ms(t6)
             log(f"[Step 6] Intermediate answer generated in {t_answer:.0f} ms")
 
             # Step 7: Agent 3 – Judge
             t7 = now_ms()
-            judge = agent3_judge(query_original, intermediate_answer, context_summary, output_lang=OUTPUT_LANG)
+            judge = agent3_judge(query_original, intermediate_answer, context_summary, output_lang=user_lang)
             t_judge = dur_ms(t7)
             log(f"[Step 7] Judgment done in {t_judge:.0f} ms")
 

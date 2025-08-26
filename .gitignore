@@ -166,3 +166,5 @@ retrieval/*.txt
 
 # generate kg pipeline codes
 indexing/.kg_runs
+indexing/_*
+indexing/run_logs

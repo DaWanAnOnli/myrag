@@ -68,7 +68,7 @@ LLM_MAX_CALLS_PER_MIN = int(os.getenv("LLM_MAX_CALLS_PER_MIN", "15"))
 # Parallelism
 INDEX_WORKERS = int(os.getenv("INDEX_WORKERS", "15"))
 
-# Stagger worker starts (seconds) - randomized uniformly in [7.0, 17.0]
+# Stagger worker starts (seconds) - randomized uniformly in [5.0, 15.0]
 STAGGER_WORKER_SECONDS = random.uniform(7.0, 17.0)
 
 # API budget controls
@@ -110,375 +110,26 @@ try:
 except Exception as e:
     raise RuntimeError(f"Failed to initialize GenerativeModel {GEN_MODEL}: {e}")
 
-# ----------------- LexID ontology constants -----------------
-# LexID node labels
-LEGAL_NODE_LABELS = [
-    "LegalDocument", "LegalDocumentContent", "RuleExpression",
-    "LawAmendment", "PlaceOfPromulgation", "Person", "Office", "City"
+# ----------------- Indonesian vocab -----------------
+LEGAL_ENTITY_TYPES = [
+    "UU", "PASAL", "AYAT", "INSTANSI", "ORANG", "ISTILAH", "SANKSI", "NOMINAL", "TANGGAL"
+]
+LEGAL_PREDICATES = [
+    "mendefinisikan",
+    "mengubah",
+    "mencabut",
+    "mulai_berlaku",
+    "mewajibkan",
+    "melarang",
+    "memberikan_sanksi",
+    "berlaku_untuk",
+    "termuat_dalam",
+    "mendelegasikan_kepada",
+    "berjumlah",
+    "berdurasi"
 ]
 
-# LexID document types (with LegalDocument label)
-LEGAL_DOCUMENT_TYPES = [
-    "Constitution", "AmendmentToTheConstitution", "PeoplesConsultativeAssemblyResolution",
-    "Act", "GovernmentRegulationInLieuOfAct", "GovernmentRegulation", "PresidentialRegulation",
-    "PresidentialDecree", "PresidentialInstruction", "MinisterialRegulation",
-    "MinisterialDecision", "MinisterialInstruction", "ProvincialRegulation",
-    "RegencyRegulation", "MunicipalRegulation", "VillageRegulation"
-]
-
-# LexID content types (with LegalDocumentContent label)
-LEGAL_CONTENT_TYPES = [
-    "Chapter", "Part", "Paragraph", "Article", "Section", "Item"
-]
-
-# LexID expression types (with RuleExpression label)
-RULE_EXPRESSION_TYPES = [
-    "Norm", "RuleAct", "Concept", "CompoundExpression",
-    "AndExpression", "OrExpression", "XorExpression"
-]
-
-# LexID amendment types (with LawAmendment label)
-LAW_AMENDMENT_TYPES = [
-    "LawAmendment", "LawAddition", "LawModification", "LawDeletion"
-]
-
-# LexID relationship types (uppercased, snake-case)
-LEXID_RELATIONSHIPS = [
-    # General Metadata
-    "CONSIDERS", "HAS_DESCRIPTION", "HAS_NAME", "SAME_AS", "HAS_CREATOR",
-    "HAS_DICTUM", "HAS_ENACTION_DATE", "HAS_ENACTION_OFFICIAL",
-    "HAS_PROMULGATION_PLACE", "HAS_REGULATION_NUMBER", "HAS_REGULATION_YEAR", "HAS_LABEL",
-
-    # Inter-Document
-    "AMENDS", "AMENDED_BY", "IMPLEMENTS", "HAS_LEGAL_BASIS", "REPEALS",
-
-    # Document Structure
-    "HAS_CONTENT", "HAS_PART", "IS_CONTENT_OF", "IS_PART_OF",
-
-    # Content Changes
-    "ADDS", "DELETES", "MODIFIES", "HAS_ADDITION_CONTENT", "HAS_MODIFICATION_TARGET",
-
-    # Semantic
-    "HAS_ACT", "HAS_ACT_TYPE", "HAS_OBJECT", "HAS_SUBJECT", "HAS_CONDITION",
-    "HAS_MODALITY", "HAS_QUALIFIER", "HAS_QUALIFIER_TYPE", "HAS_QUALIFIER_VALUE",
-    "HAS_RULE", "REFERS_TO", "HAS_ELEMENT"
-]
-
-# Most common predicates (for prompt guidance)
-COMMON_PREDICATES = [
-    "mendefinisikan", "mengubah", "mencabut", "mulai_berlaku",
-    "mewajibkan", "melarang", "memberikan_sanksi", "berlaku_untuk",
-    "termuat_dalam", "mendelegasikan_kepada", "memiliki_bagian",
-    "merujuk_pada", "merupakan_isi_dari", "menambahkan", "menghapus"
-]
-
-# Build a comprehensive allowed node types list for the JSON schema enum
-ALLOWED_NODE_TYPES: List[str] = sorted(set(
-    ["LegalDocument", "LegalDocumentContent", "RuleExpression", "LawAmendment",
-     "PlaceOfPromulgation", "Person", "Office", "City"] +
-    LEGAL_DOCUMENT_TYPES +
-    LEGAL_CONTENT_TYPES +
-    RULE_EXPRESSION_TYPES +
-    LAW_AMENDMENT_TYPES
-))
-
-# ----------------- SYSTEM HINT (LexID ontology) -----------------
-SYSTEM_HINT = """
-You are an expert in Indonesian legal knowledge graphs. You extract structured information from legal documents (Undang-Undang) to build a knowledge graph following the LexID ontology.
-
-## COMPLETE LEXID ONTOLOGY SPECIFICATION
-
-### 1. NODE TYPES (LABELS)
-
-#### Top-Level Node Labels:
-- `LegalDocument`: Base type for all Indonesian legal documents
-- `LegalDocumentContent`: Structural elements within documents
-- `RuleExpression`: Semantic content of legal clauses
-- `LawAmendment`: Changes to legal document content
-- `PlaceOfPromulgation`: Official gazettes for publication
-- `Person`: Individual person (e.g., enacting official)
-- `Office`: Government institution or body
-- `City`: Location where document was enacted
-
-#### Legal Document Types (subtypes of `LegalDocument`):
-- `Constitution`: UUD 1945
-- `AmendmentToTheConstitution`: Amendments to Constitution
-- `PeoplesConsultativeAssemblyResolution`: TAP MPR
-- `Act`: Undang-undang
-- `GovernmentRegulationInLieuOfAct`: Peraturan Pemerintah Pengganti Undang-undang (Perppu)
-- `GovernmentRegulation`: Peraturan Pemerintah (PP)
-- `PresidentialRegulation`: Peraturan Presiden
-- `PresidentialDecree`: Keputusan Presiden
-- `PresidentialInstruction`: Instruksi Presiden
-- `MinisterialRegulation`: Peraturan Menteri
-- `MinisterialDecision`: Keputusan Menteri
-- `MinisterialInstruction`: Instruksi Menteri
-- `ProvincialRegulation`: Peraturan Daerah Provinsi
-- `RegencyRegulation`: Peraturan Daerah Kabupaten
-- `MunicipalRegulation`: Peraturan Daerah Kota
-- `VillageRegulation`: Peraturan Desa
-
-#### Document Content Types (subtypes of `LegalDocumentContent`):
-- `Chapter`: Bab (identified by "BAB I", "BAB II", etc.)
-- `Part`: Bagian (identified by "Bagian Kesatu", "Bagian Kedua", etc.)
-- `Paragraph`: Paragraf (identified by "Paragraf 1", "Paragraf 2", etc.)
-- `Article`: Pasal (identified by "Pasal 1", "Pasal 2", etc.)
-- `Section`: Ayat (identified by "(1)", "(2)", etc. within an Article)
-- `Item`: Sub-clauses (identified by "a.", "b.", or "1.", "2." within a Section)
-
-#### Rule Expression Types (subtypes of `RuleExpression`):
-- `Norm`: Legal rule of conduct (obligations, permissions, prohibitions)
-- `RuleAct`: Action performed within a norm
-- `Concept`: Legal term or entity mentioned in a clause
-- `CompoundExpression`: Logical groupings (AND/OR/XOR expressions)
-  - `AndExpression`: "dan" conjunction
-  - `OrExpression`: "atau" conjunction
-  - `XorExpression`: "dan/atau" conjunction
-
-#### Amendment Types (subtypes of `LawAmendment`):
-- `LawAddition`: Addition of new content (identified by phrases like "disisipkan", "ditambahkan")
-- `LawModification`: Modification of existing content (identified by "diubah", "diganti")
-- `LawDeletion`: Deletion of existing content (identified by "dihapus", "ditiadakan")
-
-### 2. RELATIONSHIP TYPES
-
-#### General Metadata Relationships:
-- `CONSIDERS`: Links document to consideration matters (found after "Menimbang:")
-- `HAS_DESCRIPTION`: Links to text content
-- `HAS_NAME`: Links to title/name
-- `SAME_AS`: Links to equivalent entity (used for aliases: "yang selanjutnya disebut")
-- `HAS_CREATOR`: Links to creating office (found in preamble)
-- `HAS_DICTUM`: Links to formal statement of issuance (found after "MEMUTUSKAN:")
-- `HAS_ENACTION_DATE`: Links to date of enaction (found in closing)
-- `HAS_ENACTION_OFFICIAL`: Links to enacting official (found in closing)
-- `HAS_PROMULGATION_PLACE`: Links to publication place
-- `HAS_REGULATION_NUMBER`: Links to regulation number
-- `HAS_REGULATION_YEAR`: Links to year of regulation
-- `HAS_LABEL`: Human-readable label
-
-#### Inter-Document Relationships:
-- `AMENDS`: Document A amends Document B (identified by "mengubah")
-- `AMENDED_BY`: Document A is amended by Document B (inverse of AMENDS)
-- `IMPLEMENTS`: Document/Article implements another (identified by "melaksanakan")
-- `HAS_LEGAL_BASIS`: Document has another as legal basis (found after "Mengingat:")
-- `REPEALS`: Document/Article repeals another (identified by "mencabut", "tidak berlaku")
-
-#### Document Content Structure Relationships:
-- `HAS_CONTENT`: Document has chapters or articles as content
-- `HAS_PART`: Element contains sub-elements (hierarchical relationship)
-- `IS_CONTENT_OF`: Inverse of HAS_CONTENT
-- `IS_PART_OF`: Inverse of HAS_PART
-
-#### Document Content Change Relationships:
-- `ADDS`: Article introduces addition
-- `DELETES`: Article deletes content
-- `MODIFIES`: Article modifies content
-- `HAS_ADDITION_CONTENT`: Links to new content being added
-- `HAS_MODIFICATION_TARGET`: Links to content being modified
-
-#### Semantic Clause Relationships:
-- `HAS_ACT`: Links norm/concept to action (connects Norm to RuleAct)
-- `HAS_ACT_TYPE`: Links action to type/verb (connects RuleAct to verb Concept)
-- `HAS_OBJECT`: Links action to object (connects RuleAct to object Concept)
-- `HAS_SUBJECT`: Links norm/act to subject (connects Norm/RuleAct to subject Concept)
-- `HAS_CONDITION`: Links norm/concept to condition (for conditional statements with "jika", "apabila")
-- `HAS_MODALITY`: Links norm to modality (e.g., "harus", "dapat", "wajib")
-- `HAS_QUALIFIER`: Links act to qualifiers (prepositional phrases)
-- `HAS_QUALIFIER_TYPE`: Links qualifier to its type
-- `HAS_QUALIFIER_VALUE`: Links qualifier to its value
-- `HAS_RULE`: Links article/section to rule (connects LegalDocumentContent to Norm/Concept)
-- `REFERS_TO`: Links concept to legal entity (identified by "sebagaimana dimaksud pada", "berdasarkan")
-- `HAS_ELEMENT`: Links compound expression to elements
-
-## EXTRACTION PATTERNS AND EXAMPLES
-
-### 1. Document Identification
-Look for the document header with pattern "UNDANG-UNDANG REPUBLIK INDONESIA NOMOR X TAHUN Y":
-MATCH: "UNDANG-UNDANG REPUBLIK INDONESIA NOMOR 12 TAHUN 2011"
-EXTRACT: {
-"subject": {"text": "UU 12/2011", "type": "LegalDocument", "canonical_id": "LegalDocument::uu-12-2011"},
-"predicate": "has_regulation_number",
-"object": {"text": "12", "type": "Concept", "canonical_id": "Concept::12"}
-}
-
-### 2. Document Structure
-Identify hierarchical content by headings:
-
-**Chapter Example:**
-
-MATCH: "BAB I KETENTUAN UMUM"
-EXTRACT: {
-"subject": {"text": "UU 12/2011", "type": "LegalDocument", "canonical_id": "LegalDocument::uu-12-2011"},
-"predicate": "has_content",
-"object": {"text": "BAB I", "type": "Chapter", "canonical_id": "Chapter::uu-12-2011::bab i"}
-}
-
-**Article Example:**
-
-MATCH: "Pasal 1"
-EXTRACT: {
-"subject": {"text": "BAB I", "type": "Chapter", "canonical_id": "Chapter::uu-12-2011::bab i"},
-"predicate": "has_part",
-"object": {"text": "Pasal 1", "type": "Article", "canonical_id": "Article::uu-12-2011::pasal 1"}
-}
-
-### 3. Definitions and Terminology
-Identify definitions typically in Article 1 with pattern "X adalah Y":
-
-
-MATCH: "Pembentukan Peraturan Perundang-undangan adalah pembuatan Peraturan Perundang-undangan yang mencakup tahapan perencanaan, penyusunan, pembahasan, pengesahan atau penetapan, dan pengundangan."
-EXTRACT: {
-"subject": {"text": "Pembentukan Peraturan Perundang-undangan", "type": "Concept", "canonical_id": "Concept::pembentukan peraturan perundang-undangan"},
-"predicate": "mendefinisikan",
-"object": {"text": "pembuatan Peraturan Perundang-undangan yang mencakup tahapan perencanaan, penyusunan, pembahasan, pengesahan atau penetapan, dan pengundangan", "type": "Concept", "canonical_id": "Concept::pembuatan peraturan perundang-undangan yang mencakup tahapan perencanaan penyusunan pembahasan pengesahan atau penetapan dan pengundangan"}
-}
-
-### 4. Legal Norms
-Identify norms with subject-verb-object patterns and modalities:
-
-
-MATCH: "Menteri harus menetapkan peraturan pelaksanaan undang-undang ini."
-EXTRACT: [
-{
-"subject": {"text": "Norm about ministerial obligation", "type": "Norm", "canonical_id": "Norm::ministerial obligation"},
-"predicate": "has_subject",
-"object": {"text": "Menteri", "type": "Concept", "canonical_id": "Concept::menteri"}
-},
-{
-"subject": {"text": "Norm about ministerial obligation", "type": "Norm", "canonical_id": "Norm::ministerial obligation"},
-"predicate": "has_modality",
-"object": {"text": "harus", "type": "Concept", "canonical_id": "Concept::harus"}
-},
-{
-"subject": {"text": "Norm about ministerial obligation", "type": "Norm", "canonical_id": "Norm::ministerial obligation"},
-"predicate": "has_act",
-"object": {"text": "menetapkan peraturan pelaksanaan", "type": "RuleAct", "canonical_id": "RuleAct::menetapkan peraturan pelaksanaan"}
-},
-{
-"subject": {"text": "menetapkan peraturan pelaksanaan", "type": "RuleAct", "canonical_id": "RuleAct::menetapkan peraturan pelaksanaan"},
-"predicate": "has_object",
-"object": {"text": "peraturan pelaksanaan undang-undang ini", "type": "Concept", "canonical_id": "Concept::peraturan pelaksanaan undang-undang ini"}
-}
-]
-
-### 5. References
-Identify references with pattern "sebagaimana dimaksud pada":
-
-
-MATCH: "Materi Muatan sebagaimana dimaksud pada Pasal 5"
-EXTRACT: {
-"subject": {"text": "Materi Muatan", "type": "Concept", "canonical_id": "Concept::materi muatan"},
-"predicate": "refers_to",
-"object": {"text": "Pasal 5", "type": "Article", "canonical_id": "Article::uu-12-2011::pasal 5"}
-}
-
-### 6. Amendments
-Identify amendments with keywords like "diubah", "disisipkan", "dihapus":
-
-
-MATCH: "Pasal 15 Undang-Undang Nomor 10 Tahun 2004 diubah sehingga berbunyi sebagai berikut:"
-EXTRACT: [
-{
-"subject": {"text": "UU 12/2011", "type": "LegalDocument", "canonical_id": "LegalDocument::uu-12-2011"},
-"predicate": "amends",
-"object": {"text": "UU 10/2004", "type": "LegalDocument", "canonical_id": "LegalDocument::uu-10-2004"}
-},
-{
-"subject": {"text": "UU 12/2011", "type": "LegalDocument", "canonical_id": "LegalDocument::uu-12-2011"},
-"predicate": "modifies",
-"object": {"text": "Pasal 15 UU 10/2004", "type": "LawModification", "canonical_id": "LawModification::pasal 15 uu 10 2004"}
-}
-]
-
-### 7. Conditions
-Identify conditional statements with "jika", "apabila", "dalam hal":
-
-
-MATCH: "Jika diperlukan, Menteri dapat menetapkan Peraturan"
-EXTRACT: [
-{
-"subject": {"text": "Norm about ministerial permission", "type": "Norm", "canonical_id": "Norm::ministerial permission"},
-"predicate": "has_condition",
-"object": {"text": "diperlukan", "type": "Concept", "canonical_id": "Concept::diperlukan"}
-},
-{
-"subject": {"text": "Norm about ministerial permission", "type": "Norm", "canonical_id": "Norm::ministerial permission"},
-"predicate": "has_subject",
-"object": {"text": "Menteri", "type": "Concept", "canonical_id": "Concept::menteri"}
-},
-{
-"subject": {"text": "Norm about ministerial permission", "type": "Norm", "canonical_id": "Norm::ministerial permission"},
-"predicate": "has_modality",
-"object": {"text": "dapat", "type": "Concept", "canonical_id": "Concept::dapat"}
-}
-]
-
-### 8. Compound Expressions
-Identify conjunctions "dan", "atau", "dan/atau":
-
-
-MATCH: "perencanaan, penyusunan, pembahasan, pengesahan atau penetapan, dan pengundangan"
-EXTRACT: {
-"subject": {"text": "stages of law formation", "type": "CompoundExpression", "canonical_id": "CompoundExpression::stages of law formation"},
-"predicate": "has_element",
-"object": {"text": "perencanaan", "type": "Concept", "canonical_id": "Concept::perencanaan"}
-}
-
-
-OUTPUT REQUIREMENTS:
-Extract meaningful triples in JSON format. Every triple must include:
-- subject: entity node with text, type, and canonical_id
-- predicate: relationship type (lowercase, snake_case)
-- object: entity node with text, type, and canonical_id
-- evidence: textual support with article reference when available
-
-RULES:
-- Be precise and grounded in the text; never invent relationships
-- Include proper metadata (document number, article reference)
-- Extract both document structure and semantic meaning
-- For definitions, use subject "mendefinisikan" object pattern
-- For amendments, identify exact content being changed
-- Normalize predicates to lowercase Indonesian phrases
-- Use specific node types rather than generic ones
-- Ensure canonical_id follows pattern: "type::normalized_text"
-
-EXTRACTION PRIORITIES:
-1. Document metadata (number, year, creator)
-2. Document structure (chapters, articles, sections)
-3. Inter-document relationships (amends, repeals)
-4. Legal norms (obligations, permissions, prohibitions)
-5. Semantic relationships (subject-action-object)
-6. Concept definitions and references
-"""
-
-def build_single_prompt(meta: Dict[str, Any], chunk_text: str) -> str:
-    return f"""
-{SYSTEM_HINT}
-
-Chunk metadata:
-- document_id: {meta.get('document_id')}
-- chunk_id: {meta.get('chunk_id')}
-- uu_number: {meta.get('uu_number')}
-- pages: {meta.get('pages')}
-
-Extract knowledge graph triples using the LexID ontology described above. Extract as many relevant and accurate triples as you can find in the text.
-
-Text:
-\"\"\"{chunk_text}\"\"\"
-"""
-
-def build_batch_prompt(items: List[Dict[str, Any]]) -> str:
-    intro = f"{SYSTEM_HINT}\n\nYou will receive several chunks. For each chunk, return an object with 'chunk_id' and 'triples'."
-    lines = []
-    for it in items:
-        m = it["meta"]
-        lines.append(
-            f"- chunk_id: {m.get('chunk_id')} | document_id: {m.get('document_id')} | uu_number: {m.get('uu_number')} | pages: {m.get('pages')}\n"
-            f"TEXT:\n\"\"\"{it['text']}\"\"\""
-        )
-    return intro + "\n\nChunks:\n" + "\n\n".join(lines)
-
-# ----------------- JSON Schema -----------------
+# Schemas
 TRIPLE_SCHEMA = {
   "type": "object",
   "properties": {
@@ -491,20 +142,20 @@ TRIPLE_SCHEMA = {
             "type": "object",
             "properties": {
               "text": {"type": "string"},
-              "type": {"type": "string", "enum": ALLOWED_NODE_TYPES},
+              "type": {"type": "string"},
               "canonical_id": {"type": "string"}
             },
-            "required": ["text", "type"]
+            "required": ["text"]
           },
           "predicate": {"type": "string"},
           "object": {
             "type": "object",
             "properties": {
               "text": {"type": "string"},
-              "type": {"type": "string", "enum": ALLOWED_NODE_TYPES},
+              "type": {"type": "string"},
               "canonical_id": {"type": "string"}
             },
-            "required": ["text", "type"]
+            "required": ["text"]
           },
           "evidence": {
             "type": "object",
@@ -513,17 +164,50 @@ TRIPLE_SCHEMA = {
               "char_start": {"type": "integer"},
               "char_end": {"type": "integer"},
               "article_ref": {"type": "string"}
-            },
-            "required": ["quote"]
+            }
           },
           "confidence": {"type": "number"}
         },
-        "required": ["subject", "predicate", "object", "evidence"]
+        "required": ["subject", "predicate", "object"]
       }
     }
   },
   "required": ["triples"]
 }
+
+BATCH_SCHEMA = {
+  "type": "object",
+  "properties": {
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "chunk_id": {"type": "string"},
+          "triples": TRIPLE_SCHEMA["properties"]["triples"]
+        },
+        "required": ["chunk_id", "triples"]
+      }
+    }
+  },
+  "required": ["results"]
+}
+
+SYSTEM_HINT = f"""
+You extract knowledge graph triples from Indonesian legal text (Undang-Undang).
+
+Output requirements:
+- subject.type, object.type, and predicate MUST be Indonesian strings only.
+- Allowed entity types: {", ".join(LEGAL_ENTITY_TYPES)}.
+- Prefer predicates from: {", ".join(LEGAL_PREDICATES)} (snake_case where applicable).
+- Use 'UU' for the Law, 'PASAL' for Article, 'AYAT' for Clause, 'INSTANSI' for institutions/agencies, 'ISTILAH' for defined terms.
+
+Rules:
+- Be precise and strictly grounded in the chunk; if unsupported, omit the triple.
+- Include a short evidence.quote, and article_ref like 'Pasal X ayat (Y)' when present.
+- Normalize predicate to a lowercase Indonesian single-verb phrase (use the list above when possible).
+- Keep numbers/dates verbatim from the text.
+"""
 
 # ----------------- Attempt ID generator -----------------
 _attempt_lock = threading.Lock()
@@ -603,46 +287,17 @@ def sanitize_filename_component(s: str) -> str:
     return s or "unknown"
 
 def normalize_entity_key(text: str, etype: str, uu_number: Optional[str] = None) -> str:
-    """Generate a canonical key ID based on type and text (LexID-friendly)."""
-    text_slug = re.sub(r'[^\w\s-]', '', (text or "").strip().lower())
-    text_slug = re.sub(r'\s+', '-', text_slug)
-
-    # Document nodes (prefer uu_number if present)
-    if etype in ("LegalDocument",) or etype in LEGAL_DOCUMENT_TYPES:
-        if uu_number:
-            return f"{etype}::uu-{uu_number.replace('/', '-')}"
-        return f"{etype}::{text_slug}"
-
-    # Structural nodes (Article, Section, etc.)
-    if etype in LEGAL_CONTENT_TYPES or etype == "LegalDocumentContent":
-        if uu_number:
-            return f"{etype}::uu-{uu_number.replace('/', '-')}::{text_slug}"
-        return f"{etype}::{text_slug}"
-
-    # Semantic nodes
-    if etype in RULE_EXPRESSION_TYPES or etype == "RuleExpression":
-        return f"{etype}::{text_slug}"
-
-    # Amendments
-    if etype in LAW_AMENDMENT_TYPES or etype == "LawAmendment":
-        prefix = f"uu-{uu_number.replace('/', '-')}-" if uu_number else ""
-        return f"{etype}::{prefix}{text_slug}"
-
-    # Other entity types
-    return f"{etype}::{text_slug}"
+    if etype in ("UU", "PASAL", "AYAT") and uu_number:
+        return f"{etype}::{_slug(uu_number)}::{_slug(text)}"
+    return f"{etype}::{_slug(text)}"
 
 def deterministic_triple_uid(
     subject_key: str, predicate: str, object_key: str, doc_id: Optional[str], span: Optional[Tuple[int,int]]
 ) -> str:
-    """Generate a deterministic unique ID for a triple (predicate snake_case)."""
     h = hashlib.sha256()
     payload = "|".join([
-        subject_key,
-        (predicate or "").strip().lower().replace(" ", "_"),
-        object_key,
-        doc_id or "",
-        str(span[0]) if span else "",
-        str(span[1]) if span else ""
+        subject_key, (predicate or "").strip().lower(), object_key, doc_id or "",
+        str(span[0]) if span else "", str(span[1]) if span else ""
     ])
     h.update(payload.encode("utf-8"))
     return h.hexdigest()
@@ -738,46 +393,33 @@ def split_text_in_two(text: str) -> Tuple[str, str]:
     right = text[best_idx:].strip()
     return left, right
 
-# ----------------- Predicate and label helpers -----------------
-def normalize_predicate(pred: Optional[str]) -> str:
-    p = (pred or "").strip().lower()
-    p = p.replace("-", "_").replace(" ", "_")
-    p = re.sub(r"[^a-z0-9_]", "", p)
-    return p or "rel"
+# ----------------- Prompt builders -----------------
+def build_single_prompt(meta: Dict[str, Any], chunk_text: str) -> str:
+    return f"""
+{SYSTEM_HINT}
 
-def rel_type_from_pred(pred: str) -> str:
-    """
-    Turn a normalized predicate (lower_snake_case) into a safe relationship label (UPPER_SNAKE_CASE).
-    Does not enforce the LEXID_RELATIONSHIPS set (to avoid dropping data),
-    but sanitizes to [A-Z0-9_]+ and falls back to REL if empty.
-    """
-    rel = (pred or "").strip().lower()
-    rel = rel.replace("-", "_").replace(" ", "_")
-    rel = re.sub(r"[^a-z0-9_]", "", rel)
-    rel = rel.upper() or "REL"
-    return rel
+Chunk metadata:
+- document_id: {meta.get('document_id')}
+- chunk_id: {meta.get('chunk_id')}
+- uu_number: {meta.get('uu_number')}
+- pages: {meta.get('pages')}
 
-def get_base_label(specific_type: str) -> str:
-    """Map specific types to their base label."""
-    if specific_type in LEGAL_DOCUMENT_TYPES or specific_type == "LegalDocument":
-        return "LegalDocument"
-    if specific_type in LEGAL_CONTENT_TYPES or specific_type == "LegalDocumentContent":
-        return "LegalDocumentContent"
-    if specific_type in RULE_EXPRESSION_TYPES or specific_type == "RuleExpression":
-        return "RuleExpression"
-    if specific_type in LAW_AMENDMENT_TYPES or specific_type == "LawAmendment":
-        return "LawAmendment"
-    # PlaceOfPromulgation, Person, Office, City, etc.
-    return specific_type
+Text:
+\"\"\"{chunk_text}\"\"\"
+"""
 
-def labels_for_type(specific_type: str) -> str:
-    """Return a Cypher label string e.g., 'Act:LegalDocument' (dedup base if same)."""
-    base = get_base_label(specific_type)
-    if base == specific_type:
-        return specific_type
-    return f"{specific_type}:{base}"
+def build_batch_prompt(items: List[Dict[str, Any]]) -> str:
+    intro = f"{SYSTEM_HINT}\n\nYou will receive several chunks. For each chunk, return an object with 'chunk_id' and 'triples'."
+    lines = []
+    for it in items:
+        m = it["meta"]
+        lines.append(
+            f"- chunk_id: {m.get('chunk_id')} | document_id: {m.get('document_id')} | uu_number: {m.get('uu_number')} | pages: {m.get('pages')}\n"
+            f"TEXT:\n\"\"\"{it['text']}\"\"\""
+        )
+    return intro + "\n\nChunks:\n" + "\n\n".join(lines)
 
-# ----------------- LLM call wrapper (logs every attempt) -----------------
+# ----------------- Error classes and classification -----------------
 class RateLimitError(Exception):
     def __init__(self, message: str, attempt_id: int, category: str = "unknown", reason: str = ""):
         super().__init__(message)
@@ -821,6 +463,7 @@ def classify_rate_limit_error(e: Exception) -> Tuple[str, str]:
         return "rpm", "request rate exceeded"
     return "unknown", "unclassified 429"
 
+# ----------------- LLM call wrapper (logs every attempt) -----------------
 def run_llm_json(prompt: str, schema: dict, context: Dict[str, Any]) -> Tuple[Dict[str, Any], float, int]:
     """
     Makes a single LLM call with JSON schema and returns parsed JSON, duration, and attempt_id.
@@ -843,6 +486,7 @@ def run_llm_json(prompt: str, schema: dict, context: Dict[str, Any]) -> Tuple[Di
         kind = context.get("kind", "unknown")
         items_count = context.get("items_count", "?")
         token_est = estimate_tokens_for_text(prompt)
+        # Use '~' for compatibility with Windows terminals
         log_info(f"[LLM] Attempt: model={GEN_MODEL} | kind={kind} | items={items_count} | est_tokens~{token_est}", attempt_id=attempt_id)
     except Exception:
         log_info(f"[LLM] Attempt: model={GEN_MODEL}", attempt_id=attempt_id)
@@ -897,10 +541,9 @@ def extract_triples_from_chunk(chunk_text: str, meta: Dict[str, Any], prompt_ove
     uu_number = meta.get("uu_number")
     triples: List[Dict[str, Any]] = []
     for t in data.get("triples", []):
-        subj = t["subject"]; obj = t["object"]; pred_raw = t.get("predicate")
-        pred = normalize_predicate(pred_raw)
-        s_type = subj.get("type") or "Concept"
-        o_type = obj.get("type") or "Concept"
+        subj = t["subject"]; obj = t["object"]; pred = (t["predicate"] or "").strip().lower()
+        s_type = subj.get("type") or "ISTILAH"
+        o_type = obj.get("type") or "ISTILAH"
         s_key = normalize_entity_key(subj["text"], s_type, uu_number)
         o_key = normalize_entity_key(obj["text"],  o_type,  uu_number)
 
@@ -910,9 +553,9 @@ def extract_triples_from_chunk(chunk_text: str, meta: Dict[str, Any], prompt_ove
 
         triples.append({
             "triple_uid": triple_uid,
-            "subject": {"text": subj["text"], "type": s_type, "key": s_key, "canonical_id": subj.get("canonical_id")},
+            "subject": {"text": subj["text"], "type": s_type, "key": s_key},
             "predicate": pred,
-            "object": {"text": obj["text"], "type": o_type, "key": o_key, "canonical_id": obj.get("canonical_id")},
+            "object": {"text": obj["text"], "type": o_type, "key": o_key},
             "evidence": {
                 "quote": ev.get("quote"),
                 "char_start": ev.get("char_start"),
@@ -932,7 +575,7 @@ def extract_triples_from_chunk(chunk_text: str, meta: Dict[str, Any], prompt_ove
 def extract_triples_from_chunks_batch(items: List[Dict[str, Any]], prompt: str) -> Tuple[Dict[str, List[Dict[str, Any]]], float, int]:
     metas = [it["meta"] for it in items]
     data, gemini_duration, attempt_id = run_llm_json(
-        prompt, TRIPLE_SCHEMA,
+        prompt, BATCH_SCHEMA,
         context={"kind": "batch", "items_count": len(items), "items_metas": metas}
     )
 
@@ -947,10 +590,9 @@ def extract_triples_from_chunks_batch(items: List[Dict[str, Any]], prompt: str) 
         uu_number = meta.get("uu_number")
         triples_for_chunk: List[Dict[str, Any]] = []
         for t in res.get("triples", []):
-            subj = t["subject"]; obj = t["object"]; pred_raw = t.get("predicate")
-            pred = normalize_predicate(pred_raw)
-            s_type = subj.get("type") or "Concept"
-            o_type = obj.get("type") or "Concept"
+            subj = t["subject"]; obj = t["object"]; pred = (t["predicate"] or "").strip().lower()
+            s_type = subj.get("type") or "ISTILAH"
+            o_type = obj.get("type") or "ISTILAH"
             s_key = normalize_entity_key(subj["text"], s_type, uu_number)
             o_key = normalize_entity_key(obj["text"],  o_type,  uu_number)
 
@@ -960,9 +602,9 @@ def extract_triples_from_chunks_batch(items: List[Dict[str, Any]], prompt: str) 
 
             triples_for_chunk.append({
                 "triple_uid": triple_uid,
-                "subject": {"text": subj["text"], "type": s_type, "key": s_key, "canonical_id": subj.get("canonical_id")},
+                "subject": {"text": subj["text"], "type": s_type, "key": s_key},
                 "predicate": pred,
-                "object": {"text": obj["text"], "type": o_type, "key": o_key, "canonical_id": obj.get("canonical_id")},
+                "object": {"text": obj["text"], "type": o_type, "key": o_key},
                 "evidence": {
                     "quote": ev.get("quote"),
                     "char_start": ev.get("char_start"),
@@ -1057,31 +699,24 @@ def upsert_triple(tx, t: Dict[str, Any], s_emb: List[float], o_emb: List[float],
     s, o = t["subject"], t["object"]
     s_name, s_type, s_key = s["text"], s["type"], s["key"]
     o_name, o_type, o_key = o["text"], o["type"], o["key"]
-    pred = t["predicate"]  # normalized lower_snake_case
+    pred = t["predicate"]
     triple_uid = t["triple_uid"]
 
     prov = t["provenance"]
     ev = t.get("evidence") or {}
     confidence = float(t.get("confidence", 0.0))
 
-    # Label expansion (e.g., Act:LegalDocument)
-    s_label_str = labels_for_type(s_type)
-    o_label_str = labels_for_type(o_type)
-
-    # Relationship label (UPPER_SNAKE_CASE, sanitized)
-    rel_label = rel_type_from_pred(pred)
-
     start = time.time()
-    cypher = f"""
-    MERGE (s:{s_label_str} {{key:$s_key}})
+    cypher = """
+    MERGE (s:Entity {key:$s_key})
       ON CREATE SET s.name=$s_name, s.type=$s_type, s.createdAt=timestamp()
     SET s.embedding=$s_emb
 
-    MERGE (o:{o_label_str} {{key:$o_key}})
+    MERGE (o:Entity {key:$o_key})
       ON CREATE SET o.name=$o_name, o.type=$o_type, o.createdAt=timestamp()
     SET o.embedding=$o_emb
 
-    MERGE (tr:Triple {{triple_uid:$triple_uid}})
+    MERGE (tr:Triple {triple_uid:$triple_uid})
       ON CREATE SET tr.createdAt=timestamp()
     SET tr.predicate=$pred,
         tr.embedding=$tr_emb,
@@ -1098,7 +733,7 @@ def upsert_triple(tx, t: Dict[str, Any], s_emb: List[float], o_emb: List[float],
     MERGE (tr)-[:SUBJECT]->(s)
     MERGE (tr)-[:OBJECT]->(o)
 
-    MERGE (s)-[r:{rel_label} {{triple_uid:$triple_uid}}]->(o)
+    MERGE (s)-[r:REL {triple_uid:$triple_uid}]->(o)
     SET r.predicate=$pred, r.chunk_id=$chunk_id, r.document_id=$doc_id
     """
     tx.run(
