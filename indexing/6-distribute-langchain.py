@@ -23,7 +23,7 @@ from typing import Dict, List, Tuple
 # -------------------
 # Hardcoded parameters
 # -------------------
-NUM_FOLDERS = 5  # Change this to your desired number of folders
+NUM_FOLDERS = 8  # Change this to your desired number of folders
 SOURCE_DIR = (Path(__file__).resolve().parent / "../dataset/samples/langchain-results/").resolve()
 DEST_DIR = (Path(__file__).resolve().parent / "../dataset/samples/langchain-batches/").resolve()
 # SOURCE_DIR = (Path(__file__).resolve().parent / "../dataset/langchain-results/").resolve()

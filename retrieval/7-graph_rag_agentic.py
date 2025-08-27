@@ -8,6 +8,9 @@ import google.generativeai as genai
 from google.generativeai.types import GenerationConfig
 from neo4j import GraphDatabase
 
+from transformers import BertTokenizer, AutoModel
+import torch
+
 # ----------------- Load .env (parent directory of this file) -----------------
 load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
 
@@ -17,6 +20,9 @@ GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY"]
 NEO4J_URI  = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASS = os.getenv("NEO4J_PASS", "password")
+
+# Hugging Face embedding model (IndoBERT)
+HF_EMBED_MODEL = os.getenv("HF_EMBED_MODEL", "indobenchmark/indobert-base-p2")
 
 # Gemini models (can be overridden via env if desired)
 GEN_MODEL = os.getenv("GEN_MODEL", "models/gemini-2.5-flash")
@@ -55,6 +61,19 @@ genai.configure(api_key=GOOGLE_API_KEY)
 gen_model = genai.GenerativeModel(GEN_MODEL)
 
 driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+
+# Initialize IndoBERT for embeddings (local HF model)
+try:
+    _HF_EMBED_DEVICE = (
+        "cuda" if torch.cuda.is_available()
+        else ("mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu")
+    )
+    _hf_tokenizer = BertTokenizer.from_pretrained(HF_EMBED_MODEL)
+    _hf_model = AutoModel.from_pretrained(HF_EMBED_MODEL)
+    _hf_model.to(_HF_EMBED_DEVICE)
+    _hf_model.eval()
+except Exception as e:
+    raise RuntimeError(f"Failed to initialize IndoBERT embedding model {HF_EMBED_MODEL}: {e}")
 
 # ----------------- Logger -----------------
 class FileLogger:
@@ -108,18 +127,22 @@ def estimate_tokens_for_text(text: str) -> int:
     return max(1, int(len(text) / 4))
 
 def embed_text(text: str) -> List[float]:
-    res = genai.embed_content(model=EMBED_MODEL, content=text)
-    if isinstance(res, dict):
-        emb = res.get("embedding")
-        if isinstance(emb, dict) and "values" in emb:
-            return emb["values"]
-        if isinstance(emb, list):
-            return emb
     try:
-        return res.embedding.values  # type: ignore[attr-defined]
-    except Exception:
-        pass
-    raise RuntimeError("Unexpected embedding response shape for embeddings")
+        # Tokenize and move tensors to the model device
+        inputs = _hf_tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+        inputs = {k: v.to(_HF_EMBED_DEVICE) for k, v in inputs.items()}
+
+        # Forward pass with mean pooling over valid tokens
+        with torch.inference_mode():
+            out = _hf_model(**inputs)
+            last_hidden = out.last_hidden_state  # [1, seq_len, hidden]
+            mask = inputs["attention_mask"].unsqueeze(-1).type_as(last_hidden)  # [1, seq_len, 1]
+            summed = (last_hidden * mask).sum(dim=1)  # [1, hidden]
+            counts = mask.sum(dim=1).clamp(min=1e-9)  # [1, 1]
+            pooled = summed / counts                   # [1, hidden]
+            return pooled.squeeze(0).tolist()          # List[float], length 768 for base IndoBERT
+    except Exception as e:
+        raise RuntimeError(f"IndoBERT embedding failed: {e}") from e
 
 def cos_sim(a: List[float], b: List[float]) -> float:
     import math

@@ -16,3 +16,4 @@ langchain
 wheel
 numpy
 opencv-python
+transformers

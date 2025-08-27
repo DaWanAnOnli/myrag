@@ -9,6 +9,12 @@ import google.generativeai as genai
 from google.generativeai.types import GenerationConfig
 from neo4j import GraphDatabase
 
+from transformers import BertTokenizer, AutoModel
+import torch
+
+# Hugging Face embedding model (for IndoBERT)
+HF_EMBED_MODEL = os.getenv("HF_EMBED_MODEL", "indobenchmark/indobert-base-p2")
+
 # ----------------- Thread-safe logging with timestamps and attempt IDs -----------------
 _PRINT_LOCK = threading.Lock()
 
@@ -109,6 +115,20 @@ try:
     log_info(f"LLM JSON outputs directory: {JSON_OUTPUT_DIR}")
 except Exception as e:
     raise RuntimeError(f"Failed to initialize GenerativeModel {GEN_MODEL}: {e}")
+
+# Initialize IndoBERT for embeddings (local HF model)
+try:
+    _HF_EMBED_DEVICE = (
+        "cuda" if torch.cuda.is_available()
+        else ("mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else "cpu")
+    )
+    _hf_tokenizer = BertTokenizer.from_pretrained(HF_EMBED_MODEL)
+    _hf_model = AutoModel.from_pretrained(HF_EMBED_MODEL)
+    _hf_model.to(_HF_EMBED_DEVICE)
+    _hf_model.eval()
+    log_info(f"Using HF embedding model: {HF_EMBED_MODEL} (device={_HF_EMBED_DEVICE})")
+except Exception as e:
+    raise RuntimeError(f"Failed to initialize IndoBERT embedding model {HF_EMBED_MODEL}: {e}")
 
 # ----------------- LexID ontology constants -----------------
 # LexID node labels
@@ -468,7 +488,12 @@ Text:
 """
 
 def build_batch_prompt(items: List[Dict[str, Any]]) -> str:
-    intro = f"{SYSTEM_HINT}\n\nYou will receive several chunks. For each chunk, return an object with 'chunk_id' and 'triples'."
+    intro = (
+        f"{SYSTEM_HINT}\n\n"
+        "You will receive several chunks. Return JSON with a top-level key 'results' (array). "
+        "Each element must be an object: {\"chunk_id\": <id>, \"triples\": [...]}, "
+        "and 'triples' must follow the LexID triple schema described above."
+    )
     lines = []
     for it in items:
         m = it["meta"]
@@ -478,7 +503,7 @@ def build_batch_prompt(items: List[Dict[str, Any]]) -> str:
         )
     return intro + "\n\nChunks:\n" + "\n\n".join(lines)
 
-# ----------------- JSON Schema -----------------
+# ----------------- JSON Schemas -----------------
 TRIPLE_SCHEMA = {
   "type": "object",
   "properties": {
@@ -523,6 +548,25 @@ TRIPLE_SCHEMA = {
     }
   },
   "required": ["triples"]
+}
+
+# Batch variant: results = [{chunk_id, triples:[... as above ...]}]
+BATCH_TRIPLE_SCHEMA = {
+  "type": "object",
+  "properties": {
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "chunk_id": {"type": "string"},
+          "triples": TRIPLE_SCHEMA["properties"]["triples"]
+        },
+        "required": ["chunk_id", "triples"]
+      }
+    }
+  },
+  "required": ["results"]
 }
 
 # ----------------- Attempt ID generator -----------------
@@ -932,7 +976,7 @@ def extract_triples_from_chunk(chunk_text: str, meta: Dict[str, Any], prompt_ove
 def extract_triples_from_chunks_batch(items: List[Dict[str, Any]], prompt: str) -> Tuple[Dict[str, List[Dict[str, Any]]], float, int]:
     metas = [it["meta"] for it in items]
     data, gemini_duration, attempt_id = run_llm_json(
-        prompt, TRIPLE_SCHEMA,
+        prompt, BATCH_TRIPLE_SCHEMA,   # <-- use batch schema here
         context={"kind": "batch", "items_count": len(items), "items_metas": metas}
     )
 
@@ -985,35 +1029,29 @@ def extract_triples_from_chunks_batch(items: List[Dict[str, Any]], prompt: str) 
 def embed_text(text: str) -> Tuple[List[float], float]:
     if not API_BUDGET.will_allow("embed", 1):
         raise RuntimeError("API budget would be exceeded by another embedding call; stopping embedding.")
+
     start = time.time()
     try:
-        res = genai.embed_content(model=EMBED_MODEL, content=text)
+        # Tokenize and move to the same device as the model
+        inputs = _hf_tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+        inputs = {k: v.to(_HF_EMBED_DEVICE) for k, v in inputs.items()}
+
+        # Forward pass (no gradients) and mean-pool over tokens with attention mask
+        with torch.inference_mode():
+            out = _hf_model(**inputs)
+            last_hidden = out.last_hidden_state  # [1, seq_len, hidden]
+            mask = inputs["attention_mask"].unsqueeze(-1)  # [1, seq_len, 1]
+            summed = (last_hidden * mask).sum(dim=1)       # [1, hidden]
+            counts = mask.sum(dim=1).clamp(min=1)          # [1, 1]
+            pooled = summed / counts                        # [1, hidden]
+            vec = pooled.squeeze(0).tolist()                # List[float], len == 768
     except Exception as e:
-        msg = str(e)
-        if "EmbedContentRequest.model" in msg and "unexpected model name format" in msg.lower():
-            raise RuntimeError(f"Embedding model name invalid: {EMBED_MODEL}. Use 'models/text-embedding-004' or set EMBED_MODEL accordingly.") from e
-        raise
+        raise RuntimeError(f"IndoBERT embedding failed: {e}") from e
+
     dur = time.time() - start
-
-    vec: Optional[List[float]] = None
-
-    if isinstance(res, dict):
-        emb = res.get("embedding")
-        if isinstance(emb, dict) and "values" in emb:
-            vec = emb["values"]
-        elif isinstance(emb, list):
-            vec = emb
-    if vec is None:
-        try:
-            vec = res.embedding.values  # type: ignore[attr-defined]
-        except Exception:
-            pass
-    if vec is None:
-        raise RuntimeError("Unexpected embedding response shape")
 
     # Budget: count only successful embedding responses (if embeddings are counted)
     API_BUDGET.register("embed", 1)
-
     return vec, dur
 
 def node_embedding_text(name: str, etype: str) -> str:
