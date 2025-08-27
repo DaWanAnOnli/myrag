@@ -296,6 +296,17 @@ def process_single_json_file(json_file_path: str) -> tuple[List[Document], Optio
             }
             metadata = create_chunk_metadata(document_data, document_id, chunk_info)
 
+            # Inject uu_number and title into the chunk content
+            uu_number_val = metadata.get('uu_number')
+            title_val = metadata.get('title')
+            prefix_parts = []
+            if uu_number_val:
+                prefix_parts.append(f"UU Number: {uu_number_val}")
+            if title_val:
+                prefix_parts.append(f"Title: {title_val}")
+            if prefix_parts:
+                chunk_text = "\n".join(prefix_parts) + "\n\n" + chunk_text
+
             token_count = end - start
             character_count = len(chunk_text)
             metadata['token_count'] = token_count

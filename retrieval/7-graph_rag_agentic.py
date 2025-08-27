@@ -1,4 +1,4 @@
-# graph_rag_agentic.py
+# agentic_graph_rag.py
 import os, time, json, math, pickle, re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional, Set
@@ -27,21 +27,28 @@ DEFAULT_LANGCHAIN_DIR = (Path(__file__).resolve().parent / "../dataset/samples/l
 LANGCHAIN_DIR = Path(os.getenv("LANGCHAIN_DIR") or str(DEFAULT_LANGCHAIN_DIR))
 SKIP_FILES = {"all_langchain_documents.pkl"}
 
-# ----------------- Retrieval and agent loop parameters (constants) -----------------
-TOP_K_ENTITIES = 10
-TOP_K_TRIPLES = 15
-N_HOPS = 1                      # Typical: 1 or 2
-PER_HOP_LIMIT = 2000            # Guardrail per hop
-MAX_EDGES = 200                 # Cap on triples/edges after rerank
-MAX_CHUNKS = 40                 # Cap on chunks included in context
+# ----------------- Retrieval/agent parameters (hardcoded constants) -----------------
+# Independent hop-depth and top-k per step (each "n" is independent as requested)
+# Entity-centric path
+ENTITY_MATCH_TOP_K = 8                 # top similar KG entities per extracted query entity
+ENTITY_SUBGRAPH_HOPS = 1               # hop-depth for subgraph expansion from matched entities
+ENTITY_SUBGRAPH_PER_HOP_LIMIT = 2000   # per-hop expansion limit
+SUBGRAPH_TRIPLES_TOP_K = 30            # top triples selected from subgraph after triple-vs-triple similarity
 
-# OUTPUT_LANG is retained for compatibility but no longer drives the answer language.
-# The answer language is now auto-detected from the user's query.
-OUTPUT_LANG = "id"
+# Triple-centric path
+QUERY_TRIPLE_MATCH_TOP_K_PER = 10      # per query-triple, top similar KG triples
+
+# Final context combination and reranking
+MAX_TRIPLES_FINAL = 60                 # final number of triples after reranking
+MAX_CHUNKS_FINAL = 40                  # final number of chunks after reranking
+CHUNK_RERANK_CAND_LIMIT = 200          # cap chunk candidates before embedding/reranking to control cost
+
+# Agent loop and output
 ANSWER_MAX_TOKENS = 4096
-
-# Agentic loop max iterations
 MAX_ITERS = 3
+
+# Language setting
+OUTPUT_LANG = "id"  # retained for compatibility; we auto-detect based on query
 
 # ----------------- Initialize SDKs -----------------
 genai.configure(api_key=GOOGLE_API_KEY)
@@ -231,7 +238,6 @@ def safe_generate_text(prompt: str, max_tokens: int, temperature: float = 0.2) -
     return f"(Model returned no text. finish_info={info})"
 
 # ----------------- Agent 1: entity/predicate extraction -----------------
-# Note: Agent logic and vocab kept unchanged to preserve behavior.
 LEGAL_ENTITY_TYPES = [
     "UU", "PASAL", "AYAT", "INSTANSI", "ORANG", "ISTILAH", "SANKSI", "NOMINAL", "TANGGAL"
 ]
@@ -287,7 +293,87 @@ User question:
     log(f"[Agent 1] Output: entities={ [e.get('text') for e in data['entities']] }, predicates={ data['predicates'] }")
     return data
 
-# ----------------- Neo4j vector search (updated for LexID) -----------------
+# ----------------- Agent 1b: triple extraction from query -----------------
+QUERY_TRIPLES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "triples": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "subject": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string"},
+                            "type": {"type": "string"}
+                        },
+                        "required": ["text"]
+                    },
+                    "predicate": {"type": "string"},
+                    "object": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string"},
+                            "type": {"type": "string"}
+                        },
+                        "required": ["text"]
+                    }
+                },
+                "required": ["subject", "predicate", "object"]
+            }
+        }
+    },
+    "required": ["triples"]
+}
+
+def agent1b_extract_query_triples(query: str) -> List[Dict[str, Any]]:
+    prompt = f"""
+You are Agent 1b. Task: extract explicit or implied triples from the user's question in the form:
+subject — predicate — object.
+
+Rules:
+- Use short, literal subject/object texts as they appear in the question.
+- Predicates should be concise (lowercase, snake_case if multiword).
+- If type is unknown, leave it blank.
+- Do not invent or speculate; extract only what is clearly suggested by the question.
+
+Return JSON with a key "triples" as specified.
+
+User question:
+\"\"\"{query}\"\"\"
+"""
+    est_tokens = estimate_tokens_for_text(prompt)
+    log("\n[Agent 1b] Prompt:")
+    log(prompt)
+    log(f"[Agent 1b] Prompt size: {len(prompt)} chars, est_tokens≈{est_tokens}")
+    out = safe_generate_json(prompt, QUERY_TRIPLES_SCHEMA, temp=0.0)
+    triples = out.get("triples", []) if isinstance(out, dict) else []
+    # sanitize minimal fields
+    clean: List[Dict[str, Any]] = []
+    for t in triples:
+        try:
+            s = t.get("subject", {}) or {}
+            o = t.get("object", {}) or {}
+            p = (t.get("predicate") or "").strip()
+            if (s.get("text") and o.get("text") and p):
+                clean.append({
+                    "subject": {"text": s.get("text","").strip(), "type": (s.get("type") or "").strip()},
+                    "predicate": p,
+                    "object":  {"text": o.get("text","").strip(), "type": (o.get("type") or "").strip()},
+                })
+        except Exception:
+            continue
+    log(f"[Agent 1b] Extracted query triples: {['{} [{}] {}'.format(x['subject']['text'], x['predicate'], x['object']['text']) for x in clean]}")
+    return clean
+
+def query_triple_to_text(t: Dict[str, Any]) -> str:
+    s = ((t.get("subject") or {}).get("text") or "").strip()
+    p = (t.get("predicate") or "").strip()
+    o = ((t.get("object") or {}).get("text") or "").strip()
+    return f"{s} [{p}] {o}"
+
+# ----------------- Neo4j vector search helpers -----------------
 def _vector_query_nodes(index_name: str, q_emb: List[float], k: int) -> List[Dict[str, Any]]:
     """
     Query a specific vector index and return rows as dictionaries with common fields.
@@ -311,14 +397,9 @@ def _vector_query_nodes(index_name: str, q_emb: List[float], k: int) -> List[Dic
             })
         return rows
 
-def search_similar_entities(q_emb: List[float], k: int) -> List[Dict[str, Any]]:
+def search_similar_entities_by_embedding(q_emb: List[float], k: int) -> List[Dict[str, Any]]:
     """
-    In the LexID graph there is no :Entity label nor 'entity_vec' index.
-    We search across:
-      - document_vec (LegalDocument and subtypes)
-      - content_vec (LegalDocumentContent and subtypes)
-      - expression_vec (RuleExpression and subtypes)
-    Then we merge and take the global top-k by score.
+    Search across entity-like indices and return top-k merged results by score.
     """
     candidates: List[Dict[str, Any]] = []
     try:
@@ -345,10 +426,9 @@ def search_similar_entities(q_emb: List[float], k: int) -> List[Dict[str, Any]]:
     merged.sort(key=lambda x: x.get("score", 0.0), reverse=True)
     return merged[:k]
 
-def search_similar_triples(q_emb: List[float], k: int) -> List[Dict[str, Any]]:
+def search_similar_triples_by_embedding(q_emb: List[float], k: int) -> List[Dict[str, Any]]:
     """
-    Triple search remains the same, but we no longer assume :Entity labels
-    on SUBJECT/OBJECT links.
+    Query triple_vec; return dict rows with triple + subject/object if available.
     """
     cypher = """
     CALL db.index.vector.queryNodes('triple_vec', $k, $q_emb) YIELD node AS tr, score
@@ -382,13 +462,10 @@ def search_similar_triples(q_emb: List[float], k: int) -> List[Dict[str, Any]]:
             })
         return rows
 
-# ----------------- Graph expansion (updated for LexID) -----------------
+# ----------------- Graph expansion (as in LexID) -----------------
 def expand_from_entities(entity_keys: List[str], hops: int, per_hop_limit: int) -> List[Dict[str, Any]]:
     """
-    No :Entity label nor :REL relationship. We:
-      - match nodes by property key (any label)
-      - traverse any relationship [r] that carries r.triple_uid
-      - fetch the Triple node and its SUBJECT/OBJECT (unlabeled)
+    Traverse edges that carry r.triple_uid, fetch Triple nodes and endpoints.
     """
     triples: Dict[str, Dict[str, Any]] = {}
     current_seeds = list(set(k for k in entity_keys if k))
@@ -431,27 +508,6 @@ def expand_from_entities(entity_keys: List[str], hops: int, per_hop_limit: int) 
                 if s and s.get("key"): next_seeds.add(s.get("key"))
                 if o and o.get("key"): next_seeds.add(o.get("key"))
         current_seeds = list(next_seeds)
-    return list(triples.values())
-
-def expand_from_triples(triple_ids: List[str], hops: int, per_hop_limit: int) -> List[Dict[str, Any]]:
-    """
-    Same semantics as before, but don't assume :Entity labels.
-    """
-    triples: Dict[str, Dict[str, Any]] = {}
-    with driver.session() as session:
-        res = session.run("""
-        UNWIND $uids AS uid
-        MATCH (tr:Triple {triple_uid:uid})-[:SUBJECT]->(s)
-        MATCH (tr)-[:OBJECT]->(o)
-        RETURN DISTINCT s.key AS s_key, o.key AS o_key
-        """, uids=triple_ids)
-        seeds = set()
-        for r in res:
-            if r["s_key"]: seeds.add(r["s_key"])
-            if r["o_key"]: seeds.add(r["o_key"])
-    expanded = expand_from_entities(list(seeds), hops, per_hop_limit)
-    for t in expanded:
-        triples[t["triple_uid"]] = t
     return list(triples.values())
 
 # ----------------- Chunk store -----------------
@@ -501,26 +557,122 @@ class ChunkStore:
                 return val
         return None
 
-# ----------------- Context builder -----------------
-def build_context_from_triples(triples: List[Dict[str, Any]], chunk_store: ChunkStore, max_chunks: int, q_emb: List[float]) -> Tuple[str, str, List[Dict[str, Any]]]:
-    # Rerank triples by similarity using stored triple embeddings
-    def triple_score(t: Dict[str, Any]) -> float:
-        emb = t.get("embedding")
-        return cos_sim(q_emb, emb) if isinstance(emb, list) else 0.0
-    ranked = sorted(triples, key=triple_score, reverse=True)
+# ----------------- Scoring helpers -----------------
+def mean_similarity_to_query_triples(triple_emb: Optional[List[float]], q_trip_embs: List[List[float]]) -> float:
+    if not isinstance(triple_emb, list) or not q_trip_embs:
+        return 0.0
+    sims = [cos_sim(triple_emb, q) for q in q_trip_embs]
+    if not sims:
+        return 0.0
+    return sum(sims) / len(sims)
 
-    # Collect chunks by (doc_id, chunk_id), preserving rank
+# ----------------- New retrieval pipeline pieces -----------------
+def entity_centric_retrieval(
+    query_entities: List[Dict[str, Any]],
+    q_trip_embs: List[List[float]],
+    q_emb_fallback: Optional[List[float]] = None
+) -> List[Dict[str, Any]]:
+    """
+    For each extracted entity:
+      - embed entity text
+      - find top-K similar KG entities
+    Expand subgraphs from the union of matched entity keys (independent hop setting).
+    Score subgraph triples by mean similarity to query triple embeddings,
+    fallback to query embedding if no query triples.
+    Return top SUBGRAPH_TRIPLES_TOP_K triples.
+    """
+    # 1) Match entities
+    all_matched_keys: Set[str] = set()
+    for e in query_entities:
+        text = (e.get("text") or "").strip()
+        if not text:
+            continue
+        try:
+            e_emb = embed_text(text)
+        except Exception as ex:
+            log(f"[EntityRetrieval] Embedding failed for entity '{text}': {ex}")
+            continue
+        matches = search_similar_entities_by_embedding(e_emb, k=ENTITY_MATCH_TOP_K)
+        keys = [m.get("key") for m in matches if m.get("key")]
+        all_matched_keys.update(keys)
+        log(f"[EntityRetrieval] '{text}' -> matched {len(keys)} KG keys (sample: {keys[:3]})")
+
+    if not all_matched_keys:
+        log("[EntityRetrieval] No KG entity matches found from query entities.")
+        return []
+
+    # 2) Expand from matched entities
+    expanded_triples = expand_from_entities(list(all_matched_keys), hops=ENTITY_SUBGRAPH_HOPS, per_hop_limit=ENTITY_SUBGRAPH_PER_HOP_LIMIT)
+    log(f"[EntityRetrieval] Expanded subgraph triples: {len(expanded_triples)}")
+
+    if not expanded_triples:
+        return []
+
+    # 3) Score triples by mean similarity to query triples (fallback to query embedding)
+    def score(t: Dict[str, Any]) -> float:
+        emb = t.get("embedding")
+        if q_trip_embs:
+            return mean_similarity_to_query_triples(emb, q_trip_embs)
+        # fallback to whole-query embedding
+        if q_emb_fallback and isinstance(emb, list):
+            return cos_sim(q_emb_fallback, emb)
+        return 0.0
+
+    ranked = sorted(expanded_triples, key=score, reverse=True)
+    top = ranked[:SUBGRAPH_TRIPLES_TOP_K]
+    log(f"[EntityRetrieval] Selected top-{len(top)} triples from subgraph")
+    return top
+
+def triple_centric_retrieval(query_triples: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[List[float]]]:
+    """
+    For each extracted query triple:
+      - embed "s [p] o"
+      - search top-K similar KG triples
+    Return merged, deduped triples and the list of query triple embeddings used.
+    """
+    triples_map: Dict[str, Dict[str, Any]] = {}
+    q_trip_embs: List[List[float]] = []
+    for qt in query_triples:
+        try:
+            txt = query_triple_to_text(qt)
+            emb = embed_text(txt)
+            q_trip_embs.append(emb)
+        except Exception as ex:
+            log(f"[TripleRetrieval] Embedding failed for query triple '{qt}': {ex}")
+            continue
+
+        matches = search_similar_triples_by_embedding(emb, k=QUERY_TRIPLE_MATCH_TOP_K_PER)
+        for m in matches:
+            uid = m.get("triple_uid")
+            if uid:
+                if uid not in triples_map:
+                    triples_map[uid] = m
+                else:
+                    # keep the better scored one (optional)
+                    if m.get("score", 0.0) > triples_map[uid].get("score", 0.0):
+                        triples_map[uid] = m
+
+    merged = list(triples_map.values())
+    log(f"[TripleRetrieval] Collected {len(merged)} unique KG triples across {len(q_trip_embs)} query triple(s)")
+    return merged, q_trip_embs
+
+def collect_chunks_for_triples(triples: List[Dict[str, Any]], chunk_store: ChunkStore) -> List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]]:
+    """
+    From triples, gather unique (doc_id, chunk_id) and load texts.
+    Returns list of (key_pair, text, triple) for each chunk instance.
+    """
     seen_pairs: Set[Tuple[Any, Any]] = set()
-    selected_chunks: List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]] = []
-    for t in ranked:
+    out: List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]] = []
+    for t in triples:
         doc_id = t.get("document_id")
         chunk_id = t.get("chunk_id")
         if doc_id is None or chunk_id is None:
+            # fallback to evidence quote if no chunk available
             quote = t.get("evidence_quote")
             if quote:
                 key = (t.get("triple_uid"), "quote")
                 if key not in seen_pairs:
-                    selected_chunks.append((key, quote, t))
+                    out.append((key, quote, t))
                     seen_pairs.add(key)
             continue
         key = (doc_id, chunk_id)
@@ -528,22 +680,75 @@ def build_context_from_triples(triples: List[Dict[str, Any]], chunk_store: Chunk
             continue
         text = chunk_store.get_chunk(doc_id, chunk_id)
         if text:
-            selected_chunks.append((key, text, t))
+            out.append((key, text, t))
             seen_pairs.add(key)
         else:
+            # fallback to evidence quote
             quote = t.get("evidence_quote")
             if quote:
                 key2 = (t.get("triple_uid"), "quote")
                 if key2 not in seen_pairs:
-                    selected_chunks.append((key2, quote, t))
+                    out.append((key2, quote, t))
                     seen_pairs.add(key2)
-        if len(selected_chunks) >= max_chunks:
-            break
+    return out
 
-    # Triple summary (kept similar for debugging)
+def rerank_chunks_by_query(
+    chunk_records: List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]],
+    q_emb_query: List[float],
+    top_k: int
+) -> List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]]:
+    """
+    Embed chunk texts and score similarity to whole user query.
+    Returns list of records augmented with score, sorted desc.
+    """
+    # Optionally cap to limit embedding cost
+    cand = chunk_records[:CHUNK_RERANK_CAND_LIMIT]
+    scored: List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]] = []
+    for key, text, t in cand:
+        try:
+            emb = embed_text(text)
+            s = cos_sim(q_emb_query, emb)
+            scored.append((key, text, t, s))
+        except Exception as ex:
+            log(f"[ChunkRerank] Embedding failed for chunk {key}: {ex}")
+            continue
+    scored.sort(key=lambda x: x[3], reverse=True)
+    return scored[:top_k]
+
+def rerank_triples_by_query_triples(
+    triples: List[Dict[str, Any]],
+    q_trip_embs: List[List[float]],
+    q_emb_fallback: Optional[List[float]],
+    top_k: int
+) -> List[Dict[str, Any]]:
+    """
+    Sort triples by mean similarity to all query triple embeddings.
+    If no query triple embeddings, fallback to whole-query embedding similarity.
+    """
+    def score(t: Dict[str, Any]) -> float:
+        emb = t.get("embedding")
+        if q_trip_embs:
+            return mean_similarity_to_query_triples(emb, q_trip_embs)
+        if q_emb_fallback and isinstance(emb, list):
+            return cos_sim(q_emb_fallback, emb)
+        return 0.0
+
+    ranked = sorted(triples, key=score, reverse=True)
+    return ranked[:top_k]
+
+def build_combined_context_text(
+    triples_ranked: List[Dict[str, Any]],
+    chunks_ranked: List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]]
+) -> Tuple[str, str, List[Dict[str, Any]]]:
+    """
+    Create a readable context text with:
+      - Triple summary (top up to 50)
+      - Selected chunk texts
+    Returns (context_text, summary_text, list_of_chunk_records_dict)
+    """
     summary_lines = []
     summary_lines.append("Ringkasan triple yang relevan:")
-    for t in ranked[:min(50, len(ranked))]:
+    for t in triples_ranked[:min(50, len(triples_ranked))]:
         s = t.get("subject"); p = t.get("predicate"); o = t.get("object")
         uu = t.get("uu_number") or ""
         art = t.get("evidence_article_ref") or ""
@@ -551,24 +756,19 @@ def build_context_from_triples(triples: List[Dict[str, Any]], chunk_store: Chunk
         summary_lines.append(f"- {s} [{p}] {o} | {uu} | {art} | bukti: {quote}")
     summary_text = "\n".join(summary_lines)
 
-    # Compose full context with selected chunks
     lines = [summary_text, "\nPotongan teks terkait (chunk):"]
-    for idx, (key, text, t) in enumerate(selected_chunks, start=1):
+    for idx, (key, text, t, score) in enumerate(chunks_ranked, start=1):
         doc_id = t.get("document_id")
         chunk_id = t.get("chunk_id")
         uu = t.get("uu_number") or ""
-        lines.append(f"[Chunk {idx}] doc={doc_id} chunk={chunk_id} | {uu}\n{text}")
+        lines.append(f"[Chunk {idx}] doc={doc_id} chunk={chunk_id} | {uu} | score={score:.3f}\n{text}")
     context = "\n".join(lines)
 
-    chunk_records = [{"key": key, "text": text, "triple": t} for key, text, t in selected_chunks]
+    chunk_records = [{"key": key, "text": text, "triple": t, "score": score} for key, text, t, score in chunks_ranked]
     return context, summary_text, chunk_records
 
 # ----------------- Agent 2 (Intermediate answer) -----------------
 def agent2_answer(query_original: str, context: str, guidance: Optional[str], output_lang: str = "id") -> str:
-    """
-    Instructions are in English. The model is explicitly asked to answer
-    in the same language as the user's question.
-    """
     instructions = (
         "Answer concisely and accurately based strictly on the provided context. "
         "Cite UU/Article references when they are clear. "
@@ -659,7 +859,7 @@ Intermediate answer:
     log(json.dumps(out, ensure_ascii=False, indent=2))
     return out
 
-# ----------------- Iterative GraphRAG with Agents -----------------
+# ----------------- Iterative GraphRAG with Agents (updated retrieval) -----------------
 def agentic_graph_rag(query_original: str) -> Dict[str, Any]:
     global _LOGGER
     ts_name = make_timestamp_name()
@@ -670,8 +870,10 @@ def agentic_graph_rag(query_original: str) -> Dict[str, Any]:
         log("=== Agentic GraphRAG run started ===")
         log(f"Log file: {log_file}")
         log(f"Original Query: {query_original}")
-        log(f"Parameters: TOP_K_ENTITIES={TOP_K_ENTITIES}, TOP_K_TRIPLES={TOP_K_TRIPLES}, N_HOPS={N_HOPS}, "
-            f"PER_HOP_LIMIT={PER_HOP_LIMIT}, MAX_EDGES={MAX_EDGES}, MAX_CHUNKS={MAX_CHUNKS}, "
+        log(f"Parameters: ENTITY_MATCH_TOP_K={ENTITY_MATCH_TOP_K}, ENTITY_SUBGRAPH_HOPS={ENTITY_SUBGRAPH_HOPS}, "
+            f"ENTITY_SUBGRAPH_PER_HOP_LIMIT={ENTITY_SUBGRAPH_PER_HOP_LIMIT}, SUBGRAPH_TRIPLES_TOP_K={SUBGRAPH_TRIPLES_TOP_K}, "
+            f"QUERY_TRIPLE_MATCH_TOP_K_PER={QUERY_TRIPLE_MATCH_TOP_K_PER}, MAX_TRIPLES_FINAL={MAX_TRIPLES_FINAL}, "
+            f"MAX_CHUNKS_FINAL={MAX_CHUNKS_FINAL}, CHUNK_RERANK_CAND_LIMIT={CHUNK_RERANK_CAND_LIMIT}, "
             f"ANSWER_MAX_TOKENS={ANSWER_MAX_TOKENS}, MAX_ITERS={MAX_ITERS}, OUTPUT_LANG={OUTPUT_LANG}")
 
         chunk_store = ChunkStore(LANGCHAIN_DIR, set(SKIP_FILES))
@@ -687,86 +889,82 @@ def agentic_graph_rag(query_original: str) -> Dict[str, Any]:
 
         for it in range(1, MAX_ITERS + 1):
             log(f"\n--- Iteration {it}/{MAX_ITERS} ---")
-            # Step 0: Embed query_for_iter
+
+            # Step 0: Embed whole user query (for chunk reranking and fallback)
             t0 = now_ms()
-            q_emb = embed_text(query_for_iter)
+            q_emb_query = embed_text(query_for_iter)
             t_embed = dur_ms(t0)
-            log(f"[Step 0] Query embedding complete in {t_embed:.0f} ms")
+            log(f"[Step 0] Whole-query embedding in {t_embed:.0f} ms")
             log(f"[Step 0] Query used this iteration: {query_for_iter}")
 
             # Step 1: Agent 1 – extract entities/predicates from query_for_iter
             t1 = now_ms()
             extraction = agent1_extract_entities_predicates(query_for_iter)
-            t_extract = dur_ms(t1)
             ents = extraction.get("entities", [])
             preds = extraction.get("predicates", [])
-            log(f"[Step 1] Extraction done in {t_extract:.0f} ms")
+            t_extract = dur_ms(t1)
+            log(f"[Step 1] Entity/Predicate extraction done in {t_extract:.0f} ms")
 
-            # Step 2: Vector search
+            # Step 1b: Agent 1b – extract triples from query_for_iter
+            t1b = now_ms()
+            query_triples = agent1b_extract_query_triples(query_for_iter)
+            t_extract_tr = dur_ms(t1b)
+            log(f"[Step 1b] Query triple extraction done in {t_extract_tr:.0f} ms")
+
+            # Step 2: Triple-centric retrieval (per query triple)
             t2 = now_ms()
-            sim_entities = search_similar_entities(q_emb, k=TOP_K_ENTITIES)
-            sim_triples  = search_similar_triples(q_emb, k=TOP_K_TRIPLES)
-            t_search = dur_ms(t2)
-            log(f"[Step 2] Vector search done in {t_search:.0f} ms")
-            log(f"  - Top entities: {len(sim_entities)}; sample: {sim_entities[:3]}")
-            log(f"  - Top triples: {len(sim_triples)}; sample: "
-                f"{[{k:v for k,v in x.items() if k in ('subject','predicate','object','uu_number','score')} for x in sim_triples[:3]]}")
+            ctx2_triples, q_trip_embs = triple_centric_retrieval(query_triples)
+            t_triple = dur_ms(t2)
+            log(f"[Step 2] Triple-centric retrieval in {t_triple:.0f} ms; ctx2_triples={len(ctx2_triples)}, q_trip_embs={len(q_trip_embs)}")
 
-            # Step 3: n-hop expansion
-            seed_entity_keys = [e["key"] for e in sim_entities if e.get("key")]
-            seed_triple_uids = [t["triple_uid"] for t in sim_triples if t.get("triple_uid")]
-
+            # Step 3: Entity-centric retrieval (entity→KG entities→expand→triples scored vs query triples)
             t3 = now_ms()
-            expanded_from_ents = expand_from_entities(seed_entity_keys, N_HOPS, PER_HOP_LIMIT)
-            expanded_from_trs  = expand_from_triples(seed_triple_uids, N_HOPS, PER_HOP_LIMIT)
-            t_expand = dur_ms(t3)
+            ctx1_triples = entity_centric_retrieval(ents, q_trip_embs=q_trip_embs, q_emb_fallback=q_emb_query)
+            t_entity = dur_ms(t3)
+            log(f"[Step 3] Entity-centric retrieval in {t_entity:.0f} ms; ctx1_triples={len(ctx1_triples)}")
 
-            # Merge and deduplicate triples
+            # Step 4: Merge contexts, dedupe triples
             triple_map: Dict[str, Dict[str, Any]] = {}
-            for t in sim_triples + expanded_from_ents + expanded_from_trs:
-                triple_map[t["triple_uid"]] = t
-            expanded_triples = list(triple_map.values())
+            for t in ctx1_triples + ctx2_triples:
+                uid = t.get("triple_uid")
+                if uid:
+                    # keep best by aggregated score proxy if available (use existing score if present)
+                    prev = triple_map.get(uid)
+                    if prev is None or (t.get("score", 0.0) > prev.get("score", 0.0)):
+                        triple_map[uid] = t
+            merged_triples = list(triple_map.values())
+            log(f"[Step 4] Merged triples from contexts: {len(merged_triples)}")
 
-            log(f"[Step 3] Expansion done in {t_expand:.0f} ms")
-            log(f"  - Expanded triples (unique): {len(expanded_triples)}")
-
-            # Step 4: Rerank and cap to MAX_EDGES
-            t4 = now_ms()
-            def score_triple(t: Dict[str, Any]) -> float:
-                emb = t.get("embedding")
-                return cos_sim(q_emb, emb) if isinstance(emb, list) else 0.0
-            ranked_triples = sorted(expanded_triples, key=score_triple, reverse=True)
-            selected_triples = ranked_triples[:MAX_EDGES]
-            t_rerank = dur_ms(t4)
-
-            node_keys: Set[str] = set()
-            for t in selected_triples:
-                if t.get("subject_key"): node_keys.add(t["subject_key"])
-                if t.get("object_key"):  node_keys.add(t["object_key"])
-            log(f"[Step 4] Rerank+cap done in {t_rerank:.0f} ms")
-            log(f"  - Selected edges/triples: {len(selected_triples)}")
-            log(f"  - Selected nodes (unique keys): {len(node_keys)}")
-
-            # Step 5: Retrieve chunks and build context
+            # Step 5: Gather chunks from merged triples, dedupe, rerank by whole-query similarity
             t5 = now_ms()
-            context_text, context_summary, selected_chunks = build_context_from_triples(selected_triples, chunk_store, MAX_CHUNKS, q_emb)
+            chunk_records = collect_chunks_for_triples(merged_triples, chunk_store)
+            log(f"[Step 5] Collected {len(chunk_records)} chunk candidates (pre-rerank)")
+            chunks_ranked = rerank_chunks_by_query(chunk_records, q_emb_query, top_k=MAX_CHUNKS_FINAL)
             t_chunks = dur_ms(t5)
-            log(f"[Step 5] Chunk retrieval and context build in {t_chunks:.0f} ms")
-            log(f"  - Chunks selected: {len(selected_chunks)}")
+            log(f"[Step 5] Chunk rerank done in {t_chunks:.0f} ms; selected {len(chunks_ranked)}")
+
+            # Step 6: Rerank triples by mean similarity to query triples (fallback to query embedding)
+            t6 = now_ms()
+            triples_ranked = rerank_triples_by_query_triples(merged_triples, q_trip_embs=q_trip_embs, q_emb_fallback=q_emb_query, top_k=MAX_TRIPLES_FINAL)
+            t_rerank = dur_ms(t6)
+            log(f"[Step 6] Triple rerank done in {t_rerank:.0f} ms; selected {len(triples_ranked)}")
+
+            # Build combined context text (summary + chunks)
+            context_text, context_summary, _ = build_combined_context_text(triples_ranked, chunks_ranked)
             log("\n[Context summary for this iteration]:")
             log(context_summary)
 
-            # Step 6: Agent 2 – Intermediate answer (answer language follows user_lang)
-            t6 = now_ms()
-            intermediate_answer = agent2_answer(query_original, context_text, guidance_prev, output_lang=user_lang)
-            t_answer = dur_ms(t6)
-            log(f"[Step 6] Intermediate answer generated in {t_answer:.0f} ms")
-
-            # Step 7: Agent 3 – Judge
+            # Step 7: Agent 2 – Answer
             t7 = now_ms()
+            intermediate_answer = agent2_answer(query_original, context_text, guidance_prev, output_lang=user_lang)
+            t_answer = dur_ms(t7)
+            log(f"[Step 7] Intermediate answer generated in {t_answer:.0f} ms")
+
+            # Step 8: Agent 3 – Judge
+            t8 = now_ms()
             judge = agent3_judge(query_original, intermediate_answer, context_summary, output_lang=user_lang)
-            t_judge = dur_ms(t7)
-            log(f"[Step 7] Judgment done in {t_judge:.0f} ms")
+            t_judge = dur_ms(t8)
+            log(f"[Step 8] Judgment done in {t_judge:.0f} ms")
 
             judge_reports.append(judge)
 

@@ -21,7 +21,7 @@ TMP_SCRIPT_PREFIX = "_kg_pipeline_run_"
 LOGS_DIR = (BASE_DIR / "run_logs").resolve()
 
 # How many runs to execute at the same time
-BATCH_SIZE = 8
+BATCH_SIZE = 5
 
 # ANSI colors for per-process tagging
 COLORS = [

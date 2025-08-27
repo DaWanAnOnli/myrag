@@ -1,68 +1,130 @@
-Found 1 pickle files in C:\Users\Joel Rompis\Documents\Semester 7\TA\GraphRAG\myrag\dataset\langchain-results\samples (skipping: all_langchain_documents.pkl)
-Total chunks planned: 132
+Using generation model: models/gemini-2.5-flash
+Found 5 pickle files in C:\Users\Joel Rompis\Documents\Semester 7\TA\GraphRAG\myrag\dataset\langchain-results\samples (skipping: all_langchain_documents.pkl)
+Total chunks planned: 78
 API budget: enforce=True, total=10, used=0, allowed_calls_remaining=10
-Planned batch size: 14 chunk(s)/call -> planned batches: 10 (limit: 10 calls)
 LLM rate limit: 13 calls/minute
-[1/1] Processing 100-PUU-XXII-2024_chunks.pkl
-  - 100-PUU-XXII-2024_chunks.pkl: 132 chunks
-    - Batch starting at chunk index 0: size=14 chunk(s), est_tokens≈9446
-      · Extracted triples: 150
-      · Nodes in batch: 169 (new: 169, duplicate this run: 0)
-      · Edges in batch: 143 (new: 143, duplicate this run: 0)
-      · Time: 370.96s
-    - Batch starting at chunk index 14: size=14 chunk(s), est_tokens≈9774
-      · Extracted triples: 116
-      · Nodes in batch: 133 (new: 126, duplicate this run: 7)
-      · Edges in batch: 116 (new: 116, duplicate this run: 0)
-      · Time: 274.95s
-    - Batch starting at chunk index 28: size=14 chunk(s), est_tokens≈10247
-      · Extracted triples: 114
-      · Nodes in batch: 150 (new: 142, duplicate this run: 8)
-      · Edges in batch: 114 (new: 114, duplicate this run: 0)
-      · Time: 288.49s
-    - Batch starting at chunk index 42: size=14 chunk(s), est_tokens≈10090
-      · Extracted triples: 170
-      · Nodes in batch: 224 (new: 203, duplicate this run: 21)
-      · Edges in batch: 168 (new: 168, duplicate this run: 0)
-      · Time: 340.23s
-    - Batch starting at chunk index 56: size=14 chunk(s), est_tokens≈9795
-      · Extracted triples: 137
-      · Nodes in batch: 149 (new: 104, duplicate this run: 45)
-      · Edges in batch: 136 (new: 136, duplicate this run: 0)
-      · Time: 290.57s
-    - Batch starting at chunk index 70: size=14 chunk(s), est_tokens≈9852
-      · Extracted triples: 123
-      · Nodes in batch: 141 (new: 116, duplicate this run: 25)
-      · Edges in batch: 123 (new: 123, duplicate this run: 0)
-      · Time: 312.62s
-    - Batch starting at chunk index 84: size=14 chunk(s), est_tokens≈10053
-      · Extracted triples: 87
-      · Nodes in batch: 133 (new: 96, duplicate this run: 37)
-      · Edges in batch: 87 (new: 87, duplicate this run: 0)
-      · Time: 253.90s
-    - Batch starting at chunk index 98: size=14 chunk(s), est_tokens≈9957
-      · Extracted triples: 70
-      · Nodes in batch: 94 (new: 68, duplicate this run: 26)
-      · Edges in batch: 68 (new: 68, duplicate this run: 0)
-      · Time: 181.12s
-    - Batch starting at chunk index 112: size=14 chunk(s), est_tokens≈10040
-      · Extracted triples: 96
-      · Nodes in batch: 105 (new: 66, duplicate this run: 39)
-      · Edges in batch: 96 (new: 96, duplicate this run: 0)
-      · Time: 246.97s
-    - Batch starting at chunk index 126: size=6 chunk(s), est_tokens≈4177
-      · Extracted triples: 52
-      · Nodes in batch: 62 (new: 43, duplicate this run: 19)
-      · Edges in batch: 52 (new: 52, duplicate this run: 0)
-      · Time: 141.65s
-    ✓ Done 100-PUU-XXII-2024_chunks.pkl: processed 132 chunks
+Greedy batching target: <= 40 items, est tokens <= 8000
+[1/5] Processing UUNomor10Tahun1980_chunks.pkl
+  - UUNomor10Tahun1980_chunks.pkl: 6 chunks
+    - Batch at index 0: size=6 item(s), est_tokens≈4334
+      · Chunk 1463c9d4-b58a-4b16-8c25-3ccaabea6467: Gemini=21.28s | Embedding=20.88s | Neo4j=4.20s | Triples=14
+      · Chunk 5c12ad2d-d860-4875-bc70-2f997634447c: Gemini=21.28s | Embedding=31.21s | Neo4j=3.28s | Triples=21
+      · Chunk 366c13b6-acde-4b00-a981-1d5fa20c9845: Gemini=21.28s | Embedding=19.99s | Neo4j=2.36s | Triples=22
+      · Chunk 47bc8e7d-f5a7-4c45-9cb1-16bf846bf502: Gemini=21.28s | Embedding=7.48s | Neo4j=0.93s | Triples=7
+      · Chunk 43e5b6ae-0379-475a-b9e3-f9dfc21638d4: Gemini=21.28s | Embedding=15.23s | Neo4j=0.76s | Triples=10
+      · Chunk 9f4b9837-f28d-40dc-9ef6-8b26d2fb43ba: Gemini=21.28s | Embedding=5.21s | Neo4j=0.15s | Triples=4
+      · Batch time: 277.27s (LLM 127.68s) | Chunks processed: 6 | Triples stored: 78
+    ✓ Done UUNomor10Tahun1980_chunks.pkl: processed 6 chunks in this file
+[2/5] Processing UUNomor10Tahun2021_chunks.pkl
+  - UUNomor10Tahun2021_chunks.pkl: 21 chunks
+    - Batch at index 0: size=10 item(s), est_tokens≈7620
+      · Chunk 5a2d0587-13ae-4223-afc1-79d05a3d04f3: Gemini=13.50s | Embedding=11.86s | Neo4j=1.01s | Triples=7
+      · Chunk e44ca214-b775-42f6-9d32-6e8e87d74d14: Gemini=13.50s | Embedding=11.23s | Neo4j=1.56s | Triples=16
+      · Chunk b217eb26-61b9-4665-bf70-75874ad423cd: Gemini=13.50s | Embedding=12.26s | Neo4j=0.13s | Triples=7
+      · Chunk 87c295b7-0444-4a2b-8787-f76fe87c7559: Gemini=13.50s | Embedding=20.92s | Neo4j=0.69s | Triples=24
+      · Chunk 019c48b0-ad8c-48ac-87a8-04e8a8410b32: Gemini=13.50s | Embedding=9.83s | Neo4j=0.44s | Triples=19
+      · Chunk 33553948-956e-4ea2-8a71-0145bb3b2cfb: Gemini=13.50s | Embedding=2.00s | Neo4j=0.47s | Triples=3
+      · Chunk 962a8de3-7ff5-43f7-bd85-666868b9cc05: Gemini=13.50s | Embedding=3.99s | Neo4j=0.12s | Triples=6
+      · Chunk faba60dd-0108-4539-ba8d-2c6d8f8bf593: Gemini=13.50s | Embedding=0.79s | Neo4j=0.05s | Triples=2
+      · Chunk 8a615402-5016-4445-a81c-0f9b1fbb9e01: Gemini=13.50s | Embedding=8.13s | Neo4j=0.64s | Triples=9
+      · Chunk 9146a95f-9fe2-4943-8318-a5cdf67be627: Gemini=13.50s | Embedding=6.05s | Neo4j=0.42s | Triples=8
+      · Batch time: 260.95s (LLM 135.00s) | Chunks processed: 10 | Triples stored: 101
+    - Batch at index 10: size=10 item(s), est_tokens≈7774
+      · Chunk 998df107-8901-47bc-a595-923e3a7c125a: Gemini=10.33s | Embedding=2.88s | Neo4j=0.52s | Triples=4
+      · Chunk 4e7ee64a-11bf-42ce-84d9-579e5bdd45dc: Gemini=10.33s | Embedding=6.03s | Neo4j=0.58s | Triples=8
+      · Chunk 68af0cce-d50d-4321-8e26-20da170fe0be: Gemini=10.33s | Embedding=7.86s | Neo4j=0.05s | Triples=2
+      · Chunk 281afb9a-6194-4498-bd2c-431802eaf54a: Gemini=10.33s | Embedding=1.62s | Neo4j=0.34s | Triples=2
+      · Chunk 3bede9d7-cb1b-4f94-ab5b-1e7acb11f62d: Gemini=10.33s | Embedding=0.00s | Neo4j=0.00s | Triples=0
+      · Chunk 9ad3f7f0-dfba-4c43-ab27-f0e60ebee01c: Gemini=10.33s | Embedding=1.25s | Neo4j=0.04s | Triples=2
+      · Chunk 54fef489-edfe-4837-b3ba-dba0d61f2604: Gemini=10.33s | Embedding=3.22s | Neo4j=0.37s | Triples=4
+      · Chunk f50dc524-265e-40fa-aa54-1e86333a3b36: Gemini=10.33s | Embedding=1.22s | Neo4j=0.04s | Triples=2
+      · Chunk 1723e5b4-a2d0-41e3-8a3f-dead156a39e7: Gemini=10.33s | Embedding=2.37s | Neo4j=0.08s | Triples=4
+      · Chunk d19e9e57-0a97-48be-826c-decc553cacd7: Gemini=10.33s | Embedding=4.79s | Neo4j=0.10s | Triples=5
+      · Batch time: 152.28s (LLM 103.32s) | Chunks processed: 10 | Triples stored: 33
+    - Batch at index 20: size=1 item(s), est_tokens≈646
+      · Chunk 8a31738a-e776-4b62-8dbc-d952d94895a0: Gemini=11.72s | Embedding=1.21s | Neo4j=0.54s | Triples=2
+      · Batch time: 14.20s (LLM 11.72s) | Chunks processed: 1 | Triples stored: 2
+    ✓ Done UUNomor10Tahun2021_chunks.pkl: processed 21 chunks in this file
+[3/5] Processing UUNomor11Tahun1985_chunks.pkl
+  - UUNomor11Tahun1985_chunks.pkl: 5 chunks
+    - Batch at index 0: size=5 item(s), est_tokens≈4128
+      · Chunk ad1bcc58-b64d-4dca-97be-9c558007ceb3: Gemini=14.44s | Embedding=6.60s | Neo4j=1.34s | Triples=7
+      · Chunk 260f27ec-b939-4489-b0e1-080ddf5617ae: Gemini=14.44s | Embedding=6.94s | Neo4j=1.27s | Triples=10
+      · Chunk 62b675fe-43e2-4681-8506-11cb213c96f1: Gemini=14.44s | Embedding=6.81s | Neo4j=1.47s | Triples=7
+      · Chunk b41c6118-cfb1-4f46-bf51-7329abf8bc35: Gemini=14.44s | Embedding=10.83s | Neo4j=0.98s | Triples=10
+      · Chunk 129fe5b8-622e-4efa-955a-782d47d8cf15: Gemini=14.44s | Embedding=1.59s | Neo4j=0.04s | Triples=2
+      · Batch time: 127.96s (LLM 72.19s) | Chunks processed: 5 | Triples stored: 36
+    ✓ Done UUNomor11Tahun1985_chunks.pkl: processed 5 chunks in this file
+[4/5] Processing UUNomor12Tahun1950_chunks.pkl
+  - UUNomor12Tahun1950_chunks.pkl: 8 chunks
+    - Batch at index 0: size=8 item(s), est_tokens≈5649
+      · Chunk 704918a2-4ec6-4f03-ac37-445ad87234aa: Gemini=26.55s | Embedding=27.63s | Neo4j=1.68s | Triples=30
+      · Chunk 2f10c1e8-b3ef-4257-bec6-2bca0ca743b0: Gemini=26.55s | Embedding=61.78s | Neo4j=2.10s | Triples=51
+      · Chunk a29c91ff-eb8c-4f1d-8563-698705e46fb4: Gemini=26.55s | Embedding=24.31s | Neo4j=1.31s | Triples=27
+      · Chunk b41c892b-70ee-4930-a7e5-c61c9e2d5570: Gemini=26.55s | Embedding=19.18s | Neo4j=0.31s | Triples=13
+      · Chunk b23d74f1-519c-40f7-bd88-6caf7fcaa5e9: Gemini=26.55s | Embedding=22.87s | Neo4j=0.40s | Triples=28
+      · Chunk 54d2e846-5c26-4565-8535-2b7185ae1022: Gemini=26.55s | Embedding=15.65s | Neo4j=0.33s | Triples=19
+      · Chunk 2d1324eb-6ef3-457e-90ef-82ce7ba9e134: Gemini=26.55s | Embedding=18.91s | Neo4j=0.62s | Triples=21
+      · Chunk 60eeaeef-ed42-4726-b9b4-bc5e3006e3ab: Gemini=26.55s | Embedding=34.44s | Neo4j=0.34s | Triples=18
+      · Batch time: 535.41s (LLM 212.42s) | Chunks processed: 8 | Triples stored: 207
+    ✓ Done UUNomor12Tahun1950_chunks.pkl: processed 8 chunks in this file
+[5/5] Processing UUNomor12Tahun1999_chunks.pkl
+  - UUNomor12Tahun1999_chunks.pkl: 38 chunks
+    - Batch at index 0: size=10 item(s), est_tokens≈7589
+      · Chunk c53e4bb1-3b25-4f2c-96da-ca97b97e472b: Gemini=27.21s | Embedding=28.11s | Neo4j=0.60s | Triples=8
+      · Chunk 1ea2072a-1c2e-4eba-a5ea-6ffc09840f13: Gemini=27.21s | Embedding=13.82s | Neo4j=1.94s | Triples=16
+      · Chunk 4667c320-90c8-4e1c-86b3-7ef22e2a55bf: Gemini=27.21s | Embedding=23.25s | Neo4j=1.31s | Triples=28
+      · Chunk cebd97ea-b849-4e94-84e0-ad7cffb615ce: Gemini=27.21s | Embedding=19.99s | Neo4j=0.92s | Triples=25
+      · Chunk 93431e71-286c-486b-8753-8c8730b23e2c: Gemini=27.21s | Embedding=27.12s | Neo4j=0.54s | Triples=29
+      · Chunk 6e59e4df-d9d4-4a92-94bf-cd20643d7832: Gemini=27.21s | Embedding=21.94s | Neo4j=0.66s | Triples=31
+      · Chunk c14ed545-1048-4c46-bf3c-c1528d2f1f9e: Gemini=27.21s | Embedding=31.51s | Neo4j=1.33s | Triples=54
+      · Chunk ea2386f2-74e8-45b5-94b9-82e490d3c7e5: Gemini=27.21s | Embedding=19.03s | Neo4j=0.39s | Triples=21
+      · Chunk 646847fb-9104-4f7b-9128-b8912b00e733: Gemini=27.21s | Embedding=14.47s | Neo4j=0.58s | Triples=20
+      · Chunk 87a1207c-4c73-4ed5-8ee6-8f700765129b: Gemini=27.21s | Embedding=11.71s | Neo4j=0.68s | Triples=13
+      · Batch time: 585.51s (LLM 272.14s) | Chunks processed: 10 | Triples stored: 245
+    - Batch at index 10: size=10 item(s), est_tokens≈7941
+      · Chunk ca6465c2-3736-4f7c-bb56-d6eb5716033f: Gemini=23.13s | Embedding=10.51s | Neo4j=0.27s | Triples=16
+      · Chunk 9a3ba51a-a7fa-49d2-b01f-a67222b10639: Gemini=23.13s | Embedding=18.28s | Neo4j=0.30s | Triples=23
+      · Chunk 463aca84-cb30-43ad-ac2b-90528bfda2af: Gemini=23.13s | Embedding=12.85s | Neo4j=0.44s | Triples=13
+      · Chunk ed7274fb-4b0a-4acc-9796-174a5b56f9d7: Gemini=23.13s | Embedding=11.36s | Neo4j=0.38s | Triples=20
+      · Chunk 9c7099a2-3f57-4635-abcc-d67364827d3d: Gemini=23.13s | Embedding=10.93s | Neo4j=0.23s | Triples=17
+      · Chunk a3f6e4b7-2f42-4e29-a5ee-57f0d66e1574: Gemini=23.13s | Embedding=11.45s | Neo4j=0.10s | Triples=15
+      · Chunk 53cdc3e0-b3b6-4dd9-b46d-fcfc6c482504: Gemini=23.13s | Embedding=13.03s | Neo4j=0.39s | Triples=17
+      · Chunk fd5fd7e1-31fc-4c44-a153-0924c299e7f8: Gemini=23.13s | Embedding=12.49s | Neo4j=0.12s | Triples=19
+      · Chunk 748cb494-2f8f-4851-a13e-c6233488bc9a: Gemini=23.13s | Embedding=7.99s | Neo4j=0.08s | Triples=11
+      · Chunk 2d662b99-2e03-427b-b831-f5455c891768: Gemini=23.13s | Embedding=13.11s | Neo4j=0.11s | Triples=17
+      · Batch time: 374.74s (LLM 231.30s) | Chunks processed: 10 | Triples stored: 168
+    - Batch at index 20: size=10 item(s), est_tokens≈7645
+      · Chunk be2ca83f-0643-4297-8a26-25dfae412912: Gemini=24.55s | Embedding=4.52s | Neo4j=0.29s | Triples=5
+      · Chunk b75fa190-e225-4a52-9593-cbb846b2aed9: Gemini=24.55s | Embedding=11.79s | Neo4j=0.37s | Triples=30
+      · Chunk 2c718359-0c14-41d3-9bc1-18ba48501f70: Gemini=24.55s | Embedding=11.40s | Neo4j=0.18s | Triples=16
+      · Chunk ced17865-6080-43f0-9426-a5fe0211c65b: Gemini=24.55s | Embedding=6.40s | Neo4j=0.16s | Triples=10
+      · Chunk 0200a6bd-aa3c-402c-86b9-d1210de767b7: Gemini=24.55s | Embedding=20.52s | Neo4j=0.50s | Triples=48
+      · Chunk 2e27759d-9e48-4be5-854d-68dd62bc1239: Gemini=24.55s | Embedding=17.52s | Neo4j=0.53s | Triples=35
+      · Chunk d88f72ae-a170-4281-8438-e5f343f4b871: Gemini=24.55s | Embedding=7.28s | Neo4j=0.20s | Triples=13
+      · Chunk ae4c5413-d25e-43f6-9769-de203fc8a08e: Gemini=24.55s | Embedding=9.59s | Neo4j=0.33s | Triples=12
+      · Chunk f8a39d17-6d1c-49ad-9e2a-0a26fd1e1680: Gemini=24.55s | Embedding=5.57s | Neo4j=0.15s | Triples=9
+      · Chunk a8afa701-101a-48b9-a4a6-025ecfa5d4c8: Gemini=24.55s | Embedding=13.71s | Neo4j=0.26s | Triples=28
+      · Batch time: 382.28s (LLM 245.51s) | Chunks processed: 10 | Triples stored: 206
+    - Batch at index 30: size=8 item(s), est_tokens≈6491
+      · Chunk 8222a5cd-2529-4ed1-a01c-b3f6eee1f234: Gemini=16.13s | Embedding=6.11s | Neo4j=0.28s | Triples=9
+      · Chunk 179cc5a3-f1f3-45da-b1c0-17dd9da4d6c5: Gemini=16.13s | Embedding=8.17s | Neo4j=0.24s | Triples=15
+      · Chunk fb7acda2-5010-4c6a-b54d-12c1d930b645: Gemini=16.13s | Embedding=5.56s | Neo4j=0.41s | Triples=12
+      · Chunk dd1e30ae-6f78-4ed9-9a89-ab0ee018149d: Gemini=16.13s | Embedding=4.35s | Neo4j=0.08s | Triples=9
+      · Chunk 8eee109d-ff84-4207-a856-e5f2db153238: Gemini=16.13s | Embedding=4.73s | Neo4j=0.06s | Triples=7
+      · Chunk 8082cd4e-601c-4746-99fd-a94219d65a24: Gemini=16.13s | Embedding=11.26s | Neo4j=0.26s | Triples=17
+      · Chunk 1226cde7-b66d-4cc5-8d79-ec513f6639e9: Gemini=16.13s | Embedding=7.32s | Neo4j=0.24s | Triples=13
+      · Chunk 1c93ad0e-e451-475e-939b-44cd55d3c96f: Gemini=16.13s | Embedding=0.00s | Neo4j=0.00s | Triples=0
+      · Batch time: 188.77s (LLM 129.01s) | Chunks processed: 8 | Triples stored: 82
+    ! LLM call budget now exhausted after this batch.
+    ✓ Done UUNomor12Tahun1999_chunks.pkl: processed 38 chunks in this file
 
 Summary
-- Chunks processed: 132/132
-- Batches processed: 10
-- Triples stored: 1115
-- Unique nodes (this run): 1133
-- Unique edges (this run): 1103
-- Total time: 2701.46s
-- Avg time per batch: 270.15s
+- Chunks processed: 78/78
+- Triples stored: 1158
+- Total time: 2899.44s
+- LLM calls used: 10 (budget enforced)
+- Total Gemini time: 1540.28s
+- Total Embedding time: 965.80s
+- Total Neo4j time: 48.01s
 - API used: 10/10 (LLM calls and no embeddings counted)
