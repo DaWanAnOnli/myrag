@@ -23,7 +23,7 @@ GEN_MODEL = os.getenv("GEN_MODEL", "models/gemini-2.5-flash")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "models/text-embedding-004")
 
 # Dataset folder for original chunk pickles (same as ingestion)
-DEFAULT_LANGCHAIN_DIR = (Path(__file__).resolve().parent / "../dataset/langchain-results/samples").resolve()
+DEFAULT_LANGCHAIN_DIR = (Path(__file__).resolve().parent / "../dataset/samples/langchain-results/").resolve()
 LANGCHAIN_DIR = Path(os.getenv("LANGCHAIN_DIR") or str(DEFAULT_LANGCHAIN_DIR))
 SKIP_FILES = {"all_langchain_documents.pkl"}
 

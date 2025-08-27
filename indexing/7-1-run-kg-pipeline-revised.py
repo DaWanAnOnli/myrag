@@ -12,16 +12,16 @@ from dotenv import load_dotenv  # pip install python-dotenv
 # -------------- Paths (relative to this script) --------------
 BASE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BASE_DIR.parent  # parent directory of this script
-# BATCHES_ROOT = (BASE_DIR / "../dataset/samples/langchain-batches").resolve()
-# JSON_OUTPUT_DIR = (BASE_DIR / "../dataset/samples/llm-json-outputs").resolve()
-BATCHES_ROOT = (BASE_DIR / "../dataset/langchain-batches").resolve()
-JSON_OUTPUT_DIR = (BASE_DIR / "../dataset/llm-json-outputs").resolve()
+BATCHES_ROOT = (BASE_DIR / "../dataset/samples/langchain-batches").resolve()
+JSON_OUTPUT_DIR = (BASE_DIR / "../dataset/samples/llm-json-outputs").resolve()
+# BATCHES_ROOT = (BASE_DIR / "../dataset/langchain-batches").resolve()
+# JSON_OUTPUT_DIR = (BASE_DIR / "../dataset/llm-json-outputs").resolve()
 KG_PIPELINE_PATH = (BASE_DIR / "kg_pipeline.py").resolve()
 TMP_SCRIPT_PREFIX = "_kg_pipeline_run_"
 LOGS_DIR = (BASE_DIR / "run_logs").resolve()
 
 # How many runs to execute at the same time
-BATCH_SIZE = 5
+BATCH_SIZE = 8
 
 # ANSI colors for per-process tagging
 COLORS = [

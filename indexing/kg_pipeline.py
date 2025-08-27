@@ -54,7 +54,7 @@ GEN_MODEL = _normalize_model_name(os.getenv("GEN_MODEL", "gemini-2.5-flash-lite"
 EMBED_MODEL = _normalize_model_name(os.getenv("EMBED_MODEL", "text-embedding-004"))
 
 # Directory of LangChain per-document pickle files
-DEFAULT_LANGCHAIN_DIR = (Path(__file__).resolve().parent / "../dataset/langchain-results/samples").resolve()
+DEFAULT_LANGCHAIN_DIR = (Path(__file__).resolve().parent / "../dataset/samples/langchain-results/").resolve()
 LANGCHAIN_DIR = DEFAULT_LANGCHAIN_DIR
 
 # Neo4j
