@@ -6,6 +6,7 @@ from typing import List, Dict, Tuple
 from dotenv import load_dotenv
 import subprocess
 from datetime import datetime
+import sys  # ensure we can fall back to the current interpreter
 
 # --- Configuration ---
 # Set the desired RPM for EACH individual process.
@@ -15,6 +16,7 @@ RPM_PER_PROCESS = 14
 # Set how many minutes the test should run.
 DURATION_MINUTES = 1
 # ---------------------
+
 
 class GeminiRunner:
     def __init__(self):
@@ -26,6 +28,20 @@ class GeminiRunner:
         
         # Create outputs directory if it doesn't exist
         self.output_dir.mkdir(exist_ok=True)
+
+    def resolve_python(self) -> str:
+        """
+        Prefer the venv interpreter at ../env. If not found, fall back to
+        the current interpreter running this script.
+        """
+        venv_dir = self.parent_dir / "env"
+        if os.name == "nt":
+            candidate = venv_dir / "Scripts" / "python.exe"
+        else:
+            candidate = venv_dir / "bin" / "python"
+        if candidate.exists():
+            return str(candidate)
+        return sys.executable
     
     def load_api_keys(self) -> Dict[str, str]:
         """Load all GOOGLE_API_KEY_* variables from .env file"""
@@ -50,11 +66,13 @@ class GeminiRunner:
         
         env = os.environ.copy()
         env["GOOGLE_API_KEY"] = api_key
+
+        python_exe = self.resolve_python()
+        print(f"   Using interpreter: {python_exe}")
         
         try:
-            # Modified to pass rate and duration arguments
             process = await asyncio.create_subprocess_exec(
-                "python", str(self.gemini_script),
+                python_exe, str(self.gemini_script),
                 "--rate", str(rate),
                 "--duration", str(duration),
                 stdout=asyncio.subprocess.PIPE,
@@ -67,7 +85,7 @@ class GeminiRunner:
             output = stdout.decode('utf-8', errors='replace')
             
             with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(f"=== Gemini API Sustained Rate Test Results ===\n")
+                f.write(f"=== Gemini API Bursty Rate Test Results ===\n")
                 f.write(f"API Key Number: {key_number}\n")
                 f.write(f"Target Rate: {rate} RPM\n")
                 f.write(f"Duration: {duration} minutes\n")
@@ -124,7 +142,8 @@ class GeminiRunner:
         return results
     
     def print_summary(self, results: List[Tuple[str, str, int]]):
-        if not results: return
+        if not results:
+            return
         successful = sum(1 for r in results if isinstance(r, tuple) and r[2] == 0)
         failed = len(results) - successful
         print("\n" + "=" * 60)
@@ -143,14 +162,16 @@ class GeminiRunner:
                 print(f"   - API Key #{key_number}: [{status}] -> {output_file}")
             else:
                 print(f"   - Unexpected result: {result}")
-        print("\n[INFO] Review individual output files for detailed rate-limiting results.")
+        print("\n[INFO] Review individual output files for rate-wait and status per call.")
+
 
 async def main():
-    print("Gemini Sustained Rate API Key Runner")
+    print("Gemini Bursty Rate API Key Runner")
     print("=" * 50)
     runner = GeminiRunner()
     results = await runner.run_all_processes()
     runner.print_summary(results)
+
 
 if __name__ == "__main__":
     try:

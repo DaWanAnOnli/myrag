@@ -1,0 +1,19 @@
+CREATE CONSTRAINT textchunk_key_unique IF NOT EXISTS
+FOR (c:TextChunk) REQUIRE c.key IS UNIQUE;
+
+CREATE CONSTRAINT document_id_unique IF NOT EXISTS
+FOR (d:Document) REQUIRE d.document_id IS UNIQUE;
+
+// Optional: secondary lookup to filter chunks by doc quickly
+CREATE INDEX textchunk_doc_id IF NOT EXISTS
+FOR (c:TextChunk) ON (c.document_id);
+
+CREATE VECTOR INDEX chunk_embedding_index IF NOT EXISTS
+FOR (c:TextChunk)
+ON (c.embedding)
+OPTIONS {
+  indexConfig: {
+    `vector.dimensions`: 768,
+    `vector.similarity_function`: 'cosine'
+  }
+};
