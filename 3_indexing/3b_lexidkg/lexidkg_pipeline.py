@@ -183,6 +183,7 @@ ALLOWED_NODE_TYPES: List[str] = sorted(set(
 ))
 
 # ----------------- SYSTEM HINT (LexID ontology) -----------------
+# Note: Omitted full text for brevity per user request.
 SYSTEM_HINT = """
 You are an expert in Indonesian legal knowledge graphs. You extract structured information from legal documents (Undang-Undang) to build a knowledge graph following the LexID ontology.
 
@@ -451,6 +452,7 @@ EXTRACTION PRIORITIES:
 6. Concept definitions and references
 """
 
+
 def build_single_prompt(meta: Dict[str, Any], chunk_text: str) -> str:
     return f"""
 {SYSTEM_HINT}
@@ -586,6 +588,24 @@ def next_attempt_id() -> int:
         aid = _attempt_counter
         _attempt_counter += 1
         return aid
+
+# ----------------- Early stop (attempt-id cap) -----------------
+MAX_ATTEMPT_ID = int(os.getenv("MAX_ATTEMPT_ID", "1100"))
+
+class EarlyStop(Exception):
+    def __init__(self, message: str, attempt_id: Optional[int] = None):
+        super().__init__(message)
+        self.attempt_id = attempt_id
+
+STOP_EVENT = threading.Event()
+
+def request_stop(reason: str = ""):
+    if not STOP_EVENT.is_set():
+        STOP_EVENT.set()
+        log_warn(f"[STOP] Early stop requested. Reason: {reason}")
+
+def should_stop() -> bool:
+    return STOP_EVENT.is_set()
 
 # ----------------- Rate Limiter (LLM) -----------------
 class RateLimitError(Exception):
@@ -914,11 +934,19 @@ def run_llm_json(prompt: str, schema: dict, context: Dict[str, Any]) -> Tuple[Di
     Budget note: budget is charged ONLY after successful call and JSON parsing.
     Also saves the successful JSON output to a file (one file per batch).
     """
+    # Stop immediately if a prior attempt triggered early stop
+    if should_stop():
+        raise EarlyStop("Early stop already requested; skipping LLM call.")
+
     # Budget gate (we only check; we will register after success)
     if not API_BUDGET.will_allow("llm", 1):
         raise RuntimeError("API budget would be exceeded by another LLM call; stopping extraction.")
 
     attempt_id = next_attempt_id()
+    # If attempt cap reached, request global stop and bail out immediately
+    if attempt_id >= MAX_ATTEMPT_ID:
+        request_stop(f"attempt_id reached {attempt_id} (cap={MAX_ATTEMPT_ID})")
+        raise EarlyStop(f"attempt_id reached {attempt_id}", attempt_id=attempt_id)
 
     # Respect client-side rate limiter
     LLM_RATE_LIMITER.acquire(attempt_id=attempt_id)
@@ -1404,7 +1432,8 @@ def process_items(items: List[Dict[str, Any]]) -> Tuple[int, int, float, Dict[st
           "json_path": path,
           "document_id": doc,
           "uu_number": uu,
-          "embed_counts": {...}
+          "embed_counts": {...},
+          "src_file": "filename.pkl"
         }
       }
     - extra_counters: {
@@ -1412,6 +1441,10 @@ def process_items(items: List[Dict[str, Any]]) -> Tuple[int, int, float, Dict[st
         "attempts_info": [ {attempt_id, duration, chunk_ids, uu_numbers, document_ids, json_path} ]
       }
     """
+    if should_stop():
+        log_warn("Early stop flag active before processing items; skipping batch.")
+        return 0, 0, 0.0, {}, {"final_batches": 0, "rate_limit_retries": 0, "json_parse_errors": 0, "llm_calls": 0, "attempts_info": []}
+
     if not items:
         return 0, 0, 0.0, {}, {"final_batches": 0, "rate_limit_retries": 0, "json_parse_errors": 0, "llm_calls": 0, "attempts_info": []}
 
@@ -1438,6 +1471,10 @@ def process_items(items: List[Dict[str, Any]]) -> Tuple[int, int, float, Dict[st
         last_json_path: Optional[str] = None
 
         while True:
+            if should_stop():
+                log_warn("Early stop flag active. Skipping item.")
+                return 0, 0, 0.0, {}, {"final_batches": 0, "rate_limit_retries": rate_limit_retries, "json_parse_errors": json_parse_errors, "llm_calls": llm_calls, "attempts_info": attempts_info}
+
             if ENFORCE_API_BUDGET and not API_BUDGET.will_allow("llm", 1):
                 log_warn(f"Stopping (budget exhausted) before LLM call for single chunk {chunk_id}", attempt_id=last_attempt_id)
                 return 0, 0, 0.0, {}, {"final_batches": 0, "rate_limit_retries": rate_limit_retries, "json_parse_errors": json_parse_errors, "llm_calls": llm_calls, "attempts_info": attempts_info}
@@ -1459,7 +1496,8 @@ def process_items(items: List[Dict[str, Any]]) -> Tuple[int, int, float, Dict[st
                     "json_path": json_path or "",
                     "document_id": meta.get("document_id") or "",
                     "uu_number": meta.get("uu_number") or "",
-                    "embed_counts": embed_stats
+                    "embed_counts": embed_stats,
+                    "src_file": meta.get("src_file") or ""
                 }
 
                 attempts_info.append({
@@ -1480,6 +1518,16 @@ def process_items(items: List[Dict[str, Any]]) -> Tuple[int, int, float, Dict[st
 
                 return 1, written, gemini_dur, per_chunk, {
                     "final_batches": 1,
+                    "rate_limit_retries": rate_limit_retries,
+                    "json_parse_errors": json_parse_errors,
+                    "llm_calls": llm_calls,
+                    "attempts_info": attempts_info
+                }
+            except EarlyStop as es:
+                # Do not retry or split; abort and bubble up cleanly
+                log_warn(f"Early stop triggered while processing chunk {chunk_id}. Aborting item.", attempt_id=getattr(es, "attempt_id", None))
+                return 0, 0, 0.0, {}, {
+                    "final_batches": 0,
                     "rate_limit_retries": rate_limit_retries,
                     "json_parse_errors": json_parse_errors,
                     "llm_calls": llm_calls,
@@ -1601,6 +1649,10 @@ def process_items(items: List[Dict[str, Any]]) -> Tuple[int, int, float, Dict[st
         last_json_path: Optional[str] = None
 
         while True:
+            if should_stop():
+                log_warn("Early stop flag active. Skipping batch.")
+                return 0, 0, 0.0, {}, {"final_batches": 0, "rate_limit_retries": 0, "json_parse_errors": 0, "llm_calls": 0, "attempts_info": attempts_info}
+
             if ENFORCE_API_BUDGET and not API_BUDGET.will_allow("llm", 1):
                 log_warn("Stopping: API budget for LLM calls would be exceeded (batch).", attempt_id=last_attempt_id)
                 return 0, 0, 0.0, {}, {"final_batches": 0, "rate_limit_retries": 0, "json_parse_errors": 0, "llm_calls": 0, "attempts_info": attempts_info}
@@ -1637,7 +1689,8 @@ def process_items(items: List[Dict[str, Any]]) -> Tuple[int, int, float, Dict[st
                         "json_path": json_path or "",
                         "document_id": it["meta"].get("document_id") or "",
                         "uu_number": it["meta"].get("uu_number") or "",
-                        "embed_counts": embed_stats
+                        "embed_counts": embed_stats,
+                        "src_file": it["meta"].get("src_file") or ""
                     }
 
                     num_chunks_processed += 1
@@ -1670,6 +1723,15 @@ def process_items(items: List[Dict[str, Any]]) -> Tuple[int, int, float, Dict[st
                     "attempts_info": attempts_info
                 }
 
+            except EarlyStop as es:
+                log_warn(f"Early stop triggered while processing batch (size={len(items)}). Aborting batch.", attempt_id=getattr(es, "attempt_id", None))
+                return 0, 0, 0.0, {}, {
+                    "final_batches": 0,
+                    "rate_limit_retries": rate_limit_retries,
+                    "json_parse_errors": json_parse_errors,
+                    "llm_calls": llm_calls,
+                    "attempts_info": attempts_info
+                }
             except RateLimitError as rle:
                 last_attempt_id = rle.attempt_id
                 last_json_path = getattr(rle, "json_path", None)
@@ -1831,6 +1893,10 @@ def run_kg_pipeline_over_folder(
     if max_files is not None:
         pkls = pkls[:max_files]
 
+    # Track file totals and completed chunks
+    file_total_chunks: Dict[str, int] = {}
+    file_done_chunks: Dict[str, int] = {}
+
     total_chunks_planned = 0
     for p in pkls:
         try:
@@ -1866,6 +1932,7 @@ def run_kg_pipeline_over_folder(
             log_warn(f"Failed to load {pkl.name}: {e}")
             continue
 
+        added_for_file = 0
         for idx, ch in enumerate(chunks):
             if max_chunks_per_file is not None and idx >= max_chunks_per_file:
                 break
@@ -1875,11 +1942,19 @@ def run_kg_pipeline_over_folder(
                 "chunk_id": meta_source.get("chunk_id"),
                 "uu_number": meta_source.get("uu_number"),
                 "pages": meta_source.get("pages"),
+                "src_file": pkl.name,  # record source file name
             }
             text = getattr(ch, "page_content", str(ch))
             if not meta.get("chunk_id"):
                 meta["chunk_id"] = f"{pkl.stem}_chunk_{idx}"
             raw_items_all.append({"chunk_id": meta["chunk_id"], "text": text, "meta": meta})
+
+            # bump file chunk total
+            file_total_chunks[pkl.name] = file_total_chunks.get(pkl.name, 0) + 1
+            added_for_file += 1
+
+        if added_for_file == 0:
+            file_total_chunks.setdefault(pkl.name, 0)
 
     if not raw_items_all:
         log_info("No chunks found. Exiting.")
@@ -1956,9 +2031,12 @@ def run_kg_pipeline_over_folder(
         # Main scheduling loop: ramp up workers and process results
         while True:
             # Determine target concurrency considering ramp-up and (optionally) budget
-            target = allowed_workers_now()
-            if ENFORCE_API_BUDGET:
-                target = min(target, remaining_budget())
+            if should_stop():
+                target = 0
+            else:
+                target = allowed_workers_now()
+                if ENFORCE_API_BUDGET:
+                    target = min(target, remaining_budget())
 
             # Fill up to target
             while next_idx < total_batches_planned and len(futures_set) < target:
@@ -2036,6 +2114,16 @@ def run_kg_pipeline_over_folder(
                             log_info(f"      - Chunk {cid} (uu={uu_num}, attempt={attempt_id}, json={json_base}) "
                                      f"Gemini={gem_disp} | Embedding={stats['embed']:.2f}s{emb_detail} | Neo4j={stats['neo4j']:.2f}s | Triples={int(stats['triples'])}")
 
+                # Update per-file completion counts
+                for it in items_batch:
+                    cid = it["meta"]["chunk_id"]
+                    stats = per_chunk_stats.get(cid)
+                    if not stats:
+                        continue
+                    src_file = stats.get("src_file") or it["meta"].get("src_file")
+                    if src_file:
+                        file_done_chunks[src_file] = file_done_chunks.get(src_file, 0) + 1
+
                 # LLM attempts summary for this batch
                 attempt_ids_list = [a.get("attempt_id") for a in attempts_info] if attempts_info else []
                 log_info(f"    ✓ {start_label}")
@@ -2049,6 +2137,16 @@ def run_kg_pipeline_over_folder(
 
                 batches_completed_so_far += 1
                 log_info(f"        - Batches completed: {batches_completed_so_far}/{total_batches_planned}")
+
+            if should_stop():
+                # Cancel any futures that haven't started
+                cancelled = 0
+                for f in list(futures_set):
+                    if f.cancel():
+                        cancelled += 1
+                    futures_set.remove(f)
+                log_warn(f"[STOP] Early stop engaged. Cancelled {cancelled} pending batch(es). Jumping to summary.")
+                break
 
             # Loop re-checks target and submits more if ramp allows
 
@@ -2075,6 +2173,17 @@ def run_kg_pipeline_over_folder(
     log_info(f"- Speedup vs sequential: {speedup:.2f}× faster")
     if ENFORCE_API_BUDGET:
         log_info(f"- API used: {API_BUDGET.used}/{API_BUDGET.total} (LLM calls and {'embeddings' if COUNT_EMBEDDINGS_IN_BUDGET else 'no embeddings'} counted)")
+
+    # Files processed/unprocessed summary if early stop was triggered
+    if should_stop():
+        total_files = len(file_total_chunks)
+        processed_files = [fn for fn, tot in file_total_chunks.items() if file_done_chunks.get(fn, 0) >= tot]
+        unprocessed_files = [fn for fn, tot in file_total_chunks.items() if file_done_chunks.get(fn, 0) < tot]
+
+        log_warn(f"- Early stop activated at attempt_id cap {MAX_ATTEMPT_ID}.")
+        log_info(f"- Files fully processed: {len(processed_files)}/{total_files}")
+        if unprocessed_files:
+            log_info(f"- Unprocessed files ({len(unprocessed_files)}): {', '.join(unprocessed_files)}")
 
 if __name__ == "__main__":
     run_kg_pipeline_over_folder(
