@@ -31,11 +31,16 @@ elif is_sample == "false":
 else:
     raise(ValueError(f"Wrong configuration of IS_SAMPLE in .env file: {is_sample}"))
 
+BATCH_NO = "1"
+# BATCH_NO = "2"
+# BATCH_NO = "3"
+
+
 if IS_SAMPLE:
-    INPUT_DIR = "../../dataset/samples/2_extract_text_results"
+    INPUT_DIR = f"../../dataset/samples/3_indexing/3a0_distributed_jsons/{BATCH_NO}"
     OUTPUT_DIR = "../../dataset/samples/3_indexing/3a_langchain_results"
 else:
-    INPUT_DIR = "../../dataset/2_extract_text_results"
+    INPUT_DIR = f"../../dataset/3_indexing/3a0_distributed_jsons/{BATCH_NO}"
     OUTPUT_DIR = "../../dataset/3_indexing/3a_langchain_results"
 
 
