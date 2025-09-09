@@ -53,7 +53,7 @@ elif is_sample == "false":
 else:
     raise (ValueError(f"Wrong configuration of IS_SAMPLE in .env file: {is_sample}"))
 
-NUM_FOLDERS = 5  # Change this to your desired number of folders
+NUM_FOLDERS = 36  # Change this to your desired number of folders
 FILE_PATTERN = "*.pkl"  # Only .pkl files are processed
 SKIP_FILES = {"all_langchain_documents.pkl"}  # Exact filenames to skip
 

@@ -63,10 +63,10 @@ NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASS = os.getenv("NEO4J_PASS", "@ik4nkus")
 
 # LLM rate limiter (calls per minute)
-LLM_MAX_CALLS_PER_MIN = int(os.getenv("LLM_MAX_CALLS_PER_MIN", "15"))
+LLM_MAX_CALLS_PER_MIN = int(os.getenv("LLM_MAX_CALLS_PER_MIN", "8"))
 
 # Parallelism
-INDEX_WORKERS = int(os.getenv("INDEX_WORKERS", "15"))
+INDEX_WORKERS = int(os.getenv("INDEX_WORKERS", "8"))
 
 # Stagger worker starts (seconds) - randomized uniformly in [7.0, 17.0]
 STAGGER_WORKER_SECONDS = random.uniform(7.0, 17.0)
