@@ -834,34 +834,12 @@ def save_error_json_output(error_stub: Dict[str, Any], context: Dict[str, Any], 
 
 def split_text_in_two(text: str) -> Tuple[str, str]:
     """
-    Split text into two halves near the middle, preferring paragraph/sentence/space boundaries.
+    Hard split: cut exactly in half by character count.
+    No paragraph/sentence/space boundary detection; no trimming.
     """
     n = len(text)
-    if n <= 1:
-        return text, ""
     mid = n // 2
-    window = 300
-    start = max(0, mid - window)
-    end = min(n, mid + window)
-    seps = ["\n\n", "\n", ". ", " "]
-    best_idx = None
-    for sep in seps:
-        li = text.rfind(sep, 0, mid)
-        ri = text.find(sep, mid, end)
-        candidates = []
-        if li != -1:
-            candidates.append((abs(mid - (li + len(sep)//2)), li + len(sep)))
-        if ri != -1:
-            candidates.append((abs(ri - mid), ri + len(sep)))
-        if candidates:
-            candidates.sort(key=lambda x: x[0])
-            best_idx = candidates[0][1]
-            break
-    if best_idx is None:
-        best_idx = mid
-    left = text[:best_idx].strip()
-    right = text[best_idx:].strip()
-    return left, right
+    return text[:mid], text[mid:]
 
 # ----------------- Predicate and label helpers -----------------
 def normalize_predicate(pred: Optional[str]) -> str:
@@ -1004,7 +982,7 @@ def run_llm_json(prompt: str, schema: dict, context: Dict[str, Any]) -> Tuple[Di
             raw = resp.candidates[0].content.parts[0].text
             data = json.loads(raw)
         except Exception as e:
-            preview = raw[:500] if isinstance(raw, str) else "None"
+            preview = raw if isinstance(raw, str) else "None"
             # Write error JSON
             error_stub = {
                 "error": {"type": "jsonparseerror", "message": str(e), "raw_preview": preview},
@@ -1517,56 +1495,74 @@ def process_items(items: List[Dict[str, Any]]) -> Tuple[int, int, float, Dict[st
                          f"Retrying after {sleep_for:.1f}s (retry #{rate_limit_retries}).", attempt_id=last_attempt_id)
                 log_info(f"attempt id {last_attempt_id} failed", attempt_id=last_attempt_id)
                 time.sleep(sleep_for)
-                backoff = min(backoff * 2.0, random.uniform(50.0, 80.0))
+                backoff = min(backoff * random.uniform(1.5, 2.5), random.uniform(50.0, 80.0))
             except JsonParseError as e:
                 last_attempt_id = e.attempt_id
                 last_json_path = getattr(e, "json_path", None)
                 json_parse_errors += 1
-                single_parse_err_count += 1
-                if single_parse_err_count >= SINGLE_PARSE_SPLIT_AFTER:
-                    left_text, right_text = split_text_in_two(text)
-                    if not right_text:
-                        log_warn(f"JSON parse error on single chunk {chunk_id}, could not split further. "
-                                 f"(doc={meta.get('document_id')}, uu={meta.get('uu_number')}, json={last_json_path or 'n/a'}) "
-                                 f"Continuing retries. Detail: {e}", attempt_id=last_attempt_id)
-                        log_info(f"attempt id {last_attempt_id} failed", attempt_id=last_attempt_id)
-                        time.sleep(1.0)
-                        continue
-                    left_meta = dict(meta); left_meta["chunk_id"] = f"{chunk_id}::part1"
-                    right_meta = dict(meta); right_meta["chunk_id"] = f"{chunk_id}::part2"
-                    log_warn(f"JSON parse error repeated {single_parse_err_count} on {chunk_id}. Splitting into 2 parts: {len(left_text)} + {len(right_text)} chars. "
-                             f"(doc={meta.get('document_id')}, uu={meta.get('uu_number')}, json={last_json_path or 'n/a'})", attempt_id=last_attempt_id)
-                    log_info(f"attempt id {last_attempt_id} failed", attempt_id=last_attempt_id)
-                    l_chunks, l_triples, l_gemini, l_stats, l_extra = process_items([{"text": left_text, "meta": left_meta}])
-                    r_chunks, r_triples, r_gemini, r_stats, r_extra = process_items([{"text": right_text, "meta": right_meta}])
 
-                    per_chunk_agg: Dict[str, Dict[str, float]] = {}
-                    per_chunk_agg.update(l_stats)
-                    per_chunk_agg.update(r_stats)
+                # Split immediately (no retries)
+                left_text, right_text = split_text_in_two(text)
 
-                    attempts_info_agg = []
-                    attempts_info_agg.extend(l_extra.get("attempts_info", []))
-                    attempts_info_agg.extend(r_extra.get("attempts_info", []))
+                left_meta = dict(meta); left_meta["chunk_id"] = f"{chunk_id}::part1"
+                right_meta = dict(meta); right_meta["chunk_id"] = f"{chunk_id}::part2"
 
-                    return (
-                        l_chunks + r_chunks,
-                        l_triples + r_triples,
-                        l_gemini + r_gemini,
-                        per_chunk_agg,
-                        {
-                            "final_batches": l_extra.get("final_batches", 0) + r_extra.get("final_batches", 0),
-                            "rate_limit_retries": rate_limit_retries + l_extra.get("rate_limit_retries", 0) + r_extra.get("rate_limit_retries", 0),
-                            "json_parse_errors": json_parse_errors + l_extra.get("json_parse_errors", 0) + r_extra.get("json_parse_errors", 0),
-                            "llm_calls": llm_calls + l_extra.get("llm_calls", 0) + r_extra.get("llm_calls", 0),
-                            "attempts_info": attempts_info_agg
-                        }
-                    )
-                else:
-                    log_warn(f"JSON parse error on single chunk {chunk_id}. "
-                             f"(doc={meta.get('document_id')}, uu={meta.get('uu_number')}, json={last_json_path or 'n/a'}) "
-                             f"Retrying. Detail: {e}", attempt_id=last_attempt_id)
-                    log_info(f"attempt id {last_attempt_id} failed", attempt_id=last_attempt_id)
-                    time.sleep(1.0)
+                log_warn(
+                    f"JSON parse error on single chunk {chunk_id}. Splitting immediately into 2 parts: "
+                    f"{len(left_text)} + {len(right_text)} chars. "
+                    f"(doc={meta.get('document_id')}, uu={meta.get('uu_number')}, json={last_json_path or 'n/a'})",
+                    attempt_id=last_attempt_id
+                )
+                log_info(f"attempt id {last_attempt_id} failed", attempt_id=last_attempt_id)
+
+                # Process only non-empty parts (no retry of the original chunk)
+                parts = []
+                if left_text:
+                    parts.append({"text": left_text, "meta": left_meta})
+                if right_text:
+                    parts.append({"text": right_text, "meta": right_meta})
+
+                if not parts:
+                    # Nothing to process; return empty result without retry
+                    return 0, 0, 0.0, {}, {
+                        "final_batches": 0,
+                        "rate_limit_retries": rate_limit_retries,
+                        "json_parse_errors": json_parse_errors,
+                        "llm_calls": llm_calls,
+                        "attempts_info": attempts_info
+                    }
+
+                # Recursively process the parts and aggregate
+                agg_chunks = 0
+                agg_triples = 0
+                agg_gemini = 0.0
+                per_chunk_agg = {}
+                attempts_info_agg = []
+
+                agg_final_batches = 0
+                agg_rl_retries = rate_limit_retries
+                agg_json_parse_errors = json_parse_errors
+                agg_llm_calls = llm_calls
+
+                for part in parts:
+                    c_chunks, c_triples, c_gemini, c_stats, c_extra = process_items([part])
+                    agg_chunks += c_chunks
+                    agg_triples += c_triples
+                    agg_gemini += c_gemini
+                    per_chunk_agg.update(c_stats)
+                    attempts_info_agg.extend(c_extra.get("attempts_info", []))
+                    agg_final_batches += c_extra.get("final_batches", 0)
+                    agg_rl_retries += c_extra.get("rate_limit_retries", 0)
+                    agg_json_parse_errors += c_extra.get("json_parse_errors", 0)
+                    agg_llm_calls += c_extra.get("llm_calls", 0)
+
+                return agg_chunks, agg_triples, agg_gemini, per_chunk_agg, {
+                    "final_batches": agg_final_batches,
+                    "rate_limit_retries": agg_rl_retries,
+                    "json_parse_errors": agg_json_parse_errors,
+                    "llm_calls": agg_llm_calls,
+                    "attempts_info": attempts_info_agg
+                }
             except LlmCallError as e:
                 last_attempt_id = e.attempt_id
                 last_json_path = getattr(e, "json_path", None)
@@ -1685,7 +1681,7 @@ def process_items(items: List[Dict[str, Any]]) -> Tuple[int, int, float, Dict[st
                          f"Retrying after {sleep_for:.1f}s (retry #{rate_limit_retries}).", attempt_id=last_attempt_id)
                 log_info(f"attempt id {last_attempt_id} failed", attempt_id=last_attempt_id)
                 time.sleep(sleep_for)
-                backoff = min(backoff * 2.0, random.uniform(50.0, 80.0))
+                backoff = min(backoff * random.uniform(1.5, 2.5), random.uniform(50.0, 80.0))
                 continue
             except JsonParseError as e:
                 last_attempt_id = e.attempt_id

@@ -41,7 +41,7 @@ else:
 
 
 REPO_ROOT = BASE_DIR.parent.parent  # parent directory of this script
-KG_PIPELINE_PATH = (BASE_DIR / "lexidkg_pipeline_quote.py").resolve()
+KG_PIPELINE_PATH = (BASE_DIR / "lexidkg_pipeline.py").resolve()
 TMP_SCRIPT_PREFIX = "lexidkg_pipeline_run_"
 LOGS_DIR = (BASE_DIR / "run_logs").resolve()
 

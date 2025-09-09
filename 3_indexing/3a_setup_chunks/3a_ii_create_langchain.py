@@ -371,7 +371,7 @@ def process_single_json_file(json_file_path: str) -> tuple[List[Document], Optio
 
 
 def save_individual_document_chunks(chunks: List[Document], doc_summary: Dict[str, Any], output_dir: Path) -> Optional[str]:
-    """Save chunks for a single document as separate pickle file."""
+    """Save chunks for a single document as a separate pickle file, avoiding name collisions."""
     if not chunks:
         return None
 
@@ -379,13 +379,21 @@ def save_individual_document_chunks(chunks: List[Document], doc_summary: Dict[st
     base_name = Path(source_json).stem
     safe_name = "".join(c for c in base_name if c.isalnum() or c in ('-', '_')).rstrip()
 
-    langchain_filename = f"{safe_name}_chunks.pkl"
-    langchain_filepath = output_dir / langchain_filename
+    # Start with the default candidate name
+    candidate = f"{safe_name}_chunks.pkl" if safe_name else "doc_chunks.pkl"
+    langchain_filepath = output_dir / candidate
+
+    # If a file with that name exists, append an incrementing suffix
+    i = 1
+    while langchain_filepath.exists():
+        candidate = f"{safe_name}__{i}_chunks.pkl" if safe_name else f"doc__{i}_chunks.pkl"
+        langchain_filepath = output_dir / candidate
+        i += 1
 
     with open(langchain_filepath, 'wb') as f:
         pickle.dump(chunks, f)
 
-    return langchain_filename
+    return candidate
 
 
 def check_and_prepare_output_directory(output_dir: str, force: bool = FORCE_OVERWRITE) -> bool:
