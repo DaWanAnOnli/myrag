@@ -3,37 +3,33 @@
 Distribute per-document LangChain .pkl files into N folders such that
 the total CHUNKS per folder are as balanced as possible.
 
-Hardcoded settings below:
-- NUM_FOLDERS: how many subfolders to create in the destination (named 1..N)
-- SOURCE_DIR:  where to read .pkl files from
-- DEST_DIR:    where to create numbered subfolders and copy files to
+What's new:
+- Files can now be split: if a .pkl contains many chunks (list of LangChain Documents),
+  it will be sliced into multiple .pkl parts and distributed across different folders.
+- Greedy balancing at CHUNK level to a per-folder target = ceil(total_chunks / N).
+- Un-sliceable files (cannot unpickle or not a list) are still placed as-whole.
 
 Behavior:
 - Skips the file named exactly: all_langchain_documents.pkl (the combined file).
-- Counts chunks by unpickling each .pkl and taking len(obj). This assumes the
-  environment can unpickle the file (e.g., LangChain's Document class available).
-  If unpickling fails or the object has no length, defaults to chunk count = 1 (warns).
-- Greedy bin-packing by chunk count: largest chunk-count files first, always placed
-  into the currently lightest (by chunk count) folder.
-- If DEST_DIR is not empty, the script warns and asks for confirmation.
-  On confirmation, it deletes EVERYTHING inside DEST_DIR (recursive) and recreates it.
-- After copying, it prints for each folder:
+- For splittable files (a pickled list), we slice contiguous ranges and write new .pkl parts.
+- For unsplittable files, we copy the .pkl as-is to the current lightest folder.
+- If DEST_DIR is not empty, the script warns and asks for confirmation, then clears it.
+
+Reporting per folder:
   - total size (bytes, human readable)
-  - total number of files in the folder (on disk)
+  - total number of files (recursively)
   - number of langchain files (.pkl) in the folder
   - total chunks contained (sum of chunks across those .pkl files)
-
-Note:
-- This script balances by chunk count, not bytes. Sizes are still reported for visibility.
 """
 
 import heapq
+import math
 import os
 import pickle
 import shutil
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import dotenv
 
@@ -41,10 +37,10 @@ import dotenv
 # Hardcoded parameters
 # -------------------
 env_file_path = Path("../../.env")
-    
+
 # Load the .env file
 if not env_file_path.exists():
-    raise(ImportError(f"Error: .env file not found at {env_file_path}"))
+    raise (ImportError(f"Error: .env file not found at {env_file_path}"))
 
 dotenv.load_dotenv(env_file_path)
 
@@ -55,12 +51,16 @@ if is_sample == "true":
 elif is_sample == "false":
     IS_SAMPLE = False
 else:
-    raise(ValueError(f"Wrong configuration of IS_SAMPLE in .env file: {is_sample}"))
+    raise (ValueError(f"Wrong configuration of IS_SAMPLE in .env file: {is_sample}"))
 
 NUM_FOLDERS = 5  # Change this to your desired number of folders
 FILE_PATTERN = "*.pkl"  # Only .pkl files are processed
 SKIP_FILES = {"all_langchain_documents.pkl"}  # Exact filenames to skip
 
+# Splitting behavior
+# We always allow splitting when a file is a pickled list. Parts are sized adaptively to
+# fill the current lightest folder up to the per-folder target chunk count.
+MAX_PART_SIZE_HINT = None  # Optional hard cap for part size in chunks (None = no extra cap)
 
 if IS_SAMPLE:
     SOURCE_DIR = (Path(__file__).resolve().parent / "../../dataset/samples/3_indexing/3a_langchain_results/").resolve()
@@ -141,25 +141,40 @@ def confirm_and_clean_destination(src: Path, dest_root: Path) -> None:
     dest_root.mkdir(parents=True, exist_ok=True)
 
 
-def count_chunks_in_pkl(pkl_path: Path) -> int:
+def safe_base_name(path: Path) -> str:
+    stem = path.stem
+    return "".join(c for c in stem if c.isalnum() or c in ('-', '_')).rstrip() or "doc"
+
+
+def analyze_pkl(pkl_path: Path) -> Tuple[bool, int, Optional[List]]:
     """
-    Manually count chunks in a LangChain .pkl by unpickling and taking len(obj).
-    If unpickling fails or the object has no length, default to 1 and warn.
+    Try to unpickle a .pkl file and decide if it's splittable.
+
+    Returns:
+      (splittable, chunk_count, obj_list_or_none)
+
+    - splittable=True if object is a list (of LangChain Documents) -> sliceable
+    - chunk_count = len(obj) if possible, else 1
+    - obj_list_or_none = the loaded list if splittable, else None
     """
     try:
         with open(pkl_path, "rb") as f:
             obj = pickle.load(f)
+        # Prefer list (typical for LangChain Document arrays)
+        if isinstance(obj, list):
+            return True, len(obj), obj
+        # Not a list: still try len for chunk count, but mark unsplittable
         try:
             count = len(obj)  # type: ignore
             if isinstance(count, int) and count >= 0:
-                return count
+                return False, count, None
         except Exception:
             pass
-        print(f"Warning: {pkl_path.name} loaded but has no length; defaulting chunk count to 1", file=sys.stderr)
-        return 1
-    except Exception as e:
-        print(f"Warning: could not unpickle {pkl_path.name} ({e}); defaulting chunk count to 1", file=sys.stderr)
-        return 1
+        # Fallback
+        return False, 1, None
+    except Exception:
+        # Could not unpickle
+        return False, 1, None
 
 
 def count_all_files_in_dir(dir_path: Path) -> int:
@@ -182,13 +197,13 @@ def main() -> int:
     print(f"Source directory: {src}")
     print(f"Destination directory: {dest_root}")
     print(f"Requested folders: {n}")
-    print("Distribution metric: chunk count per .pkl (manual unpickling)")
+    print("Distribution metric: chunk count (files may be split into parts)")
 
     if not src.exists() or not src.is_dir():
         print(f"Error: Source directory does not exist or is not a directory: {src}", file=sys.stderr)
         return 2
 
-    # Collect .pkl files and their sizes, skipping specified filenames
+    # Collect .pkl files, skipping specified filenames
     files = [p for p in src.glob(FILE_PATTERN) if p.is_file() and p.name not in SKIP_FILES]
 
     skipped_present = any((src / name).exists() for name in SKIP_FILES)
@@ -201,10 +216,12 @@ def main() -> int:
 
     print(f"Found {len(files)} .pkl file(s) to distribute.")
 
-    # Build list of (chunk_count, size_bytes, path) by manually counting chunks
-    entries: List[Tuple[int, int, Path]] = []
-    total_bytes = 0
+    # Analyze files: which are splittable lists vs unsplittable
+    splittable_entries: List[Tuple[int, int, Path, List]] = []  # (chunk_count, size_bytes, path, obj_list)
+    unsplittable_entries: List[Tuple[int, int, Path]] = []      # (chunk_count, size_bytes, path)
+    total_bytes_src = 0
     total_chunks = 0
+    num_split_candidates = 0
 
     for p in files:
         try:
@@ -213,18 +230,24 @@ def main() -> int:
             print(f"Warning: skipping {p} (cannot stat: {e})", file=sys.stderr)
             continue
 
-        chunks = count_chunks_in_pkl(p)
+        splittable, chunk_count, obj_list = analyze_pkl(p)
 
-        entries.append((chunks, sz, p))
-        total_bytes += sz
-        total_chunks += chunks
+        total_bytes_src += sz
+        total_chunks += chunk_count
 
-    if not entries:
+        if splittable and chunk_count > 0 and isinstance(obj_list, list):
+            splittable_entries.append((chunk_count, sz, p, obj_list))
+            num_split_candidates += 1
+        else:
+            unsplittable_entries.append((chunk_count, sz, p))
+
+    if not splittable_entries and not unsplittable_entries:
         print(f"No readable .pkl files found in: {src}")
         return 0
 
     print(f"Total chunks (sum across files): {total_chunks}")
-    print(f"Total bytes (before distribution): {human_bytes(total_bytes)}")
+    print(f"Total bytes (before distribution): {human_bytes(total_bytes_src)}")
+    print(f"Splittable files: {len(splittable_entries)} | Un-splittable files: {len(unsplittable_entries)}")
 
     # Confirm and clean destination if needed
     confirm_and_clean_destination(src, dest_root)
@@ -232,51 +255,110 @@ def main() -> int:
     # Prepare destination folders
     subdirs = ensure_dirs(dest_root, n)
 
-    # Greedy bin packing by chunk count: largest-first into the lightest bin
-    entries.sort(key=lambda t: (t[0], t[1]), reverse=True)  # sort by chunk_count desc, then size desc
+    # Target chunks per folder for balancing
+    target_per_folder = math.ceil(total_chunks / n)
+    print(f"Per-folder target chunks: {target_per_folder}")
 
     # Min-heap of (current_total_chunks, folder_index starting at 1)
     heap: List[Tuple[int, int]] = [(0, i) for i in range(1, n + 1)]
     heapq.heapify(heap)
 
-    # Allocations: folder_idx -> list[(chunk_count, size_bytes, path)]
-    allocations: Dict[int, List[Tuple[int, int, Path]]] = {i: [] for i in range(1, n + 1)}
-
-    print("Allocating files to folders (largest chunk-count first)...")
-    for chunk_count, size_bytes, path in entries:
-        current_chunks, idx = heapq.heappop(heap)
-        allocations[idx].append((chunk_count, size_bytes, path))
-        heapq.heappush(heap, (current_chunks + chunk_count, idx))
-
-    # Copy files according to allocations and accumulate stats
-    print("Copying files to destination folders...")
+    # Stats
     copied = 0
+    split_files_count = 0
+    split_parts_written = 0
+
     folder_bytes: Dict[int, int] = {i: 0 for i in range(1, n + 1)}
     folder_chunks: Dict[int, int] = {i: 0 for i in range(1, n + 1)}
     folder_pkl_files: Dict[int, int] = {i: 0 for i in range(1, n + 1)}
 
-    for i in range(1, n + 1):
-        target_dir = subdirs[i - 1]
-        for chunk_count, size_bytes, src_path in allocations[i]:
-            dest_path = target_dir / src_path.name
+    # 1) Place unsplittable entries first (largest-first) so we know the baseline load
+    unsplittable_entries.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    for chunk_count, size_bytes, path in unsplittable_entries:
+        curr, idx = heapq.heappop(heap)
+        target_dir = subdirs[idx - 1]
+        dest_path = target_dir / path.name
+        try:
+            shutil.copy2(path, dest_path)
+            folder_bytes[idx] += size_bytes
+            folder_chunks[idx] += chunk_count
+            folder_pkl_files[idx] += 1
+            copied += 1
+        except Exception as e:
+            print(f"Error copying {path} -> {dest_path}: {e}", file=sys.stderr)
+        heapq.heappush(heap, (curr + chunk_count, idx))
+
+    # 2) Distribute splittable entries by slicing into parts to fill folders up to target
+    splittable_entries.sort(key=lambda t: (t[0], t[1]), reverse=True)
+
+    print("Allocating slices from splittable files to folders...")
+    for chunk_count, size_bytes, path, obj_list in splittable_entries:
+        base = safe_base_name(path)
+        remaining = chunk_count
+        start = 0
+        part_no = 1
+        file_was_split = False
+
+        while remaining > 0:
+            curr, idx = heapq.heappop(heap)
+            target_dir = subdirs[idx - 1]
+
+            # Compute desired slice size for this folder
+            capacity = max(0, target_per_folder - curr)
+            if capacity <= 0:
+                # Folder already at/over target; still put some, but not too large.
+                # Heuristic: a slice up to target, but no more than remaining.
+                capacity = min(remaining, target_per_folder)
+
+            if MAX_PART_SIZE_HINT is not None:
+                capacity = min(capacity, MAX_PART_SIZE_HINT)
+
+            # Always at least 1 chunk
+            take = max(1, min(remaining, capacity))
+
+            end = start + take
+            slice_obj = obj_list[start:end]
+
+            # Name parts so you can trace origin and range
+            part_name = f"{base}.part{part_no:03d}_idx{start}-{end-1}.pkl"
+            dest_path = target_dir / part_name
+
             try:
-                shutil.copy2(src_path, dest_path)
-                folder_bytes[i] += size_bytes
-                folder_chunks[i] += chunk_count
-                folder_pkl_files[i] += 1
-                copied += 1
+                with open(dest_path, "wb") as f:
+                    pickle.dump(slice_obj, f)
+                sz_written = dest_path.stat().st_size
+                folder_bytes[idx] += sz_written
+                folder_chunks[idx] += take
+                folder_pkl_files[idx] += 1
+                split_parts_written += 1
+                file_was_split = file_was_split or (take != chunk_count)
             except Exception as e:
-                print(f"Error copying {src_path} -> {dest_path}: {e}", file=sys.stderr)
+                print(f"Error writing slice {dest_path}: {e}", file=sys.stderr)
+                # If writing failed, push heap entry back unchanged and abort this file gracefully
+                heapq.heappush(heap, (curr, idx))
+                break
+
+            # Update heap and counters
+            heapq.heappush(heap, (curr + take, idx))
+            start = end
+            remaining -= take
+            part_no += 1
+
+        if file_was_split:
+            split_files_count += 1
+
+        # free memory
+        del obj_list
 
     # Summary (preserving and extending original logging)
-    print(f"Copied {copied} .pkl files from {src} to {dest_root} across {n} folders.")
-    print(f"Total size: {human_bytes(total_bytes)}")
-    print(f"Total chunks: {total_chunks}")
+    total_dest_bytes = sum(folder_bytes.values())
+    print(f"Copied {copied} unsplittable .pkl file(s) as-is.")
+    print(f"Wrote {split_parts_written} part file(s) from {split_files_count} splittable source file(s).")
+    print(f"Total size written: {human_bytes(total_dest_bytes)}")
+    print(f"Total chunks distributed: {sum(folder_chunks.values())}")
 
     for i in range(1, n + 1):
-        # Original-style summary line (size + count of files)
-        print(f"  Folder {i}: {human_bytes(folder_bytes[i])} in {len(allocations[i])} files")
-        # Extended details required: total files, langchain files, chunks
+        print(f"  Folder {i}: {human_bytes(folder_bytes[i])} in {folder_pkl_files[i]} .pkl file(s)")
         folder_dir = subdirs[i - 1]
         all_files_count = count_all_files_in_dir(folder_dir)
         print(
@@ -288,8 +370,7 @@ def main() -> int:
     if folder_bytes:
         sizes = list(folder_bytes.values())
         diff = max(sizes) - min(sizes)
-        # Original label for size spread
-        print(f"Balance spread (max - min): {human_bytes(diff)}")
+        print(f"Balance spread (size, max - min): {human_bytes(diff)}")
 
     if folder_chunks:
         chunk_sizes = list(folder_chunks.values())
