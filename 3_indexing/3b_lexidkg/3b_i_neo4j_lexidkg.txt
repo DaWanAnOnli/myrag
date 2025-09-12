@@ -1,4 +1,29 @@
-// Uniqueness constraints
+// Uniqueness for MERGE-by-key (per base label)
+CREATE CONSTRAINT legal_document_key_unique IF NOT EXISTS
+FOR (d:LegalDocument) REQUIRE d.key IS UNIQUE;
+
+CREATE CONSTRAINT legal_document_content_key_unique IF NOT EXISTS
+FOR (c:LegalDocumentContent) REQUIRE c.key IS UNIQUE;
+
+CREATE CONSTRAINT rule_expression_key_unique IF NOT EXISTS
+FOR (e:RuleExpression) REQUIRE e.key IS UNIQUE;
+
+CREATE CONSTRAINT law_amendment_key_unique IF NOT EXISTS
+FOR (l:LawAmendment) REQUIRE l.key IS UNIQUE;
+
+CREATE CONSTRAINT place_key_unique IF NOT EXISTS
+FOR (p:PlaceOfPromulgation) REQUIRE p.key IS UNIQUE;
+
+CREATE CONSTRAINT person_key_unique IF NOT EXISTS
+FOR (p:Person) REQUIRE p.key IS UNIQUE;
+
+CREATE CONSTRAINT office_key_unique IF NOT EXISTS
+FOR (o:Office) REQUIRE o.key IS UNIQUE;
+
+CREATE CONSTRAINT city_key_unique IF NOT EXISTS
+FOR (c:City) REQUIRE c.key IS UNIQUE;
+
+// Keep your existing domain uniqueness (useful for reads/integrity)
 CREATE CONSTRAINT legal_document_unique IF NOT EXISTS
 FOR (d:LegalDocument) REQUIRE (d.number, d.year) IS UNIQUE;
 
@@ -6,34 +31,8 @@ CREATE CONSTRAINT article_unique IF NOT EXISTS
 FOR (a:LegalDocumentContent) REQUIRE (a.name, a.document_id) IS UNIQUE;
 
 CREATE CONSTRAINT concept_unique IF NOT EXISTS
-FOR (c:RuleExpression) REQUIRE c.expression_uid IS UNIQUE;
+FOR (e:RuleExpression) REQUIRE e.expression_uid IS UNIQUE;
 
+// Triple unique (dedup anchor)
 CREATE CONSTRAINT triple_uid IF NOT EXISTS
 FOR (t:Triple) REQUIRE t.triple_uid IS UNIQUE;
-
-// Vector indexes
-CREATE VECTOR INDEX document_vec IF NOT EXISTS
-FOR (d:LegalDocument) ON (d.embedding)
-OPTIONS { indexConfig: { `vector.dimensions`: 768, `vector.similarity_function`: 'COSINE' } };
-
-CREATE VECTOR INDEX content_vec IF NOT EXISTS
-FOR (c:LegalDocumentContent) ON (c.embedding)
-OPTIONS { indexConfig: { `vector.dimensions`: 768, `vector.similarity_function`: 'COSINE' } };
-
-CREATE VECTOR INDEX expression_vec IF NOT EXISTS
-FOR (e:RuleExpression) ON (e.embedding)
-OPTIONS { indexConfig: { `vector.dimensions`: 768, `vector.similarity_function`: 'COSINE' } };
-
-CREATE VECTOR INDEX triple_vec IF NOT EXISTS
-FOR (t:Triple) ON (t.embedding)
-OPTIONS { indexConfig: { `vector.dimensions`: 768, `vector.similarity_function`: 'COSINE' } };
-
-// Full-text search indexes
-CREATE FULLTEXT INDEX document_fts IF NOT EXISTS
-FOR (d:LegalDocument) ON EACH [d.name];
-
-CREATE FULLTEXT INDEX content_fts IF NOT EXISTS
-FOR (c:LegalDocumentContent) ON EACH [c.description];
-
-CREATE FULLTEXT INDEX expression_fts IF NOT EXISTS
-FOR (e:RuleExpression) ON EACH [e.name];
