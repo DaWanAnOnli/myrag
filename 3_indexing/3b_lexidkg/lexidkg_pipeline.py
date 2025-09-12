@@ -54,7 +54,7 @@ def _normalize_model_name(m: str) -> str:
         return m
     return f"models/{m}"
 
-GEN_MODEL = _normalize_model_name(os.getenv("GEN_MODEL", "gemini-2.5-flash-lite"))
+GEN_MODEL = _normalize_model_name(os.getenv("GEN_MODEL", "gemini-2.5-flash"))
 EMBED_MODEL = _normalize_model_name(os.getenv("EMBED_MODEL", "text-embedding-004"))
 
 # Directory of LangChain per-document pickle files
@@ -372,7 +372,10 @@ Extract meaningful triples in JSON format. Every triple must include:
 - subject: entity node with text, type, and canonical_id
 - predicate: relationship type (lowercase, snake_case)
 - object: entity node with text, type, and canonical_id
-- evidence: textual support with article reference when available
+- evidence: textual support with:
+    - quote (string, required)
+    - article_ref (string, required; e.g., "Pasal 5", "Ayat (2)" if available in the text)
+- confidence: number in [0.0, 1.0]
 
 RULES:
 - Be precise and grounded in the text; never invent relationships
@@ -445,19 +448,17 @@ Each element must be an object with the following shape:
       "subject": {
         "text": "string",
         "type": "one of the allowed node types described above",
-        "canonical_id": "string (optional)"
+        "canonical_id": "string"
       },
       "predicate": "string",
       "object": {
         "text": "string",
         "type": "one of the allowed node types described above",
-        "canonical_id": "string (optional)"
+        "canonical_id": "string"
       },
       "evidence": {
         "quote": "string",
-        "char_start": 0,
-        "char_end": 0,
-        "article_ref": "string (optional)"
+        "article_ref": "string"
       },
       "confidence": 0.0
     }
@@ -466,6 +467,7 @@ Each element must be an object with the following shape:
 Notes:
 - 'triples' must follow the LexID ontology and constraints above.
 - Use only the provided chunk text; do not invent information.
+- All fields shown are required. confidence must be between 0.0 and 1.0.
 """
     lines = []
     for it in items:
@@ -476,7 +478,6 @@ Notes:
         )
     return intro + "\n\nChunks:\n" + "\n\n".join(lines)
 
-# ----------------- JSON Schemas (unchanged) -----------------
 TRIPLE_SCHEMA = {
   "type": "object",
   "properties": {
@@ -492,7 +493,7 @@ TRIPLE_SCHEMA = {
               "type": {"type": "string", "enum": ALLOWED_NODE_TYPES},
               "canonical_id": {"type": "string"}
             },
-            "required": ["text", "type"]
+            "required": ["text", "type", "canonical_id"]
           },
           "predicate": {"type": "string"},
           "object": {
@@ -502,21 +503,19 @@ TRIPLE_SCHEMA = {
               "type": {"type": "string", "enum": ALLOWED_NODE_TYPES},
               "canonical_id": {"type": "string"}
             },
-            "required": ["text", "type"]
+            "required": ["text", "type", "canonical_id"]
           },
           "evidence": {
             "type": "object",
             "properties": {
               "quote": {"type": "string"},
-              "char_start": {"type": "integer"},
-              "char_end": {"type": "integer"},
               "article_ref": {"type": "string"}
             },
-            "required": ["quote"]
+            "required": ["quote", "article_ref"]
           },
           "confidence": {"type": "number"}
         },
-        "required": ["subject", "predicate", "object", "evidence"]
+        "required": ["subject", "predicate", "object", "evidence", "confidence"]
       }
     }
   },
@@ -916,6 +915,13 @@ def run_llm_json(prompt: str, schema: dict, context: Dict[str, Any]) -> Tuple[Di
     out_path = save_llm_json_output(data, context, attempt_id=attempt_id)
     return data, dur, attempt_id, str(out_path)
 
+def _clamp01(x, default=0.5) -> float:
+    try:
+        v = float(x)
+    except Exception:
+        return default
+    return 0.0 if v < 0.0 else 1.0 if v > 1.0 else v
+
 # ----------------- LLM Extraction (single attempt) -----------------
 def extract_triples_from_chunk(chunk_text: str, meta: Dict[str, Any], prompt_override: Optional[str] = None) -> Tuple[List[Dict[str, Any]], float, int, Optional[str]]:
     prompt = prompt_override or build_single_prompt(meta, chunk_text)
@@ -935,21 +941,34 @@ def extract_triples_from_chunk(chunk_text: str, meta: Dict[str, Any], prompt_ove
         o_key = normalize_entity_key(obj["text"],  o_type,  uu_number)
 
         ev = t.get("evidence") or {}
-        span = (ev["char_start"], ev["char_end"]) if ev.get("char_start") is not None and ev.get("char_end") is not None else None
+        # No character spans anymore
+        span = None
         triple_uid = deterministic_triple_uid(s_key, pred, o_key, meta.get("document_id"), span)
+
+        # Clamp confidence to [0.0, 1.0]
+        conf_raw = _clamp01(t.get("confidence", 0.5))
+        try:
+            conf = float(conf_raw)
+        except Exception:
+            conf = 0.5
+        conf = max(0.0, min(1.0, conf))
 
         triples.append({
             "triple_uid": triple_uid,
-            "subject": {"text": subj["text"], "type": s_type, "key": s_key, "canonical_id": subj.get("canonical_id")},
-            "predicate": pred,
-            "object": {"text": obj["text"], "type": o_type, "key": o_key, "canonical_id": obj.get("canonical_id")},
-            "evidence": {
-                "quote": ev.get("quote"),
-                "char_start": ev.get("char_start"),
-                "char_end": ev.get("char_end"),
-                "article_ref": ev.get("article_ref"),
+            "subject": {
+                "text": subj["text"], "type": s_type, "key": s_key,
+                "canonical_id": subj["canonical_id"]
             },
-            "confidence": float(t.get("confidence", 0.0)),
+            "predicate": pred,
+            "object": {
+                "text": obj["text"], "type": o_type, "key": o_key,
+                "canonical_id": obj["canonical_id"]
+            },
+            "evidence": {
+                "quote": ev["quote"],
+                "article_ref": ev["article_ref"]
+            },
+            "confidence": conf,
             "provenance": {
                 "document_id": meta.get("document_id"),
                 "chunk_id": meta.get("chunk_id"),
@@ -985,21 +1004,32 @@ def extract_triples_from_chunks_batch(items: List[Dict[str, Any]], prompt: str) 
             o_key = normalize_entity_key(obj["text"],  o_type,  uu_number)
 
             ev = t.get("evidence") or {}
-            span = (ev["char_start"], ev["char_end"]) if ev.get("char_start") is not None and ev.get("char_end") is not None else None
+            span = None
             triple_uid = deterministic_triple_uid(s_key, pred, o_key, meta.get("document_id"), span)
+
+            conf_raw = _clamp01(t.get("confidence", 0.5))
+            try:
+                conf = float(conf_raw)
+            except Exception:
+                conf = 0.5
+            conf = max(0.0, min(1.0, conf))
 
             triples_for_chunk.append({
                 "triple_uid": triple_uid,
-                "subject": {"text": subj["text"], "type": s_type, "key": s_key, "canonical_id": subj.get("canonical_id")},
-                "predicate": pred,
-                "object": {"text": obj["text"], "type": o_type, "key": o_key, "canonical_id": obj.get("canonical_id")},
-                "evidence": {
-                    "quote": ev.get("quote"),
-                    "char_start": ev.get("char_start"),
-                    "char_end": ev.get("char_end"),
-                    "article_ref": ev.get("article_ref"),
+                "subject": {
+                    "text": subj["text"], "type": s_type, "key": s_key,
+                    "canonical_id": subj["canonical_id"]
                 },
-                "confidence": float(t.get("confidence", 0.0)),
+                "predicate": pred,
+                "object": {
+                    "text": obj["text"], "type": o_type, "key": o_key,
+                    "canonical_id": obj["canonical_id"]
+                },
+                "evidence": {
+                    "quote": ev["quote"],
+                    "article_ref": ev["article_ref"]
+                },
+                "confidence": conf,
                 "provenance": {
                     "document_id": meta.get("document_id"),
                     "chunk_id": meta.get("chunk_id"),
@@ -1150,7 +1180,7 @@ def upsert_triple_in_tx(tx, t: Dict[str, Any], s_emb: List[float], o_emb: List[f
 
     prov = t["provenance"]
     ev = t.get("evidence") or {}
-    confidence = float(t.get("confidence", 0.0))
+    confidence = _clamp01(float(t.get("confidence", 0.0)))
 
     s_label_str = labels_for_type(s_type)    # e.g., "Act:LegalDocument"
     o_label_str = labels_for_type(o_type)    # e.g., "Concept:RuleExpression" etc.
@@ -1178,8 +1208,6 @@ def upsert_triple_in_tx(tx, t: Dict[str, Any], s_emb: List[float], o_emb: List[f
         tr.uu_number=$uu_number,
         tr.pages=$pages,
         tr.evidence_quote=$evidence_quote,
-        tr.evidence_char_start=$evidence_char_start,
-        tr.evidence_char_end=$evidence_char_end,
         tr.evidence_article_ref=$evidence_article_ref,
         tr.confidence=$confidence
 
@@ -1203,8 +1231,6 @@ def upsert_triple_in_tx(tx, t: Dict[str, Any], s_emb: List[float], o_emb: List[f
         uu_number=prov.get("uu_number"),
         pages=prov.get("pages", []),
         evidence_quote=ev.get("quote"),
-        evidence_char_start=ev.get("char_start"),
-        evidence_char_end=ev.get("char_end"),
         evidence_article_ref=ev.get("article_ref"),
         confidence=confidence,
     )

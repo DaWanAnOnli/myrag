@@ -24,7 +24,7 @@ else:
     raise(ValueError(f"Wrong configuration of IS_SAMPLE in .env file: {is_sample}"))
 
 # CONFIGURATION - modify this value as needed
-N_FOLDERS = 3  # Number of folders to distribute files into
+N_FOLDERS = 1  # Number of folders to distribute files into
 
 def get_file_size(file_path: Path) -> int:
     """Get file size in bytes."""
@@ -65,7 +65,7 @@ def main():
     # Define paths
     if IS_SAMPLE:
         source_dir = Path("../../dataset/samples/2_extract_text_results")
-        dest_dir = Path("../../dataset/samples3_indexing/3a0_distributed_jsons")
+        dest_dir = Path("../../dataset/samples/3_indexing/3a0_distributed_jsons")
     else:
         source_dir = Path("../../dataset/2_extract_text_results")
         dest_dir = Path("../../dataset/3_indexing/3a0_distributed_jsons")
