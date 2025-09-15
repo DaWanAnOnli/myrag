@@ -9,7 +9,10 @@ Key features:
 - Filters to verification_choice == "A".
 - Selection mode: "first" or "random", limited by MAX_QUESTIONS.
 - Loads GOOGLE_API_KEY_1, GOOGLE_API_KEY_2, ... from ../../../.env.
-- Spawns one worker process per API key, distributing questions evenly.
+- Spawns workers in shifts:
+    * Number of concurrent workers per shift is controlled by PROCESSES_PER_SHIFT.
+    * Each worker uses its own API key and gets its preassigned subset of questions.
+    * Waits for all workers in a shift to finish before launching the next shift.
 - Each worker:
     * Sets its own GOOGLE_API_KEY (both env var and rag.GOOGLE_API_KEY constant).
     * Captures terminal output per question into question_terminal_logs.
@@ -35,7 +38,7 @@ import multiprocessing as mp
 
 import dotenv
 
-# ----------------- Hardcoded testing limit -----------------
+# ----------------- Hardcoded testing limit and shift size -----------------
 
 env_file_path = Path("../../../.env")
     
@@ -62,6 +65,9 @@ MAX_QUESTIONS = None
 #   "first"  -> pick the first MAX_QUESTIONS 'A' questions
 #   "random" -> pick MAX_QUESTIONS random 'A' questions (uniform, without replacement)
 SELECTION_MODE = "random"  # change to "first" to select deterministically
+
+# New: number of processes to run concurrently per shift
+PROCESSES_PER_SHIFT = 5  # Adjust this to control shift size
 
 # ----------------- Paths (underscore-only) -----------------
 
@@ -235,7 +241,7 @@ def worker_main(worker_id: int,
 
     # Import after setting env so the module can also read env if it does.
     try:
-        import lexidkg_graphrag_agentic_quotes as rag
+        import lexidkg_graphrag as rag
     except Exception as e:
         log(f"[Worker {worker_id}] ERROR: Could not import lexidkg_graphrag_agentic.py: {e}")
         # Still write an empty part file so parent can proceed
@@ -406,40 +412,60 @@ def main():
         log("No non-empty questions after filtering. Exiting.")
         return
 
-    # Distribute tasks evenly across workers
-    n_workers = min(len(api_keys), total_tasks)  # don't spawn idle workers
-    api_keys = api_keys[:n_workers]
-    task_chunks = chunk_evenly(tasks, n_workers)
+    # Determine how many workers (one per API key) we will use overall
+    total_workers = min(len(api_keys), total_tasks)  # don't create workers that would get 0 tasks
+    api_keys = api_keys[:total_workers]
 
-    log("Worker assignment:")
-    for i, ((label, key, num), chunk) in enumerate(zip(api_keys, task_chunks)):
-        ids_preview = [t["id"] for t in chunk[:5]]
-        more = "" if len(chunk) <= 5 else f" ... (+{len(chunk)-5} more)"
-        log(f"  - Worker {i}: {label}={mask_key(key)} | tasks={len(chunk)} | first IDs={ids_preview}{more}")
+    # Distribute tasks evenly across all workers (keys)
+    task_chunks = chunk_evenly(tasks, total_workers)
+    assignments = list(zip(api_keys, task_chunks))  # [( (label, key, idx), [tasks_for_worker] ), ...]
 
-    # Launch workers
-    procs = []
+    # Print assignment overview by shifts
+    log("Worker assignment (by shifts):")
+    num_shifts = (total_workers + PROCESSES_PER_SHIFT - 1) // PROCESSES_PER_SHIFT
+    for shift_idx in range(num_shifts):
+        start = shift_idx * PROCESSES_PER_SHIFT
+        end = min(start + PROCESSES_PER_SHIFT, total_workers)
+        log(f"  - Shift {shift_idx+1}/{num_shifts}: workers {start}..{end-1}")
+        for i in range(start, end):
+            (label, key, num), chunk = assignments[i]
+            ids_preview = [t["id"] for t in chunk[:5]]
+            more = "" if len(chunk) <= 5 else f" ... (+{len(chunk)-5} more)"
+            log(f"      Worker {i}: {label}={mask_key(key)} | tasks={len(chunk)} | first IDs={ids_preview}{more}")
+
+    # Launch workers shift-by-shift
     part_paths = []
     overall_start = time.monotonic()
-    for i, ((label, key, _), chunk) in enumerate(zip(api_keys, task_chunks)):
-        if not chunk:
-            log(f"[Worker {i}] No tasks assigned; skipping spawn.")
-            continue
-        part_path = out_path.parent / f"{out_path.stem}.part{i}.jsonl"
-        part_paths.append(part_path)
-        p = mp.Process(
-            target=worker_main,
-            args=(i, label, key, chunk, total_tasks, str(per_question_logs_dir), str(part_path)),
-            name=f"worker-{i}"
-        )
-        p.start()
-        procs.append(p)
-        log(f"Spawned worker {i} (pid={p.pid}) with {len(chunk)} task(s). Part: {part_path.name}")
+    for shift_idx in range(num_shifts):
+        start = shift_idx * PROCESSES_PER_SHIFT
+        end = min(start + PROCESSES_PER_SHIFT, total_workers)
+        current_assignments = list(enumerate(assignments[start:end], start=start))
 
-    # Wait for workers to finish
-    for p in procs:
-        p.join()
-        log(f"Worker process {p.name} (pid={p.pid}) joined with exitcode={p.exitcode}")
+        log(f"Launching Shift {shift_idx+1}/{num_shifts} with up to {PROCESSES_PER_SHIFT} process(es).")
+        procs = []
+
+        # Spawn processes for this shift
+        for i, ((label, key, _), chunk) in current_assignments:
+            if not chunk:
+                log(f"[Worker {i}] No tasks assigned; skipping spawn.")
+                continue
+            part_path = out_path.parent / f"{out_path.stem}.part{i}.jsonl"
+            part_paths.append(part_path)
+            p = mp.Process(
+                target=worker_main,
+                args=(i, label, key, chunk, total_tasks, str(per_question_logs_dir), str(part_path)),
+                name=f"worker-{i}"
+            )
+            p.start()
+            procs.append(p)
+            log(f"Spawned worker {i} (pid={p.pid}) with {len(chunk)} task(s). Part: {part_path.name} [Shift {shift_idx+1}]")
+
+        # Wait for this shift to finish
+        for p in procs:
+            p.join()
+            log(f"Worker process {p.name} (pid={p.pid}) joined with exitcode={p.exitcode} [Shift {shift_idx+1}]")
+
+        log(f"Shift {shift_idx+1}/{num_shifts} complete.")
 
     # Merge part files into single output
     merged = 0
