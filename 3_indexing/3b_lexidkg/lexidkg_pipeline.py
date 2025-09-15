@@ -552,7 +552,7 @@ def next_attempt_id() -> int:
         return aid
 
 # ----------------- Early stop (attempt-id cap) -----------------
-MAX_ATTEMPT_ID = int(os.getenv("MAX_ATTEMPT_ID", "1100"))
+MAX_ATTEMPT_ID = int(os.getenv("MAX_ATTEMPT_ID", "325"))
 
 class EarlyStop(Exception):
     def __init__(self, message: str, attempt_id: Optional[int] = None):

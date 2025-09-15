@@ -45,7 +45,7 @@ else:
     raise(ValueError(f"Wrong configuration of IS_SAMPLE in .env file: {is_sample}"))
 
 # Number of output folders (batches) to create
-BATCH_COUNT = 5  # <-- change this number as needed
+BATCH_COUNT = 36  # <-- change this number as needed
 
 # Input and output directories
 # INPUT_DIR is relative to this script's location; OUTPUT_DIR is absolute as requested.

@@ -5,9 +5,9 @@ Parallel runner for generate_qa.py.
 What it does:
 - Detects batch folders under: ../dataset/samples/json-batches-for-qa
   (i.e., batch-001, batch-002, ...), relative to this script.
-- Reads API keys GOOGLE_API_KEY_1, GOOGLE_API_KEY_2, ... from the parent .env
-  and maps key N to batch-N.
-- Spawns one subprocess per batch using the venv at ../env, running generate_qa.py
+- Reads API keys GOOGLE_API_KEY_1, GOOGLE_API_KEY_2, ... from the repository .env
+  located at ../../.env relative to this script, and maps key N to batch-N.
+- Spawns subprocesses using the venv at ../env, running generate_qa.py
   with:
     - an explicit --file-list pointing to that batch's *.json files
     - a per-process output JSONL path:
@@ -15,6 +15,8 @@ What it does:
   The environment variable GOOGLE_API_KEY is set per process from the mapped key.
 - Streams each process's output live to the terminal with color-coded prefixes
   like [PROCESS-1], and simultaneously writes to per-process log files.
+- Runs processes in "shifts": only SHIFT_SIZE processes run concurrently.
+  After a shift completes, the next shift starts, and so on.
 - When all processes finish, combines per-batch JSONL files into:
     ../dataset/samples/qa_pairs/qa_pairs_combined.jsonl
   and also writes a JSON array version:
@@ -23,6 +25,7 @@ What it does:
 Error cases:
 - If number of keys does not equal number of batch folders, exit with error.
 - If any required paths are missing (venv, generate_qa.py, batches), exit with error.
+- If SHIFT_SIZE < 1, exit with error.
 
 Requirements:
 - No third-party deps. ANSI colors used for most terminals.
@@ -46,14 +49,21 @@ from typing import Dict, List, Tuple
 import dotenv
 
 # ----------------------------
-# Paths and constants
+# Paths, constants, and config
 # ----------------------------
 
-env_file_path = Path("../../.env")
-    
-# Load the .env file
+SCRIPT_DIR = Path(__file__).resolve().parent
+PARENT_DIR = SCRIPT_DIR.parent
+
+# Hardcoded shift size: how many generate_qa instances to run at once
+SHIFT_SIZE = 6  # Set this to the desired concurrent process count per "shift"
+
+# .env file location relative to this script (repo-level .env)
+env_file_path = (SCRIPT_DIR / ".." / ".." / ".env").resolve()
+
+# Load the .env file for IS_SAMPLE and other environment variables
 if not env_file_path.exists():
-    raise(ImportError(f"Error: .env file not found at {env_file_path}"))
+    raise ImportError(f"Error: .env file not found at {env_file_path}")
 
 dotenv.load_dotenv(env_file_path)
 
@@ -64,10 +74,7 @@ if is_sample == "true":
 elif is_sample == "false":
     IS_SAMPLE = False
 else:
-    raise(ValueError(f"Wrong configuration of IS_SAMPLE in .env file: {is_sample}"))
-
-SCRIPT_DIR = Path(__file__).resolve().parent
-PARENT_DIR = SCRIPT_DIR.parent
+    raise ValueError(f"Wrong configuration of IS_SAMPLE in .env file: {is_sample}")
 
 if IS_SAMPLE:
     BATCH_BASE = (SCRIPT_DIR / ".." / ".." / "dataset" / "samples" / "4_experiment" / "4a_qa_generation" / "4a_i_json_batches_for_qa").resolve()
@@ -198,16 +205,12 @@ def tee_stream(proc: subprocess.Popen, proc_idx: int, log_path: Path, color: str
     """Read process stdout live, write to console (prefixed/colorized) and to file."""
     prefix = prefix_for(proc_idx)
     with log_path.open("w", encoding="utf-8") as log_f:
-        # Read line by line
         for line in iter(proc.stdout.readline, ""):
             if line == "":
                 break
-            # Normalize line endings
             line = line.rstrip("\r\n")
             with PRINT_LOCK:
-                # Print to console with color and prefix
                 print(f"{color}{prefix}{line}{ANSI_RESET}", flush=True)
-            # Write raw line to log (without prefix/color)
             log_f.write(line + "\n")
             log_f.flush()
 
@@ -227,11 +230,9 @@ def combine_jsonl(per_batch_paths: List[Path], combined_jsonl: Path, combined_js
                         continue
                     out_f.write(line + "\n")
                     total_lines += 1
-                    # Also attempt to parse as JSON for the array
                     try:
                         all_records.append(json.loads(line))
                     except json.JSONDecodeError:
-                        # If a line isn't JSON, we still keep it in JSONL but skip array
                         pass
     with combined_json_array.open("w", encoding="utf-8") as jf:
         json.dump(all_records, jf, ensure_ascii=False, indent=2)
@@ -241,12 +242,16 @@ def combine_jsonl(per_batch_paths: List[Path], combined_jsonl: Path, combined_js
 def main():
     ensure_paths()
 
+    # Validate shift size
+    if not isinstance(SHIFT_SIZE, int) or SHIFT_SIZE < 1:
+        abort(f"Invalid SHIFT_SIZE={SHIFT_SIZE}. Must be an integer >= 1.")
+
     # Locate batches
     batches = find_batches(BATCH_BASE)  # [(idx, path)]
     n_batches = len(batches)
 
-    # Load API keys from parent .env
-    env_map = parse_env_file(PARENT_DIR / ".. " / ".." / ".." / ".env")
+    # Load API keys from .env (consistent, script-relative path)
+    env_map = parse_env_file(env_file_path)
     keys: Dict[int, str] = {}
     for i in range(1, n_batches + 1):
         k = f"GOOGLE_API_KEY_{i}"
@@ -255,7 +260,6 @@ def main():
 
     # Validate key count and mapping 1..N
     if len(keys) != n_batches:
-        # Helpful message: show which indices are missing
         missing = [i for i in range(1, n_batches + 1) if i not in keys]
         present = sorted(keys.keys())
         abort(
@@ -295,14 +299,15 @@ def main():
             }
         )
 
-    # Spawn processes
-    procs = []
-    threads = []
+    # Shifts execution
     start_time = time.time()
-    print(f"Launching {len(per_proc_specs)} processes using venv Python at: {VENV_PY}", flush=True)
+    total = len(per_proc_specs)
+    total_shifts = (total + SHIFT_SIZE - 1) // SHIFT_SIZE
+    print(f"Launching {total} processes in shifts of {SHIFT_SIZE} using venv Python at: {VENV_PY}", flush=True)
 
-    # Ensure child processes are killed on Ctrl+C
+    # Ensure child processes are killed on Ctrl+C (for current shift)
     stop_event = threading.Event()
+    procs: List[subprocess.Popen] = []  # Will be re-assigned per shift
 
     def handle_sigint(sig, frame):
         with PRINT_LOCK:
@@ -311,43 +316,58 @@ def main():
         for p in procs:
             if p.poll() is None:
                 try:
-                    # Terminate nicely; if needed, escalate later
                     p.terminate()
                 except Exception:
                     pass
 
     signal.signal(signal.SIGINT, handle_sigint)
 
+    all_exit_codes: List[int] = []
+
     try:
-        for spec in per_proc_specs:
-            cmd = build_cmd(spec["out_jsonl"], spec["file_list"])
-            # Start process; merge stderr into stdout for unified streaming
-            p = subprocess.Popen(
-                cmd,
-                cwd=str(SCRIPT_DIR),
-                env=spec["env"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-            procs.append(p)
-            t = threading.Thread(
-                target=tee_stream,
-                args=(p, spec["idx"], spec["log_path"], spec["color"]),
-                daemon=True,
-            )
-            t.start()
-            threads.append(t)
+        for s_idx in range(total_shifts):
+            start = s_idx * SHIFT_SIZE
+            end = min(start + SHIFT_SIZE, total)
+            chunk = per_proc_specs[start:end]
 
-        # Wait for processes to finish
-        exit_codes = []
-        for p in procs:
-            exit_codes.append(p.wait())
+            procs = []
+            threads = []
 
-        # Ensure all logging threads drain
-        for t in threads:
-            t.join(timeout=2.0)
+            print(f"\n=== Shift {s_idx + 1}/{total_shifts} "
+                  f"({len(chunk)} processes: {chunk[0]['batch_name']}..{chunk[-1]['batch_name']}) ===",
+                  flush=True)
+
+            # Start processes for this shift
+            for spec in chunk:
+                cmd = build_cmd(spec["out_jsonl"], spec["file_list"])
+                p = subprocess.Popen(
+                    cmd,
+                    cwd=str(SCRIPT_DIR),
+                    env=spec["env"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                procs.append(p)
+                t = threading.Thread(
+                    target=tee_stream,
+                    args=(p, spec["idx"], spec["log_path"], spec["color"]),
+                    daemon=True,
+                )
+                t.start()
+                threads.append(t)
+
+            # Wait for processes in this shift to finish
+            shift_exit_codes = []
+            for p in procs:
+                shift_exit_codes.append(p.wait())
+
+            # Ensure all logging threads drain for this shift
+            for t in threads:
+                t.join(timeout=2.0)
+
+            all_exit_codes.extend(shift_exit_codes)
 
     finally:
         # If any still running (e.g., on exception), try to kill them
@@ -359,10 +379,10 @@ def main():
                     pass
 
     elapsed = time.time() - start_time
-    any_fail = any(code != 0 for code in exit_codes)
+    any_fail = any(code != 0 for code in all_exit_codes)
 
     # Report status
-    for spec, code in zip(per_proc_specs, exit_codes):
+    for spec, code in zip(per_proc_specs, all_exit_codes):
         status = "OK" if code == 0 else f"EXIT={code}"
         print(f"{prefix_for(spec['idx'])}{status} | output={spec['out_jsonl']} | log={spec['log_path']}", flush=True)
 

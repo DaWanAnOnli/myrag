@@ -87,11 +87,11 @@ else:
 MAX_JSON_FILES: Optional[int] = None
 MAX_PAGES_PER_DOC: Optional[int] = None
 PAGES_PER_GROUP = 10
-NUM_GROUPS_TO_SAMPLE = 2
+NUM_GROUPS_TO_SAMPLE = 10000000000000000000000000
 
 MODEL_NAME = "gemini-2.5-flash-lite"
 TEMPERATURE = 0.2
-MAX_OUTPUT_TOKENS = 512
+MAX_OUTPUT_TOKENS = 8192
 TOP_P = 0.95
 TOP_K = 40
 
@@ -106,7 +106,7 @@ MAX_CONTEXT_CHARS = None
 RETRY_DELAY_MIN_SECONDS = 5
 RETRY_DELAY_MAX_SECONDS = 15
 
-RPM_LIMIT: Optional[int] = 13  # max API calls per minute (set <=0 / None to disable)
+RPM_LIMIT: Optional[int] = 8  # max API calls per minute (set <=0 / None to disable)
 
 # -----------------------
 # Logging helpers

@@ -53,7 +53,7 @@ elif is_sample == "false":
 else:
     raise (ValueError(f"Wrong configuration of IS_SAMPLE in .env file: {is_sample}"))
 
-NUM_FOLDERS = 36  # Change this to your desired number of folders
+NUM_FOLDERS = 34  # Change this to your desired number of folders
 FILE_PATTERN = "*.pkl"  # Only .pkl files are processed
 SKIP_FILES = {"all_langchain_documents.pkl"}  # Exact filenames to skip
 
@@ -62,11 +62,28 @@ SKIP_FILES = {"all_langchain_documents.pkl"}  # Exact filenames to skip
 # fill the current lightest folder up to the per-folder target chunk count.
 MAX_PART_SIZE_HINT = None  # Optional hard cap for part size in chunks (None = no extra cap)
 
+
+# naive
+BATCH_NO = "1"
+
+# flash
+# BATCH_NO = "1" # started running on 12/9/25 23.00 - finished
+# BATCH_NO = "2" # started running on 13/9/25 23.00 - finished
+# BATCH_NO = "3"
+
+# pro
+# BATCH_NO = "1" 
+# BATCH_NO = "2"
+# BATCH_NO = "3"
+# BATCH_NO = "4"
+# BATCH_NO = "5"
+# BATCH_NO = "6"
+
 if IS_SAMPLE:
-    SOURCE_DIR = (Path(__file__).resolve().parent / "../../dataset/samples/3_indexing/3a_langchain_results/").resolve()
+    SOURCE_DIR = (Path(__file__).resolve().parent / f"../../dataset/samples/3_indexing/3a1_langchain_batches_days/{BATCH_NO}").resolve()
     DEST_DIR = (Path(__file__).resolve().parent / "../../dataset/samples/3_indexing/3b_langchain_batches/").resolve()
 else:
-    SOURCE_DIR = (Path(__file__).resolve().parent / "../../dataset/3_indexing/3a_langchain_results/").resolve()
+    SOURCE_DIR = (Path(__file__).resolve().parent / f"../../dataset/3_indexing/3a1_langchain_batches_days/{BATCH_NO}").resolve()
     DEST_DIR = (Path(__file__).resolve().parent / "../../dataset/3_indexing/3b_langchain_batches/").resolve()
 
 
