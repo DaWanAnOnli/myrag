@@ -46,7 +46,7 @@ TMP_SCRIPT_PREFIX = "lexidkg_pipeline_run_"
 LOGS_DIR = (BASE_DIR / "run_logs").resolve()
 
 # How many runs to execute at the same time
-BATCH_SIZE = 6
+BATCH_SIZE = 9
 
 # ANSI colors for per-process tagging
 COLORS = [

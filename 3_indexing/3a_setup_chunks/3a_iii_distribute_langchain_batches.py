@@ -63,7 +63,7 @@ SKIP_FILES = {"all_langchain_documents.pkl"}  # Exact filenames to skip
 MAX_PART_SIZE_HINT = None  # Optional hard cap for part size in chunks (None = no extra cap)
 
 
-# naive
+# flash-lite & naive
 BATCH_NO = "1"
 
 # flash
