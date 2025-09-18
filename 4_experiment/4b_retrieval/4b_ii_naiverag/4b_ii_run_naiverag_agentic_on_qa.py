@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Parallel naive agentic RAG runner over QA pairs (underscore paths only).
+Parallel naive answerer-only RAG runner over QA pairs (underscore paths only).
 
 Input JSONL (each line):
   {
@@ -19,7 +19,7 @@ Input JSONL (each line):
 Behavior:
 - Filters to verification_choice == "A".
 - Distributes questions evenly across worker processes (one per GOOGLE_API_KEY_N).
-- Each worker overrides GOOGLE_API_KEY (env and module constant in naiverag_agentic.py).
+- Each worker overrides GOOGLE_API_KEY (env and module constant in agentic_rag.py).
 
 Output JSONL (combined, one file):
   {
@@ -226,9 +226,9 @@ def worker_main(worker_id: int,
 
     # Import after setting env so the module can read it
     try:
-        import naiverag_agentic as rag
+        import naiverag as rag
     except Exception as e:
-        log(f"[Worker {worker_id}] ERROR: Could not import naiverag_agentic.py: {e}")
+        log(f"[Worker {worker_id}] ERROR: Could not import naiverag.py: {e}")
         part_path.write_text("", encoding="utf-8")
         return
 
@@ -312,7 +312,7 @@ def ensure_output_dir_ready(output_dir: Path):
     output_dir.mkdir(parents=True, exist_ok=True)
     not_empty = any(output_dir.iterdir())
     if not_empty:
-        print(f"WARNING: Output directory is not empty:\n  {output_dir}")
+        print(f"WARNING: Output directory is not empty:\n {output_dir}")
         print("Continuing will OVERWRITE (delete) all files in this folder.")
         resp = input("Type 'YES' to confirm and continue, or anything else to abort: ").strip()
         if resp != "YES":
