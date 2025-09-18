@@ -1,0 +1,7 @@
+1. check batch_days folder 
+2. check batch_days assignment in distribute lanchain script 
+2. check llm_json folder 
+2. check llm model in .env 
+3. check neo4j instance 
+4. check batch size in indexer runner 
+5. check workers and rpm in pipeline 

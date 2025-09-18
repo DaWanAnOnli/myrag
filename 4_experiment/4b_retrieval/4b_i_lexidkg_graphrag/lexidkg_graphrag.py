@@ -527,14 +527,10 @@ def run_cypher_with_retry(cypher: str, params: Dict[str, Any]) -> List[Any]:
     raise RuntimeError(f"Neo4j query failed after {NEO4J_MAX_ATTEMPTS} attempts (qid={qid}): {last_e}")
 
 def _vector_query_nodes(index_name: str, q_emb: List[float], k: int) -> List[Dict[str, Any]]:
-    """
-    Query a specific vector index and return rows as dictionaries with common fields.
-    Ensures q_emb is a plain Python list[float] copied fresh.
-    """
     q_emb = _as_float_list(q_emb)
     cypher = """
     CALL db.index.vector.queryNodes($index_name, $k, $q_emb) YIELD node AS n, score
-    RETURN n, score
+    RETURN n, score, elementId(n) AS elem_id
     ORDER BY score DESC
     LIMIT $k
     """
@@ -544,6 +540,7 @@ def _vector_query_nodes(index_name: str, q_emb: List[float], k: int) -> List[Dic
         n = r["n"]
         rows.append({
             "key": n.get("key"),
+            "elem_id": r["elem_id"],  # NEW
             "name": n.get("name"),
             "type": n.get("type"),
             "score": r["score"],
@@ -551,9 +548,6 @@ def _vector_query_nodes(index_name: str, q_emb: List[float], k: int) -> List[Dic
     return rows
 
 def search_similar_entities_by_embedding(q_emb: List[float], k: int) -> List[Dict[str, Any]]:
-    """
-    Search across entity-like indices and return top-k merged results by score.
-    """
     candidates: List[Dict[str, Any]] = []
     try:
         candidates.extend(_vector_query_nodes("document_vec", q_emb, k))
@@ -568,12 +562,12 @@ def search_similar_entities_by_embedding(q_emb: List[float], k: int) -> List[Dic
     except Exception as e:
         log(f"[Warn] expression_vec query failed: {e}", level="WARN")
 
-    # Deduplicate by (key, type) while keeping the best score
-    best: Dict[Tuple[Optional[str], Optional[str]], Dict[str, Any]] = {}
+    best: Dict[str, Dict[str, Any]] = {}
     for row in candidates:
-        key = (row.get("key"), row.get("type"))
-        if key not in best or (row.get("score", -1) > best[key].get("score", -1)):
-            best[key] = row
+        # Prefer elementId if present, else fall back to key+type
+        dedup_key = row.get("elem_id") or f"{row.get('key')}|{row.get('type')}"
+        if dedup_key not in best or (row.get("score", -1) > best[dedup_key].get("score", -1)):
+            best[dedup_key] = row
 
     merged = list(best.values())
     merged.sort(key=lambda x: x.get("score", 0.0), reverse=True)
@@ -616,27 +610,48 @@ def search_similar_triples_by_embedding(q_emb: List[float], k: int) -> List[Dict
     return rows
 
 # ----------------- Graph expansion (as in LexID) -----------------
-def expand_from_entities(entity_keys: List[str], hops: int, per_hop_limit: int) -> List[Dict[str, Any]]:
-    """
-    Traverse edges that carry r.triple_uid, fetch Triple nodes and endpoints.
-    """
+def expand_from_entities(
+    entity_keys: List[str],
+    hops: int,
+    per_hop_limit: int,
+    entity_elem_ids: Optional[List[str]] = None  # NEW: optional fast-path by id
+) -> List[Dict[str, Any]]:
     triples: Dict[str, Dict[str, Any]] = {}
-    current_seeds = list(set(k for k in entity_keys if k))
+    current_ids: Set[str] = set(x for x in (entity_elem_ids or []) if x)
+    current_keys: Set[str] = set(x for x in (entity_keys or []) if x)
+
     for _ in range(hops):
-        if not current_seeds:
+        if not current_ids and not current_keys:
             break
-        cypher = """
-        UNWIND $keys AS k
-        MATCH (e {key:k})-[r]->(nbr)
-        WHERE r.triple_uid IS NOT NULL
-        WITH DISTINCT r LIMIT $limit
-        MATCH (tr:Triple {triple_uid:r.triple_uid})
-        OPTIONAL MATCH (tr)-[:SUBJECT]->(s)
-        OPTIONAL MATCH (tr)-[:OBJECT]->(o)
-        RETURN tr, s, o
-        """
-        res = run_cypher_with_retry(cypher, {"keys": current_seeds, "limit": per_hop_limit})
-        next_seeds: Set[str] = set()
+
+        if current_ids:
+            cypher = """
+            UNWIND $ids AS eid
+            MATCH (e) WHERE elementId(e) = eid
+            MATCH (e)-[r:PREDICATE]->()
+            WITH DISTINCT r.triple_uid AS uid LIMIT $limit
+            MATCH (tr:Triple {triple_uid: uid})
+            OPTIONAL MATCH (tr)-[:SUBJECT]->(s)
+            OPTIONAL MATCH (tr)-[:OBJECT]->(o)
+            RETURN tr, s, o, elementId(s) AS s_id, elementId(o) AS o_id
+            """
+            params = {"ids": list(current_ids), "limit": per_hop_limit}
+        else:
+            cypher = """
+            UNWIND $keys AS k
+            MATCH (e:Entity {key:k})-[r:PREDICATE]->()
+            WITH DISTINCT r.triple_uid AS uid LIMIT $limit
+            MATCH (tr:Triple {triple_uid: uid})
+            OPTIONAL MATCH (tr)-[:SUBJECT]->(s)
+            OPTIONAL MATCH (tr)-[:OBJECT]->(o)
+            RETURN tr, s, o, elementId(s) AS s_id, elementId(o) AS o_id
+            """
+            params = {"keys": list(current_keys), "limit": per_hop_limit}
+
+        res = run_cypher_with_retry(cypher, params)
+
+        next_ids: Set[str] = set()
+        next_keys: Set[str] = set()
         for r in res:
             tr = r["tr"]; s = r["s"]; o = r["o"]
             uid = tr.get("triple_uid")
@@ -657,9 +672,19 @@ def expand_from_entities(entity_keys: List[str], hops: int, per_hop_limit: int) 
                     "object_key": o.get("key") if o else None,
                     "object_type": o.get("type") if o else None,
                 }
-            if s and s.get("key"): next_seeds.add(s.get("key"))
-            if o and o.get("key"): next_seeds.add(o.get("key"))
-        current_seeds = list(next_seeds)
+            # Seed next hop by both ids and keys if available
+            if s:
+                if s.get("key"): next_keys.add(s.get("key"))
+            if o:
+                if o.get("key"): next_keys.add(o.get("key"))
+            s_id = r.get("s_id");  o_id = r.get("o_id")
+            if s_id: next_ids.add(s_id)
+            if o_id: next_ids.add(o_id)
+
+        # Prefer id-based expansion when available
+        current_ids = next_ids if next_ids else set()
+        current_keys = set() if next_ids else next_keys
+
     return list(triples.values())
 
 # ----------------- Chunk store -----------------
@@ -761,17 +786,9 @@ def entity_centric_retrieval(
     q_trip_embs: List[List[float]],
     q_emb_fallback: Optional[List[float]] = None
 ) -> List[Dict[str, Any]]:
-    """
-    For each extracted entity:
-      - embed entity text
-      - find top-K similar KG entities
-    Expand subgraphs from the union of matched entity keys (independent hop setting).
-    Score subgraph triples by mean similarity to query triple embeddings,
-    fallback to query embedding if no query triples.
-    Return top SUBGRAPH_TRIPLES_TOP_K triples.
-    """
-    # 1) Match entities
     all_matched_keys: Set[str] = set()
+    all_matched_ids: Set[str] = set()
+
     for e in query_entities:
         text = (e.get("text") or "").strip()
         if not text:
@@ -783,27 +800,30 @@ def entity_centric_retrieval(
             continue
         matches = search_similar_entities_by_embedding(e_emb, k=ENTITY_MATCH_TOP_K)
         keys = [m.get("key") for m in matches if m.get("key")]
+        ids  = [m.get("elem_id") for m in matches if m.get("elem_id")]
         all_matched_keys.update(keys)
-        log(f"[EntityRetrieval] '{text}' -> matched {len(keys)} KG keys (sample: {keys[:3]})")
+        all_matched_ids.update(ids)
 
-    if not all_matched_keys:
+    if not (all_matched_keys or all_matched_ids):
         log("[EntityRetrieval] No KG entity matches found from query entities.")
         return []
 
-    # 2) Expand from matched entities
     t0 = now_ms()
-    expanded_triples = expand_from_entities(list(all_matched_keys), hops=ENTITY_SUBGRAPH_HOPS, per_hop_limit=ENTITY_SUBGRAPH_PER_HOP_LIMIT)
+    expanded_triples = expand_from_entities(
+        list(all_matched_keys),
+        hops=ENTITY_SUBGRAPH_HOPS,
+        per_hop_limit=ENTITY_SUBGRAPH_PER_HOP_LIMIT,
+        entity_elem_ids=list(all_matched_ids) if all_matched_ids else None
+    )
     log(f"[EntityRetrieval] Expanded subgraph triples: {len(expanded_triples)} | {dur_ms(t0):.0f} ms")
 
     if not expanded_triples:
         return []
 
-    # 3) Score triples by mean similarity to query triples (fallback to query embedding)
     def score(t: Dict[str, Any]) -> float:
         emb = t.get("embedding")
         if q_trip_embs:
             return mean_similarity_to_query_triples(emb, q_trip_embs)
-        # fallback to whole-query embedding
         if q_emb_fallback and isinstance(emb, list):
             return cos_sim(q_emb_fallback, emb)
         return 0.0

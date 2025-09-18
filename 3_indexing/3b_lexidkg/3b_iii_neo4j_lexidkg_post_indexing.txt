@@ -1,0 +1,14 @@
+MATCH (n:LegalDocument)          WHERE n.key IS NOT NULL SET n:Entity;
+MATCH (n:LegalDocumentContent)   WHERE n.key IS NOT NULL SET n:Entity;
+MATCH (n:RuleExpression)         WHERE n.key IS NOT NULL SET n:Entity;
+MATCH (n:LawAmendment)           WHERE n.key IS NOT NULL SET n:Entity;
+MATCH (n:PlaceOfPromulgation)    WHERE n.key IS NOT NULL SET n:Entity;
+MATCH (n:Person)                 WHERE n.key IS NOT NULL SET n:Entity;
+MATCH (n:Office)                 WHERE n.key IS NOT NULL SET n:Entity;
+MATCH (n:City)                   WHERE n.key IS NOT NULL SET n:Entity;
+
+
+CREATE INDEX entity_key_idx IF NOT EXISTS
+FOR (n:Entity) ON (n.key);
+
+CALL db.awaitIndexes();

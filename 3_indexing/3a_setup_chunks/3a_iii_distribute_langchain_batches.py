@@ -64,11 +64,11 @@ MAX_PART_SIZE_HINT = None  # Optional hard cap for part size in chunks (None = n
 
 
 # flash-lite & naive
-BATCH_NO = "1"
+# BATCH_NO = "1" # flash-lite: done, naive: done
 
 # flash
-# BATCH_NO = "1" # started running on 12/9/25 23.00 - finished
-# BATCH_NO = "2" # started running on 13/9/25 23.00 - finished
+BATCH_NO = "1" # run on 18/9/25 14.30
+# BATCH_NO = "2"
 # BATCH_NO = "3"
 
 # pro
