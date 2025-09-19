@@ -6,6 +6,10 @@ Runs multiple instances of llm_judge.py in parallel with different Google API ke
 splits the input JSONL equally (round-robin) among processes using shard flags,
 and merges per-process CSVs into a single output sorted by id.
 
+New: Supports batched execution of subprocesses via a hardcoded BATCH_SIZE.
+- If BATCH_SIZE = 5, it launches 5 judge processes at a time; once they all finish,
+  it launches the next 5, and so on.
+
 - Reads API keys GOOGLE_API_KEY_1, GOOGLE_API_KEY_2, ... from ../../.env
 - Uses the latest input file matched by llm_judge.INPUT_PATTERN
 - Ensures consistent CSV columns via a shared labels.json
@@ -20,6 +24,13 @@ import csv
 import subprocess
 from pathlib import Path
 from typing import List, Dict, Any
+
+# -------------------------
+# Hardcoded batching control
+# -------------------------
+# Set how many subprocesses to run concurrently.
+# Set to a positive integer; values <= 0 will default to "all at once".
+BATCH_SIZE = 6
 
 try:
     from dotenv import load_dotenv
@@ -145,7 +156,7 @@ def main():
         sys.exit(1)
 
     n_proc = len(api_keys)
-    print(f"Discovered {n_proc} API key(s). Launching {n_proc} parallel judge process(es).")
+    print(f"Discovered {n_proc} API key(s).")
 
     input_path = find_latest_input_file()
     print(f"Using input dataset: {input_path}")
@@ -162,8 +173,8 @@ def main():
     with labels_path.open("w", encoding="utf-8") as f:
         json.dump(all_labels, f, ensure_ascii=False, indent=2)
 
-    # Launch subprocesses: each process handles a round-robin shard
-    processes = []
+    # Prepare per-job commands and outputs
+    jobs = []
     part_csvs: List[Path] = []
 
     for i, key in enumerate(api_keys):
@@ -187,16 +198,40 @@ def main():
             "--force-include-id",
         ]
 
-        print(f"[P{shard_idx}] Starting: {' '.join(cmd)}")
-        p = subprocess.Popen(cmd, env=env)
-        processes.append(p)
+        jobs.append({
+            "shard_idx": shard_idx,
+            "cmd": cmd,
+            "env": env,
+        })
 
-    # Wait for all
-    exit_codes = []
-    for i, p in enumerate(processes):
-        rc = p.wait()
-        exit_codes.append(rc)
-        print(f"[P{i+1}] Exit code: {rc}")
+    # Determine batch size
+    batch_size = BATCH_SIZE if isinstance(BATCH_SIZE, int) and BATCH_SIZE > 0 else n_proc
+    num_batches = (n_proc + batch_size - 1) // batch_size
+    print(f"Launching {n_proc} parallel judge process(es) in {num_batches} batch(es) of up to {batch_size} process(es) each.")
+
+    # Run in batches
+    exit_codes: List[int] = [0] * n_proc
+    for batch_num in range(num_batches):
+        start = batch_num * batch_size
+        end = min(start + batch_size, n_proc)
+        batch = jobs[start:end]
+
+        print(f"--- Starting batch {batch_num + 1}/{num_batches} (processes {start + 1}..{end}) ---")
+        processes = []
+
+        # Launch the batch
+        for job in batch:
+            print(f"[P{job['shard_idx']}] Starting: {' '.join(job['cmd'])}")
+            p = subprocess.Popen(job["cmd"], env=job["env"])
+            processes.append((job["shard_idx"], p))
+
+        # Wait for the batch to finish
+        for shard_idx, p in processes:
+            rc = p.wait()
+            exit_codes[shard_idx - 1] = rc
+            print(f"[P{shard_idx}] Exit code: {rc}")
+
+        print(f"--- Batch {batch_num + 1}/{num_batches} complete ---")
 
     if any(rc != 0 for rc in exit_codes):
         print("Warning: one or more judge processes reported a non-zero exit. Check per-process logs.", file=sys.stderr)

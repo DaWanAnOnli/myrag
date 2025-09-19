@@ -67,7 +67,7 @@ MAX_QUESTIONS = None
 SELECTION_MODE = "random"  # change to "first" to select deterministically
 
 # New: number of processes to run concurrently per shift
-PROCESSES_PER_SHIFT = 5  # Adjust this to control shift size
+PROCESSES_PER_SHIFT = 9  # Adjust this to control shift size
 
 # ----------------- Paths (underscore-only) -----------------
 

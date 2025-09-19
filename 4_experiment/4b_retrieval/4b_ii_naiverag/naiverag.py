@@ -5,10 +5,12 @@
 # - Retrieve top-k most similar TextChunk nodes from Neo4j vector index 'chunk_embedding_index'
 # - Use Agent 2 (Answerer) in a single pass (no Judge)
 # - Logging to a timestamped file (and console)
+# - Rate limiting: hardcoded calls-per-minute across embedding and generation
 
 import os, time, json, pickle, re, random
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
+from collections import deque
 
 from dotenv import load_dotenv
 import google.generativeai as genai
@@ -36,6 +38,10 @@ CHUNK_TEXT_CLAMP = int(os.getenv("CHUNK_TEXT_CLAMP", "1000000")) # max chars per
 ANSWER_MAX_TOKENS = int(os.getenv("ANSWER_MAX_TOKENS", "4096"))
 # Force a single iteration for answerer-only mode
 MAX_ITERS = 1
+
+# Hardcoded LLM rate limit (calls per minute) across this process (embeddings + generations).
+# Set this to match your API key's allowed rate.
+LLM_CALLS_PER_MINUTE = 10
 
 # ----------------- Initialize SDKs -----------------
 genai.configure(api_key=GOOGLE_API_KEY)
@@ -83,12 +89,40 @@ def make_timestamp_name() -> str:
 def estimate_tokens_for_text(text: str) -> int:
     return max(1, int(len(text) / 4))
 
+# --- Simple per-process rate limiter (calls/minute) ---
+class RateLimiter:
+    def __init__(self, calls_per_minute: int):
+        self.calls_per_minute = max(0, int(calls_per_minute))
+        self.window = deque()  # monotonic timestamps of recent calls
+        self.window_seconds = 60.0
+
+    def wait_for_slot(self):
+        if self.calls_per_minute <= 0:
+            return  # disabled
+        while True:
+            now = time.monotonic()
+            # evict old timestamps
+            while self.window and (now - self.window[0]) >= self.window_seconds:
+                self.window.popleft()
+            if len(self.window) < self.calls_per_minute:
+                self.window.append(now)
+                return
+            sleep_time = self.window_seconds - (now - self.window[0])
+            if sleep_time > 0:
+                log(f"[RateLimit] Sleeping {sleep_time:.2f}s to respect LLM_CALLS_PER_MINUTE={self.calls_per_minute}")
+                time.sleep(sleep_time)
+            else:
+                time.sleep(0.01)
+
+_RATE_LIMITER = RateLimiter(LLM_CALLS_PER_MINUTE)
+
 def _rand_wait_seconds() -> float:
     return random.uniform(5.0, 20.0)
 
 def _api_call_with_retry(func, *args, **kwargs):
     while True:
         try:
+            _RATE_LIMITER.wait_for_slot()
             return func(*args, **kwargs)
         except Exception as e:
             wait_s = _rand_wait_seconds()
@@ -368,7 +402,7 @@ def agentic_rag(query_original: str) -> Dict[str, Any]:
         log("=== Agentic RAG (Answerer-only) run started ===")
         log(f"Log file: {log_file}")
         log(f"Original Query: {query_original}")
-        log(f"Parameters: TOP_K_CHUNKS={TOP_K_CHUNKS}, MAX_CHUNKS_FINAL={MAX_CHUNKS_FINAL}, CHUNK_TEXT_CLAMP={CHUNK_TEXT_CLAMP}, ANSWER_MAX_TOKENS={ANSWER_MAX_TOKENS}, MAX_ITERS={MAX_ITERS}")
+        log(f"Parameters: TOP_K_CHUNKS={TOP_K_CHUNKS}, MAX_CHUNKS_FINAL={MAX_CHUNKS_FINAL}, CHUNK_TEXT_CLAMP={CHUNK_TEXT_CLAMP}, ANSWER_MAX_TOKENS={ANSWER_MAX_TOKENS}, MAX_ITERS={MAX_ITERS}, LLM_CALLS_PER_MINUTE={LLM_CALLS_PER_MINUTE}")
 
         user_lang = detect_user_language(query_original)
         log(f"[Language] Detected user language: {user_lang}")

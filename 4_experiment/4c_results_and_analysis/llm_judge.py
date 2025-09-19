@@ -60,7 +60,7 @@ elif is_sample == "false":
 else:
     raise(ValueError(f"Wrong configuration of IS_SAMPLE in .env file: {is_sample}"))
 
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-2.5-flash-lite"
 TEMPERATURE = 0.0
 TOP_P = 0.0
 TOP_K = 1

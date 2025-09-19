@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Parallel naive answerer-only RAG runner over QA pairs (underscore paths only).
+Parallel naive agentic RAG runner over QA pairs (underscore paths only), with batched subprocess execution.
 
 Input JSONL (each line):
   {
@@ -17,8 +17,9 @@ Input JSONL (each line):
   }
 
 Behavior:
-- Filters to verification_choice == "A".
 - Distributes questions evenly across worker processes (one per GOOGLE_API_KEY_N).
+- Workers are launched in batches. BATCH_SIZE controls how many subprocesses run concurrently.
+  Example: BATCH_SIZE=5 runs 5 workers at a time; the next 5 start only after the first 5 finish.
 - Each worker overrides GOOGLE_API_KEY (env and module constant in agentic_rag.py).
 
 Output JSONL (combined, one file):
@@ -78,6 +79,10 @@ else:
 PER_QUESTION_LOGS_DIRNAME = "question_terminal_logs_naive_over_graph"
 ENV_PATH_REL = "../../../.env"
 CLEAN_PART_FILES = True  # remove worker part files after merging
+
+# Batched execution: number of subprocesses to run concurrently.
+# Set to 0 or a negative number to run all workers at once (legacy behavior).
+BATCH_SIZE = 5
 
 # ----------------- Utilities & logging -----------------
 
@@ -228,7 +233,7 @@ def worker_main(worker_id: int,
     try:
         import naiverag as rag
     except Exception as e:
-        log(f"[Worker {worker_id}] ERROR: Could not import naiverag.py: {e}")
+        log(f"[Worker {worker_id}] ERROR: Could not import agentic_rag.py: {e}")
         part_path.write_text("", encoding="utf-8")
         return
 
@@ -416,29 +421,62 @@ def main():
         more = "" if len(chunk) <= 5 else f" ... (+{len(chunk)-5} more)"
         log(f"  - Worker {i}: {label}={mask_key(key)} | tasks={len(chunk)} | first IDs={ids_preview}{more}")
 
-    # Launch workers
-    procs = []
+    # Prepare worker specs and part files (do not launch yet)
+    worker_specs = []
     part_paths = []
-    overall_start = time.monotonic()
     for i, ((label, key, _), chunk) in enumerate(zip(api_keys, task_chunks)):
         if not chunk:
             log(f"[Worker {i}] No tasks assigned; skipping spawn.")
             continue
         part_path = out_path.parent / f"{out_path.stem}.part{i}.jsonl"
         part_paths.append(part_path)
-        p = mp.Process(
-            target=worker_main,
-            args=(i, label, key, chunk, total_tasks, str(logs_dir), str(part_path)),
-            name=f"worker-{i}"
-        )
-        p.start()
-        procs.append(p)
-        log(f"Spawned worker {i} (pid={p.pid}) with {len(chunk)} task(s). Part: {part_path.name}")
+        worker_specs.append({
+            "index": i,
+            "label": label,
+            "key": key,
+            "chunk": chunk,
+            "part_path": part_path,
+        })
 
-    # Wait for workers to finish
-    for p in procs:
-        p.join()
-        log(f"Worker process {p.name} (pid={p.pid}) joined with exitcode={p.exitcode}")
+    # Batched launch of workers
+    total_workers = len(worker_specs)
+    if total_workers == 0:
+        log("No workers to launch. Exiting.")
+        return
+
+    effective_batch_size = total_workers if not BATCH_SIZE or BATCH_SIZE <= 0 else max(1, int(BATCH_SIZE))
+    num_batches = (total_workers + effective_batch_size - 1) // effective_batch_size
+    log(f"Launching {total_workers} worker(s) in {num_batches} batch(es) of up to {effective_batch_size} concurrent process(es).")
+
+    overall_start = time.monotonic()
+    for b in range(num_batches):
+        start_idx = b * effective_batch_size
+        end_idx = min(start_idx + effective_batch_size, total_workers)
+        batch = worker_specs[start_idx:end_idx]
+        log(f"Starting batch {b+1}/{num_batches}: workers indices {[spec['index'] for spec in batch]}")
+
+        procs = []
+        for spec in batch:
+            i = spec["index"]
+            label = spec["label"]
+            key = spec["key"]
+            chunk = spec["chunk"]
+            part_path = spec["part_path"]
+            p = mp.Process(
+                target=worker_main,
+                args=(i, label, key, chunk, total_tasks, str(logs_dir), str(part_path)),
+                name=f"worker-{i}"
+            )
+            p.start()
+            procs.append(p)
+            log(f"Spawned worker {i} (pid={p.pid}) with {len(chunk)} task(s). Part: {part_path.name}")
+
+        # Wait for this batch to finish
+        for p in procs:
+            p.join()
+            log(f"Worker process {p.name} (pid={p.pid}) joined with exitcode={p.exitcode}")
+
+        log(f"Completed batch {b+1}/{num_batches}.")
 
     # Merge part files into single output
     merged = 0
