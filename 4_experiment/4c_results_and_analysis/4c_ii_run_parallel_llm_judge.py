@@ -30,7 +30,7 @@ from typing import List, Dict, Any
 # -------------------------
 # Set how many subprocesses to run concurrently.
 # Set to a positive integer; values <= 0 will default to "all at once".
-BATCH_SIZE = 6
+BATCH_SIZE = 9
 
 try:
     from dotenv import load_dotenv
