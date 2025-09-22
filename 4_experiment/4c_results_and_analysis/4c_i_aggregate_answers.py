@@ -41,19 +41,19 @@ else:
     raise(ValueError(f"Wrong configuration of IS_SAMPLE in .env file: {is_sample}"))
 
 if IS_SAMPLE:
-    BASE_INPUT_DIRECTORY = "../../dataset/samples/4_experiment/4b_experiment_answers"
+    BASE_INPUT_DIRECTORY = "../../dataset/samples/4_experiment/4b_experiment_answers/saved_answers"
 else:
-    BASE_INPUT_DIRECTORY = "../../dataset/4_experiment/4b_experiment_answers"
+    BASE_INPUT_DIRECTORY = "../../dataset/4_experiment/4b_experiment_answers/saved_answers"
 
 
-LEXIDKG_GRAPHRAG_PATTERNS = [
-    # graph_rag_answers_*.jsonl
-    os.path.join(BASE_INPUT_DIRECTORY, "4b_i_lexidkg_graphrag", "graph_rag_answers_*.jsonl"),
-]
+# LEXIDKG_GRAPHRAG_PATTERNS = [
+#     # graph_rag_answers_*.jsonl
+#     os.path.join(BASE_INPUT_DIRECTORY, "4b_i_lexidkg_graphrag", "graph_rag_answers_*.jsonl"),
+# ]
 
 NAIVE_RAG_PATTERNS = [
     # naive_rag_answers_*.jsonl
-    os.path.join(BASE_INPUT_DIRECTORY, "4b_ii_naive_rag", "naive_rag_answers_*.jsonl"),
+    os.path.join(BASE_INPUT_DIRECTORY, "naive_rag_answers_*_2500.jsonl"),
 ]
 
 # NAIVEKG_GRAPHRAG_PATTERNS = [
@@ -61,6 +61,33 @@ NAIVE_RAG_PATTERNS = [
 #     # Note: original message had a small typo ("base_input/directory"); using BASE_INPUT_DIRECTORY consistently here.
 #     os.path.join(BASE_INPUT_DIRECTORY, "4b_iii_naivekg_graphrag", "naivekg_graphrag_answers_*.jsonl"),
 # ]
+
+ZERO_HOP_PATTERNS = [
+    os.path.join(BASE_INPUT_DIRECTORY, "graph_rag_answers_*_0_hops_2500.jsonl")
+]
+
+ONE_HOP_PATTERNS = [
+    os.path.join(BASE_INPUT_DIRECTORY, "graph_rag_answers_*_1_hop_2500.jsonl")
+]
+
+TWO_HOP_PATTERNS = [
+    os.path.join(BASE_INPUT_DIRECTORY, "graph_rag_answers_*_2_hops_2500.jsonl")
+]
+
+THREE_HOP_PATTERNS = [
+    os.path.join(BASE_INPUT_DIRECTORY, "graph_rag_answers_*_3_hops_2500.jsonl")
+]
+
+FOUR_HOP_PATTERNS = [
+    os.path.join(BASE_INPUT_DIRECTORY, "graph_rag_answers_*_4_hops_2500.jsonl")
+]
+
+FIVE_HOP_PATTERNS = [
+    os.path.join(BASE_INPUT_DIRECTORY, "graph_rag_answers_*_5_hops_2500.jsonl")
+]
+
+
+
 
 # Output path with timestamp
 TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -160,26 +187,35 @@ def sort_ids(id_keys: Iterable[str]) -> List[str]:
 
 
 def main():
-    graph_files = expand_paths(LEXIDKG_GRAPHRAG_PATTERNS)
+    # graph_files = expand_paths(LEXIDKG_GRAPHRAG_PATTERNS)
     naive_rag_files = expand_paths(NAIVE_RAG_PATTERNS)
     # naivekg_graphrag_files = expand_paths(NAIVEKG_GRAPHRAG_PATTERNS)
+    zero_hop_files = expand_paths(ZERO_HOP_PATTERNS)
+    one_hop_files = expand_paths(ONE_HOP_PATTERNS)
+    two_hop_files = expand_paths(TWO_HOP_PATTERNS)
+    three_hop_files = expand_paths(THREE_HOP_PATTERNS)
+    four_hop_files = expand_paths(FOUR_HOP_PATTERNS)
+    five_hop_files = expand_paths(FIVE_HOP_PATTERNS)
 
-    if not graph_files and not naive_rag_files: #and not naivekg_graphrag_files:
+    if not zero_hop_files and not naive_rag_files \
+        and not one_hop_files and not two_hop_files \
+        and not three_hop_files and not four_hop_files \
+        and not five_hop_files:
         eprint("[error] No input files found for any group. Exiting.")
         sys.exit(1)
 
     # Load/normalize each group
-    graph_data = load_group(
-        graph_files,
-        source_answer_field="generated_answer",
-        dest_answer_field="agentic_lexidkg_graphrag_answer",
-        include_question=True,
-        include_ground_truth=True,
-    )
+    # graph_data = load_group(
+    #     graph_files,
+    #     source_answer_field="generated_answer",
+    #     dest_answer_field="agentic_lexidkg_graphrag_answer",
+    #     include_question=True,
+    #     include_ground_truth=True,
+    # )
     naive_rag_data = load_group(
         naive_rag_files,
         source_answer_field="agentic_naive_rag_answer",
-        dest_answer_field="agentic_naive_rag_answer",
+        dest_answer_field="naive_rag_answer",
         include_question=True,
         include_ground_truth=True,
     )
@@ -190,8 +226,53 @@ def main():
     #     include_question=True,
     #     include_ground_truth=True,
     # )
+    zero_hop_data = load_group(
+        zero_hop_files,
+        source_answer_field="generated_answer",
+        dest_answer_field="lexidkg_graphrag_0_hop_answer",
+        include_question=True,
+        include_ground_truth=True,
+    )
+    one_hop_data = load_group(
+        one_hop_files,
+        source_answer_field="generated_answer",
+        dest_answer_field="lexidkg_graphrag_1_hop_answer",
+        include_question=True,
+        include_ground_truth=True,
+    )
+    two_hop_data = load_group(
+        two_hop_files,
+        source_answer_field="generated_answer",
+        dest_answer_field="lexidkg_graphrag_2_hop_answer",
+        include_question=True,
+        include_ground_truth=True,
+    )
+    three_hop_data = load_group(
+        three_hop_files,
+        source_answer_field="generated_answer",
+        dest_answer_field="lexidkg_graphrag_3_hop_answer",
+        include_question=True,
+        include_ground_truth=True,
+    )
+    four_hop_data = load_group(
+        four_hop_files,
+        source_answer_field="generated_answer",
+        dest_answer_field="lexidkg_graphrag_4_hop_answer",
+        include_question=True,
+        include_ground_truth=True,
+    )
+    five_hop_data = load_group(
+        five_hop_files,
+        source_answer_field="generated_answer",
+        dest_answer_field="lexidkg_graphrag_5_hop_answer",
+        include_question=True,
+        include_ground_truth=True,
+    )
 
-    all_ids = set(graph_data.keys()) | set(naive_rag_data.keys()) # | set(naivekg_graphrag_data.keys())
+
+    # all_ids = set(graph_data.keys()) | set(naive_rag_data.keys()) |# | set(naivekg_graphrag_data.keys())
+    all_ids = set(naive_rag_data.keys()) | set(zero_hop_data.keys()) | set(one_hop_data.keys()) | \
+    set (two_hop_data.keys()) | set (three_hop_data.keys()) | set (four_hop_data.keys()) | set(five_hop_data.keys())
     if not all_ids:
         eprint("[warn] No records found across inputs. Output will be empty.")
 
@@ -199,12 +280,19 @@ def main():
     written = 0
     with open(OUTPUT_PATH, "w", encoding="utf-8") as out_f:
         for id_key in sort_ids(all_ids):
-            g = graph_data.get(id_key, {})
+            # g = graph_data.get(id_key, {})
             n = naive_rag_data.get(id_key, {})
             # k = naivekg_graphrag_data.get(id_key, {})
+            g0 = zero_hop_data.get(id_key, {})
+            g1 = one_hop_data.get(id_key, {})
+            g2 = two_hop_data.get(id_key, {})
+            g3 = three_hop_data.get(id_key, {})
+            g4 = four_hop_data.get(id_key, {})
+            g5 = five_hop_data.get(id_key, {})
 
             # Preserve original id type when possible
-            id_val = pick_first(g.get("id"), n.get("id"))# , k.get("id"))
+            # id_val = pick_first(g.get("id"), n.get("id"))# , k.get("id"))
+            id_val = pick_first(n.get("id"), g0.get("id"))
             if id_val is None:
                 try:
                     id_val = int(id_key)
@@ -213,11 +301,15 @@ def main():
 
             merged = {
                 "id": id_val,
-                "question": pick_first(g.get("question"), n.get("question")), #k.get("question")),
-                "ground_truth": pick_first(g.get("ground_truth"), n.get("ground_truth")), #k.get("ground_truth")),
-                "agentic_lexidkg_graphrag_answer": g.get("agentic_lexidkg_graphrag_answer"),
-                "agentic_naive_rag_answer": n.get("agentic_naive_rag_answer")
-                # "agentic_naivekg_graphrag_answer": k.get("agentic_naivekg_graphrag_answer"),
+                "question": pick_first(n.get("question"), g0.get("question")), #k.get("question")),
+                "ground_truth": pick_first(n.get("ground_truth"), g0.get("ground_truth")), #k.get("ground_truth")),
+                "naive_rag_answer": n.get("naive_rag_answer"),
+                "lexidkg_graphrag_0_hop_answer": g0.get("lexidkg_graphrag_0_hop_answer"),
+                "lexidkg_graphrag_1_hop_answer": g1.get("lexidkg_graphrag_1_hop_answer"),
+                "lexidkg_graphrag_2_hop_answer": g2.get("lexidkg_graphrag_2_hop_answer"),
+                "lexidkg_graphrag_3_hop_answer": g3.get("lexidkg_graphrag_3_hop_answer"),
+                "lexidkg_graphrag_4_hop_answer": g4.get("lexidkg_graphrag_4_hop_answer"),
+                "lexidkg_graphrag_5_hop_answer": g5.get("lexidkg_graphrag_5_hop_answer"),
             }
 
             out_f.write(json.dumps(merged, ensure_ascii=False) + "\n")

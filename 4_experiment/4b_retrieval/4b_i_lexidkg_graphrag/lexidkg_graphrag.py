@@ -39,7 +39,7 @@ SKIP_FILES = {"all_langchain_documents.pkl"}
 # Independent hop-depth and top-k per step (each "n" is independent as requested)
 # Entity-centric path
 ENTITY_MATCH_TOP_K = 15                 # top similar KG entities per extracted query entity
-ENTITY_SUBGRAPH_HOPS = 2               # hop-depth for subgraph expansion from matched entities
+ENTITY_SUBGRAPH_HOPS = 0               # hop-depth for subgraph expansion from matched entities
 ENTITY_SUBGRAPH_PER_HOP_LIMIT = 2000   # per-hop expansion limit
 SUBGRAPH_TRIPLES_TOP_K = 30            # top triples selected from subgraph after triple-vs-triple similarity
 

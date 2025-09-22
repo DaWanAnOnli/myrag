@@ -453,13 +453,13 @@ def main():
     scraper = BPKScraper()
     
     # URL to scrape
-    start_url = "https://peraturan.bpk.go.id/Search?keywords=&tentang=&nomor=&jenis=9"
+    start_url = "https://peraturan.bpk.go.id/Search?keywords=&tentang=&nomor=&jenis=10"
     
     # Scrape data (limit to first 1 page for testing)
-    data = scraper.scrape_all_pages(start_url, max_pages=191)
+    data = scraper.scrape_all_pages(start_url, max_pages=10000000)
     
     # Save to CSV
-    scraper.save_to_csv(data, 'bpk_perpu_data.csv')
+    scraper.save_to_csv(data, 'bpk_pp_data.csv')
     
     print(f"\nScraping completed! Found {len(data)} records.")
     

@@ -9,9 +9,16 @@ Enhancements:
 - Optional --output-suffix to disambiguate per-process CSV and log filenames.
 - Optional --labels-file for consistent CSV columns across shards.
 - Optional --force-include-id to ensure ID column is present for merging/sorting.
+
+Update (max attempts + failure handling):
+- Adds a MAX_ATTEMPTS cap (default 5) for validation/parse/exception failures in model responses.
+- After 5 failed attempts for a question, logs detailed diagnostics including the question id and the exact issue,
+  then continues with the next question.
+- In the CSV, sets score = -1 and reason = "N/A" for all expected labels of the failed question.
 """
 
 import os
+import random
 import sys
 import json
 import csv
@@ -68,6 +75,9 @@ TOP_K = 1
 # Requests per minute (RPM). All attempts (including failed ones) respect this limit.
 RPM = 10
 
+# Maximum attempts per question when response is invalid (labels/scores/JSON/exception)
+MAX_ATTEMPTS = 10
+
 # I/O paths (relative to this script)
 SCRIPT_DIR = Path(__file__).resolve().parent
 PARENT_DIR = SCRIPT_DIR.parent
@@ -88,19 +98,23 @@ LOG_DIR = (SCRIPT_DIR / "llm_judge_logs").resolve()
 # Preferred label ordering for known models (extras will be appended)
 PREFERRED_LABEL_ORDER = [
     "naiverag",
-    "lexidkg_graphrag",
-    "naivekg_graphrag",
-    "graphrag",
-    # "naive_graphrag",
+    "lexidkg_graphrag_0_hop",
+    "lexidkg_graphrag_1_hop",
+    "lexidkg_graphrag_2_hop",
+    "lexidkg_graphrag_3_hop",
+    "lexidkg_graphrag_4_hop",
+    "lexidkg_graphrag_5_hop",
 ]
 
 # Map JSONL keys to friendly, stable labels (optional explicit mapping)
 MODEL_KEY_TO_LABEL = {
-    "agentic_naive_rag_answer": "naiverag",
-    "agentic_graph_rag_answer": "graphrag",
-    "agentic_naive_graphrag_answer": "naive_graphrag",
-    # "agentic_naivekg_graphrag_answer": "naivekg_graphrag",
-    "agentic_lexidkg_graphrag_answer": "lexidkg_graphrag",
+    "naive_rag_answer": "naiverag",
+    "lexidkg_graphrag_0_hop_answer": "lexidkg_graphrag_0_hop",
+    "lexidkg_graphrag_1_hop_answer": "lexidkg_graphrag_1_hop",
+    "lexidkg_graphrag_2_hop_answer": "lexidkg_graphrag_2_hop",
+    "lexidkg_graphrag_3_hop_answer": "lexidkg_graphrag_3_hop",
+    "lexidkg_graphrag_4_hop_answer": "lexidkg_graphrag_4_hop",
+    "lexidkg_graphrag_5_hop_answer": "lexidkg_graphrag_5_hop",
 }
 
 
@@ -151,7 +165,7 @@ def collect_model_answers(item: Dict[str, Any]) -> Dict[str, str]:
     for key, value in item.items():
         if not isinstance(value, str):
             continue
-        if key.endswith("_answer") and key.startswith("agentic_"):
+        if key.endswith("_answer"):
             label = label_from_key(key)
             if label:
                 out[label] = value.strip()
@@ -343,15 +357,28 @@ def call_llm_with_retry(model: genai.GenerativeModel,
                         logger: logging.Logger,
                         q_index: int,
                         total: int,
-                        expected_labels: List[str]) -> Tuple[Dict[str, Any], float, int]:
+                        expected_labels: List[str],
+                        qid: Any,
+                        max_attempts: int = MAX_ATTEMPTS) -> Tuple[Optional[Dict[str, Any]], float, int, Optional[Dict[str, Any]]]:
+    """
+    Returns:
+        parsed_json (or None if failed after max attempts),
+        last_attempt_duration_seconds,
+        attempts_made,
+        error_info (dict with details if failed; None if success)
+    """
     exp_norm = [normalize_label(x) for x in expected_labels]
     attempts = 0
-    while True:
+    last_duration = 0.0
+    last_error_info: Optional[Dict[str, Any]] = None
+    last_text: Optional[str] = None
+
+    while attempts < max_attempts:
         attempts += 1
         limiter.wait_for_slot(logger=logger)
         t0 = time.perf_counter()
         try:
-            logger.info(f"[Q{q_index+1}/{total}] Attempt {attempts}: sending request...")
+            logger.info(f"[Q{q_index+1}/{total} | id={qid}] Attempt {attempts}: sending request...")
             response = model.generate_content(
                 prompt,
                 generation_config=genai.types.GenerationConfig(
@@ -360,47 +387,91 @@ def call_llm_with_retry(model: genai.GenerativeModel,
                     top_k=TOP_K,
                 ),
             )
-            duration = time.perf_counter() - t0
+            last_duration = time.perf_counter() - t0
 
             text = getattr(response, "text", None)
             if not text and hasattr(response, "candidates") and response.candidates:
                 parts = response.candidates[0].content.parts if response.candidates[0].content else []
                 text = "".join(getattr(p, "text", "") for p in parts)
+            last_text = text or ""
 
-            parsed = extract_json(text or "")
+            parsed = extract_json(last_text)
             if not isinstance(parsed, dict):
-                logger.warning(f"[Q{q_index+1}] Attempt {attempts}: Could not parse JSON. Retrying...")
-                logger.info(f"[Q{q_index+1}] Attempt {attempts} duration: {duration:.3f}s - FAILED")
+                # JSON parse failure
+                logger.warning(f"[Q{q_index+1} | id={qid}] Attempt {attempts}: Could not parse JSON. Retrying...")
+                logger.info(f"[Q{q_index+1} | id={qid}] Attempt {attempts} duration: {last_duration:.3f}s - FAILED")
+                last_error_info = {
+                    "type": "parse_error",
+                    "message": "Could not parse JSON from model output.",
+                    "raw_text_excerpt": truncate(last_text, 500),
+                }
                 continue
 
-            norm_parsed = {}
-            for k, v in parsed.items():
-                norm_parsed[normalize_label(k)] = v
+            norm_parsed = {normalize_label(k): v for k, v in parsed.items()}
 
             def valid_score(x: Any) -> bool:
                 return isinstance(x, int) and x in (0, 1, 2)
 
-            ok = True
+            missing_labels = [lbl for lbl in exp_norm if lbl not in norm_parsed]
+            invalid_details: List[Dict[str, Any]] = []
             for lbl_norm in exp_norm:
                 if lbl_norm not in norm_parsed:
-                    ok = False
-                    break
+                    continue
                 sv = norm_parsed[lbl_norm]
-                if not isinstance(sv, dict) or not valid_score(sv.get("score")):
-                    ok = False
-                    break
+                if not isinstance(sv, dict):
+                    invalid_details.append({
+                        "label": lbl_norm,
+                        "issue": "value is not an object",
+                        "observed_type": type(sv).__name__,
+                    })
+                else:
+                    sc = sv.get("score", None)
+                    if sc is None:
+                        invalid_details.append({"label": lbl_norm, "issue": "missing score"})
+                    elif not isinstance(sc, int):
+                        invalid_details.append({"label": lbl_norm, "issue": "non-integer score", "observed_type": type(sc).__name__, "observed_value": sc})
+                    elif sc not in (0, 1, 2):
+                        invalid_details.append({"label": lbl_norm, "issue": "score out of allowed range", "observed_value": sc})
 
-            if not ok:
-                logger.warning(f"[Q{q_index+1}] Attempt {attempts}: Missing/invalid expected labels/scores. Retrying...")
-                logger.info(f"[Q{q_index+1}] Attempt {attempts} duration: {duration:.3f}s - FAILED")
+            if missing_labels or invalid_details:
+                # Validation failure on expected labels/scores
+                summary_invalid = [f"{d.get('label')}: {d.get('issue')}" for d in invalid_details]
+                logger.warning(
+                    f"[Q{q_index+1} | id={qid}] Attempt {attempts}: Missing/invalid expected labels/scores. "
+                    f"Missing={missing_labels or '[]'} | Invalid={summary_invalid or '[]'}. Retrying..."
+                )
+                logger.info(f"[Q{q_index+1} | id={qid}] Attempt {attempts} duration: {last_duration:.3f}s - FAILED")
+                last_error_info = {
+                    "type": "validation_error",
+                    "expected_labels": exp_norm,
+                    "returned_labels": list(norm_parsed.keys()),
+                    "missing_labels": missing_labels,
+                    "invalid_details": invalid_details,
+                    "raw_text_excerpt": truncate(last_text, 500),
+                }
+                time.sleep(random.uniform(50.0, 80.0))
                 continue
 
-            logger.info(f"[Q{q_index+1}] Attempt {attempts} duration: {duration:.3f}s - SUCCESS")
-            return parsed, duration, attempts
+            # Success
+            logger.info(f"[Q{q_index+1} | id={qid}] Attempt {attempts} duration: {last_duration:.3f}s - SUCCESS")
+            return parsed, last_duration, attempts, None
 
         except Exception as e:
-            duration = time.perf_counter() - t0
-            logger.warning(f"[Q{q_index+1}] Attempt {attempts} duration: {duration:.3f}s - EXCEPTION: {repr(e)}. Retrying...")
+            last_duration = time.perf_counter() - t0
+            logger.warning(f"[Q{q_index+1} | id={qid}] Attempt {attempts} duration: {last_duration:.3f}s - EXCEPTION: {repr(e)}. Retrying...")
+            last_error_info = {
+                "type": "exception",
+                "exception": repr(e),
+            }
+            time.sleep(random.uniform(50.0, 80.0))
+            continue
+
+    # Reached max attempts
+    logger.error(
+        f"[Q{q_index+1} | id={qid}] Max attempts reached ({max_attempts}). Aborting this question. "
+        f"Last error: {json.dumps(last_error_info, ensure_ascii=False) if last_error_info else 'N/A'}"
+    )
+    return None, last_duration, attempts, last_error_info
 
 
 def compute_csv_columns(all_labels: List[str], include_id: bool) -> List[str]:
@@ -460,11 +531,68 @@ def evaluate_dataset(items: List[Dict[str, Any]],
         candidates = {lbl: model_answers[lbl] for lbl in expected_labels}
         prompt = build_prompt(q, gt, candidates)
 
-        parsed, duration, attempts = call_llm_with_retry(
-            model, limiter, prompt, logger, idx, total_questions, expected_labels
+        parsed, duration, attempts, error_info = call_llm_with_retry(
+            model, limiter, prompt, logger, idx, total_questions, expected_labels, qid=qid, max_attempts=MAX_ATTEMPTS
         )
         total_attempts += attempts
+
+        # Failure path: mark -1 / N/A and continue
+        if parsed is None:
+            failed_attempts_count += attempts  # all attempts failed for this question
+
+            # Build row with -1 score and N/A reason for expected labels
+            row: Dict[str, Any] = {}
+            if include_id:
+                row["id"] = qid
+            row["question"] = q
+            row["ground truth"] = gt
+            for lbl in all_labels:
+                row[f"answer by {lbl}"] = model_answers.get(lbl, "")
+
+            for lbl in expected_labels:
+                row[f"{lbl} score"] = -1
+                row[f"reason for {lbl} score"] = "N/A"
+
+            for lbl in all_labels:
+                row.setdefault(f"{lbl} score", "")
+                row.setdefault(f"reason for {lbl} score", "")
+
+            # Detailed diagnostics to the log for traceability
+            if error_info:
+                etype = error_info.get("type", "unknown")
+                if etype == "validation_error":
+                    logger.error(
+                        f"[Q{idx+1}] id={qid} Validation failed after {attempts} attempt(s). "
+                        f"Expected={error_info.get('expected_labels')} | Returned={error_info.get('returned_labels')} | "
+                        f"Missing={error_info.get('missing_labels')} | Invalid={error_info.get('invalid_details')} | "
+                        f"LastResponseExcerpt='{error_info.get('raw_text_excerpt')}'"
+                    )
+                elif etype == "parse_error":
+                    logger.error(
+                        f"[Q{idx+1}] id={qid} JSON parse failed after {attempts} attempt(s). "
+                        f"LastResponseExcerpt='{error_info.get('raw_text_excerpt')}'"
+                    )
+                elif etype == "exception":
+                    logger.error(
+                        f"[Q{idx+1}] id={qid} Exception after {attempts} attempt(s): {error_info.get('exception')}"
+                    )
+                else:
+                    logger.error(f"[Q{idx+1}] id={qid} Aborted after {attempts} attempt(s). Details: {error_info}")
+            else:
+                logger.error(f"[Q{idx+1}] id={qid} Aborted after {attempts} attempt(s). No error details available.")
+
+            logger.info(
+                f"[Q{idx+1}] id={qid} FAILED after {attempts} attempt(s). "
+                + ", ".join([f"{lbl}: {row[f'{lbl} score'] if row[f'{lbl} score']!='' else '-'}" for lbl in all_labels])
+            )
+
+            rows.append(row)
+            # Continue to next question
+            continue
+
+        # Success path
         failed_attempts_count += (attempts - 1)
+        # Only successful items contribute to success stats
         successful_items += 1
         total_duration_all_success += duration
 
@@ -512,14 +640,14 @@ def evaluate_dataset(items: List[Dict[str, Any]],
         percentages_by_label[lbl] = pct
 
     if all_labels:
-        max_pct = max(percentages_by_label.values())
-        winners = [lbl for lbl in all_labels if abs(percentages_by_label[lbl] - max_pct) < 1e-9]
-        winner = "Tie: " + ", ".join(winners) if len(winners) > 1 else winners[0]
+        max_pct = max(percentages_by_label.values()) if percentages_by_label else 0.0
+        winners = [lbl for lbl in all_labels if percentages_by_label.get(lbl, 0.0) == max_pct]
+        winner = "Tie: " + ", ".join(winners) if len(winners) > 1 else (winners[0] if winners else "N/A")
     else:
         winner = "N/A"
 
     summary = {
-        "total_questions": successful_items,
+        "total_questions": successful_items,  # kept for backward compatibility with existing logs
         "total_attempts": total_attempts,
         "successful_attempts": successful_items,
         "failed_attempts": failed_attempts_count,
@@ -617,7 +745,7 @@ def main():
 
     logger, log_path = configure_logging(run_ts, log_path_override)
     logger.info("LLM Judge run started.")
-    logger.info(f"Model: {MODEL_NAME} | RPM limit: {RPM}")
+    logger.info(f"Model: {MODEL_NAME} | RPM limit: {RPM} | Max attempts per question: {MAX_ATTEMPTS}")
 
     if args.rpm:
         RPM = args.rpm
