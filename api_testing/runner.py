@@ -11,7 +11,7 @@ import sys  # ensure we can fall back to the current interpreter
 # --- Configuration ---
 # Set the desired RPM for EACH individual process.
 # The total RPM will be this value * number of API keys.
-RPM_PER_PROCESS = 14
+RPM_PER_PROCESS = 3
 
 # Set how many minutes the test should run.
 DURATION_MINUTES = 1

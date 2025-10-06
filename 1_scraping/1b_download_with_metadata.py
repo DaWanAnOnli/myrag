@@ -217,8 +217,8 @@ def read_metadata_from_pdf(pdf_path):
         return {}
 
 def main():
-    input_csv = os.path.join('..', 'dataset', 'bpk_undang_undang_data.csv')
-    output_dir = os.path.join('..', 'dataset', '1_pdfs_with_metadata')
+    input_csv = os.path.join('..', 'dataset', 'bpk_pp_data.csv')
+    output_dir = os.path.join('..', 'dataset', 'pp')
     output_parent_dir = os.path.join('..', 'dataset')  # Parent directory for failed_downloads.csv
     
     os.makedirs(output_dir, exist_ok=True)

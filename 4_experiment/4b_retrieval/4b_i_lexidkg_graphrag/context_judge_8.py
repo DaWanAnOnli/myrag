@@ -54,7 +54,7 @@ SKIP_FILES = {"all_langchain_documents.pkl"}
 # ----------------- Retrieval/agent parameters -----------------
 # Entity-centric path
 ENTITY_MATCH_TOP_K = 15                 # top similar KG entities per extracted query entity
-ENTITY_SUBGRAPH_HOPS = 1               # hop-depth for subgraph expansion from matched entities
+ENTITY_SUBGRAPH_HOPS = 5               # hop-depth for subgraph expansion from matched entities
 ENTITY_SUBGRAPH_PER_HOP_LIMIT = 2000   # per-hop expansion limit
 SUBGRAPH_TRIPLES_TOP_K = 30            # top triples selected from subgraph after triple-vs-triple similarity
 
@@ -64,7 +64,7 @@ QUERY_TRIPLE_MATCH_TOP_K_PER = 20      # per query-triple, top similar KG triple
 # Final context combination and reranking
 MAX_TRIPLES_FINAL = 60                 # final number of triples after reranking
 MAX_CHUNKS_FINAL = 40                  # final number of chunks after reranking
-CHUNK_RERANK_CAND_LIMIT = 200          # cap chunk candidates before embedding/reranking to control cost
+CHUNK_RERANK_CAND_LIMIT = 10000000            # cap chunk candidates before embedding/reranking to control cost
 
 # Agent loop and output
 ANSWER_MAX_TOKENS = 4096
@@ -74,15 +74,15 @@ OUTPUT_LANG = "id"  # retained for compatibility; we auto-detect based on query
 
 # ----------------- New: Judge + Modifier loop controls -----------------
 # Hardcoded maximum number of judge/modifier iterations (per requirement)
-MAX_JUDGE_ITERS = 3
+MAX_JUDGE_ITERS = 4
 
 # Max characters of built context text fed to the Context Judge (to control tokens)
-JUDGE_CONTEXT_MAX_CHARS = int(os.getenv("JUDGE_CONTEXT_MAX_CHARS", "10000000000000000000000000000"))
+JUDGE_CONTEXT_MAX_CHARS = int(os.getenv("JUDGE_CONTEXT_MAX_CHARS", "1000000000000000000000000000000"))
 
 # ----------------- Global LLM throttling (concurrency + QPS) -----------------
-LLM_EMBED_MAX_CONCURRENCY = max(1, int(os.getenv("LLM_EMBED_MAX_CONCURRENCY", "2")))
-LLM_EMBED_QPS = float(os.getenv("LLM_EMBED_QPS", "2.0"))   # average embed calls per second (global)
-LLM_GEN_MAX_CONCURRENCY   = max(1, int(os.getenv("LLM_GEN_MAX_CONCURRENCY", "1")))
+LLM_EMBED_MAX_CONCURRENCY = max(1, int(os.getenv("LLM_EMBED_MAX_CONCURRENCY", "165")))
+LLM_EMBED_QPS = float(os.getenv("LLM_EMBED_QPS", "165.0"))   # average embed calls per second (global)
+LLM_GEN_MAX_CONCURRENCY   = max(1, int(os.getenv("LLM_GEN_MAX_CONCURRENCY", "100")))
 LLM_GEN_QPS   = float(os.getenv("LLM_GEN_QPS", "1.0"))     # average generation calls per second (global)
 
 # Embedding cache cap

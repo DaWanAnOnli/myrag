@@ -61,7 +61,7 @@ SKIP_FILES = {"all_langchain_documents.pkl"}
 # ----------------- Retrieval/agent parameters -----------------
 # Entity-centric path
 ENTITY_MATCH_TOP_K = 15
-ENTITY_SUBGRAPH_HOPS = 1
+ENTITY_SUBGRAPH_HOPS = 5
 ENTITY_SUBGRAPH_PER_HOP_LIMIT = 2000
 SUBGRAPH_TRIPLES_TOP_K = 30
 
@@ -71,7 +71,7 @@ QUERY_TRIPLE_MATCH_TOP_K_PER = 20
 # Final context combination and reranking
 MAX_TRIPLES_FINAL = 60
 MAX_CHUNKS_FINAL = 40
-CHUNK_RERANK_CAND_LIMIT = 200
+CHUNK_RERANK_CAND_LIMIT = 10000000
 
 # Agent output
 ANSWER_MAX_TOKENS = 4096
@@ -81,15 +81,15 @@ OUTPUT_LANG = "id"  # retained for compatibility
 
 # ----------------- New: Answer-Judge loop controls -----------------
 # Hardcoded maximum number of iterations for the Answer Judge loop (per requirement)
-MAX_ANSWER_JUDGE_ITERS = 3
+MAX_ANSWER_JUDGE_ITERS = 4
 
 # Truncation for what we feed to AJ/QM to control tokens
-AJ_ANSWER_MAX_CHARS = int(os.getenv("AJ_ANSWER_MAX_CHARS", "5000"))
+AJ_ANSWER_MAX_CHARS = int(os.getenv("AJ_ANSWER_MAX_CHARS", "500000000000000"))
 
 # ----------------- Global LLM throttling (concurrency + QPS) -----------------
-LLM_EMBED_MAX_CONCURRENCY = max(1, int(os.getenv("LLM_EMBED_MAX_CONCURRENCY", "2")))
-LLM_EMBED_QPS = float(os.getenv("LLM_EMBED_QPS", "2.0"))
-LLM_GEN_MAX_CONCURRENCY   = max(1, int(os.getenv("LLM_GEN_MAX_CONCURRENCY", "1")))
+LLM_EMBED_MAX_CONCURRENCY = max(1, int(os.getenv("LLM_EMBED_MAX_CONCURRENCY", "165")))
+LLM_EMBED_QPS = float(os.getenv("LLM_EMBED_QPS", "165.0"))
+LLM_GEN_MAX_CONCURRENCY   = max(1, int(os.getenv("LLM_GEN_MAX_CONCURRENCY", "100")))
 LLM_GEN_QPS   = float(os.getenv("LLM_GEN_QPS", "1.0"))
 
 # Embedding cache cap
@@ -201,7 +201,7 @@ def _as_float_list(vec) -> List[float]:
             return []
 
 def _rand_wait_seconds() -> float:
-    return random.uniform(5.0, 20.0)
+    return random.uniform(50.0, 80.0)
 
 def _api_call_with_retry(func, *args, **kwargs):
     while True:

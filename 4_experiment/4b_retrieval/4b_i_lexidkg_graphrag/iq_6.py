@@ -37,7 +37,7 @@ NEO4J_PASS = os.getenv("NEO4J_PASS", "password")
 
 # Neo4j retry/timeout controls (to prevent infinite loops on persistent errors)
 NEO4J_TX_TIMEOUT_S = float(os.getenv("NEO4J_TX_TIMEOUT_S", "60"))  # per-query transaction timeout (seconds)
-NEO4J_MAX_ATTEMPTS = int(os.getenv("NEO4J_MAX_ATTEMPTS", "10"))   # max attempts for run_cypher_with_retry
+NEO4J_MAX_ATTEMPTS = int(os.getenv("NEO4J_MAX_ATTEMPTS", "100000"))   # max attempts for run_cypher_with_retry
 NEO4J_MAX_CONCURRENCY = int(os.getenv("NEO4J_MAX_CONCURRENCY", "0"))  # 0=unlimited
 
 # Gemini models (can be overridden via env if desired)
@@ -52,7 +52,7 @@ SKIP_FILES = {"all_langchain_documents.pkl"}
 # ----------------- Retrieval/agent parameters (hardcoded constants) -----------------
 # Entity-centric path
 ENTITY_MATCH_TOP_K = 15                 # top similar KG entities per extracted query entity
-ENTITY_SUBGRAPH_HOPS = 1               # hop-depth for subgraph expansion from matched entities
+ENTITY_SUBGRAPH_HOPS = 5               # hop-depth for subgraph expansion from matched entities
 ENTITY_SUBGRAPH_PER_HOP_LIMIT = 2000   # per-hop expansion limit
 SUBGRAPH_TRIPLES_TOP_K = 30            # top triples selected from subgraph after triple-vs-triple similarity
 
@@ -62,7 +62,7 @@ QUERY_TRIPLE_MATCH_TOP_K_PER = 20      # per query-triple, top similar KG triple
 # Final context combination and reranking
 MAX_TRIPLES_FINAL = 60                 # final number of triples after reranking
 MAX_CHUNKS_FINAL = 40                  # final number of chunks after reranking
-CHUNK_RERANK_CAND_LIMIT = 200          # cap chunk candidates before embedding/reranking to control cost
+CHUNK_RERANK_CAND_LIMIT = 10000000          # cap chunk candidates before embedding/reranking to control cost
 
 # Agent loop and output
 ANSWER_MAX_TOKENS = 4096
@@ -78,9 +78,9 @@ IQ_MAX_STEPS = 5
 # Aggregation removed by design (final answer is the last IQ's answer)
 
 # ----------------- Global LLM throttling (concurrency + QPS) -----------------
-LLM_EMBED_MAX_CONCURRENCY = max(1, int(os.getenv("LLM_EMBED_MAX_CONCURRENCY", "2")))
+LLM_EMBED_MAX_CONCURRENCY = max(10000, int(os.getenv("LLM_EMBED_MAX_CONCURRENCY", "2")))
 LLM_EMBED_QPS = float(os.getenv("LLM_EMBED_QPS", "2.0"))   # average embed calls per second (global)
-LLM_GEN_MAX_CONCURRENCY   = max(1, int(os.getenv("LLM_GEN_MAX_CONCURRENCY", "1")))
+LLM_GEN_MAX_CONCURRENCY   = max(10000, int(os.getenv("LLM_GEN_MAX_CONCURRENCY", "1")))
 LLM_GEN_QPS   = float(os.getenv("LLM_GEN_QPS", "1.0"))     # average generation calls per second (global)
 
 # Embedding cache cap

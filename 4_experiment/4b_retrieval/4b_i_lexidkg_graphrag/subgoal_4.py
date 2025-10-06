@@ -70,7 +70,7 @@ OUTPUT_LANG = "id"  # retained for compatibility; we auto-detect based on query
 
 # ----------------- Agentic (new) -----------------
 # Hardcoded maximum number of subgoals Agent 0 may produce (per requirement)
-SUBGOAL_MAX_COUNT = 3
+SUBGOAL_MAX_COUNT = 2
 
 # Max number of subgoals processed concurrently (configurable via env)
 SUBGOAL_MAX_PARALLELISM = int(os.getenv("SUBGOAL_MAX_PARALLELISM", "2"))
@@ -1442,6 +1442,7 @@ def agentic_graph_rag_agentic(query_original: str) -> Dict[str, Any]:
     t_all = now_ms()
     try:
         log("=== Agentic GraphRAG (Subgoals + Aggregator) run started ===")
+        log(f"GOOGLE API KEY: {GOOGLE_API_KEY}")
         log(f"Process info: pid={_pid()}")
         log(f"Log file: {log_file}")
         log(f"Original Query: {query_original}")
