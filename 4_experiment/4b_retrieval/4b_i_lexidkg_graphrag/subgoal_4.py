@@ -1,33 +1,20 @@
 # lexidkg_graphrag_agentic.py
-# Agentic GraphRAG with Answer Judge + Query Modifier loop:
-# - Agent AJ: Answer Judge (evaluates the generated answer; if weak, diagnoses and proposes query improvements)
-# - Agent QM: Query Modifier (rewrites the query based on AJ feedback and prior query–answer–feedback history)
-# - Agents 1 & 1b: Entity/predicate and triple extraction (as before)
-# - Agent 2: Answerer (answers strictly from retrieved context)
-# Orchestration:
-# - Iterative loop (hardcoded max iterations). Each iteration:
-#   1) Retrieval to build context
-#   2) Answer (Agent 2)
-#   3) Answer Judge (Agent AJ)
-#       - If acceptable → stop and return answer
-#       - Else → Query Modifier (Agent QM) → next iteration with modified query
-# - Maintains history of query–answer–feedback triples for AJ/QM inputs
+# Agentic GraphRAG with:
+# - Agent 0: Subgoal Generator (parallelizable subgoals, capped by hardcoded max)
+# - Agents 1 & 2: Existing single-pass GraphRAG per subgoal (Entity/Triple extraction + Answerer)
+# - Agent 3: Final Aggregator (merge subanswers into final answer)
 # Plus:
-# - Global LLM rate limiting (concurrency + QPS)
-# - Thread-safe logging with per-iteration tags
+# - Global LLM rate limiting (concurrency + QPS) for embeddings and generations
+# - Thread-safe logging with per-subgoal tags
 # - Embedding cache
-# - Shared ChunkStore across iterations
+# - Shared ChunkStore across subgoals
 # - Optional Neo4j concurrency cap
-#
-# Backward compatibility:
-# - run_single_pass_for_question(...) retained
-# - agentic_graph_rag(...) retained
-# - Prior judge-based orchestrators can remain alongside this new one
 
 import os, time, json, math, pickle, re, random, hashlib, threading
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional, Set
 from threading import Lock
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
 import google.generativeai as genai
@@ -44,9 +31,9 @@ NEO4J_URI  = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASS = os.getenv("NEO4J_PASS", "password")
 
-# Neo4j retry/timeout controls
-NEO4J_TX_TIMEOUT_S = float(os.getenv("NEO4J_TX_TIMEOUT_S", "60"))
-NEO4J_MAX_ATTEMPTS = int(os.getenv("NEO4J_MAX_ATTEMPTS", "10"))
+# Neo4j retry/timeout controls (to prevent infinite loops on persistent errors)
+NEO4J_TX_TIMEOUT_S = float(os.getenv("NEO4J_TX_TIMEOUT_S", "60"))  # per-query transaction timeout (seconds)
+NEO4J_MAX_ATTEMPTS = int(os.getenv("NEO4J_MAX_ATTEMPTS", "10"))   # max attempts for run_cypher_with_retry
 NEO4J_MAX_CONCURRENCY = int(os.getenv("NEO4J_MAX_CONCURRENCY", "0"))  # 0=unlimited
 
 # Gemini models (can be overridden via env if desired)
@@ -58,39 +45,44 @@ DEFAULT_LANGCHAIN_DIR = (Path(__file__).resolve().parent / "../../../dataset/3_i
 LANGCHAIN_DIR = Path(os.getenv("LANGCHAIN_DIR") or str(DEFAULT_LANGCHAIN_DIR))
 SKIP_FILES = {"all_langchain_documents.pkl"}
 
-# ----------------- Retrieval/agent parameters -----------------
+# ----------------- Retrieval/agent parameters (hardcoded constants) -----------------
+# Independent hop-depth and top-k per step (each "n" is independent as requested)
 # Entity-centric path
-ENTITY_MATCH_TOP_K = 15
-ENTITY_SUBGRAPH_HOPS = 1
-ENTITY_SUBGRAPH_PER_HOP_LIMIT = 2000
-SUBGRAPH_TRIPLES_TOP_K = 30
+ENTITY_MATCH_TOP_K = 15                 # top similar KG entities per extracted query entity
+ENTITY_SUBGRAPH_HOPS = 5              # hop-depth for subgraph expansion from matched entities
+ENTITY_SUBGRAPH_PER_HOP_LIMIT = 2000   # per-hop expansion limit
+SUBGRAPH_TRIPLES_TOP_K = 30            # top triples selected from subgraph after triple-vs-triple similarity
 
 # Triple-centric path
-QUERY_TRIPLE_MATCH_TOP_K_PER = 20
+QUERY_TRIPLE_MATCH_TOP_K_PER = 20      # per query-triple, top similar KG triples
 
 # Final context combination and reranking
-MAX_TRIPLES_FINAL = 60
-MAX_CHUNKS_FINAL = 40
-CHUNK_RERANK_CAND_LIMIT = 200
+MAX_TRIPLES_FINAL = 60                 # final number of triples after reranking
+MAX_CHUNKS_FINAL = 40                  # final number of chunks after reranking
+CHUNK_RERANK_CAND_LIMIT = 200          # cap chunk candidates before embedding/reranking to control cost
 
-# Agent output
+# Agent loop and output
 ANSWER_MAX_TOKENS = 4096
+MAX_ITERS = 3  # Note: ignored in single-pass mode
 
-# Language default (we detect automatically)
-OUTPUT_LANG = "id"  # retained for compatibility
+# Language setting
+OUTPUT_LANG = "id"  # retained for compatibility; we auto-detect based on query
 
-# ----------------- New: Answer-Judge loop controls -----------------
-# Hardcoded maximum number of iterations for the Answer Judge loop (per requirement)
-MAX_ANSWER_JUDGE_ITERS = 3
+# ----------------- Agentic (new) -----------------
+# Hardcoded maximum number of subgoals Agent 0 may produce (per requirement)
+SUBGOAL_MAX_COUNT = 2
 
-# Truncation for what we feed to AJ/QM to control tokens
-AJ_ANSWER_MAX_CHARS = int(os.getenv("AJ_ANSWER_MAX_CHARS", "5000"))
+# Max number of subgoals processed concurrently (configurable via env)
+SUBGOAL_MAX_PARALLELISM = int(os.getenv("SUBGOAL_MAX_PARALLELISM", "2"))
 
-# ----------------- Global LLM throttling (concurrency + QPS) -----------------
+# Aggregator output cap
+AGGREGATOR_MAX_TOKENS = int(os.getenv("AGGREGATOR_MAX_TOKENS", str(ANSWER_MAX_TOKENS)))
+
+# Global LLM throttling (concurrency + QPS)
 LLM_EMBED_MAX_CONCURRENCY = max(1, int(os.getenv("LLM_EMBED_MAX_CONCURRENCY", "2")))
-LLM_EMBED_QPS = float(os.getenv("LLM_EMBED_QPS", "2.0"))
+LLM_EMBED_QPS = float(os.getenv("LLM_EMBED_QPS", "2.0"))   # average embed calls per second (global)
 LLM_GEN_MAX_CONCURRENCY   = max(1, int(os.getenv("LLM_GEN_MAX_CONCURRENCY", "1")))
-LLM_GEN_QPS   = float(os.getenv("LLM_GEN_QPS", "1.0"))
+LLM_GEN_QPS   = float(os.getenv("LLM_GEN_QPS", "1.0"))     # average generation calls per second (global)
 
 # Embedding cache cap
 CACHE_EMBED_MAX_ITEMS = int(os.getenv("CACHE_EMBED_MAX_ITEMS", "200000"))
@@ -103,10 +95,10 @@ driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
 
 # ----------------- Logger -----------------
 _LOGGER: Optional["FileLogger"] = None
-_LOG_TL = threading.local()  # thread-local for iteration tags
+_LOG_TL = threading.local()  # thread-local for subgoal tags
 
 def set_log_context(tag: Optional[str]):
-    setattr(_LOG_TL, "iter_tag", tag or None)
+    setattr(_LOG_TL, "sg_tag", tag or None)
 
 def _now_ts() -> str:
     t = time.time()
@@ -121,8 +113,8 @@ def _pid() -> int:
         return -1
 
 def _prefix(level: str = "INFO") -> str:
-    tag = getattr(_LOG_TL, "iter_tag", None)
-    tag_part = f" [iter={tag}]" if tag else ""
+    tag = getattr(_LOG_TL, "sg_tag", None)
+    tag_part = f" [sg={tag}]" if tag else ""
     return f"[{_now_ts()}] [{level}]{tag_part} [pid={_pid()}]"
 
 class FileLogger:
@@ -179,12 +171,18 @@ def dur_ms(start: float) -> float:
     return (time.time() - start) * 1000.0
 
 def _norm_id(x) -> str:
+    """Normalize IDs so (uuid object, stringified uuid, whitespace variants) compare the same."""
     return str(x).strip() if x is not None else ""
 
 def estimate_tokens_for_text(text: str) -> int:
-    return max(1, int(len(text) / 4))  # naive heuristic: ~4 chars/token
+    # Quick heuristic: ~4 characters per token
+    return max(1, int(len(text) / 4))
 
 def _as_float_list(vec) -> List[float]:
+    """
+    Normalize any vector-like to a fresh Python list[float].
+    Prevents Neo4j driver 'Existing exports of data: object cannot be re-sized.' errors.
+    """
     if vec is None:
         return []
     try:
@@ -200,10 +198,17 @@ def _as_float_list(vec) -> List[float]:
         except Exception:
             return []
 
+# Retry helpers for any external API call (e.g., rate limit errors)
 def _rand_wait_seconds() -> float:
+    # Uniform 5–20 seconds
     return random.uniform(5.0, 20.0)
 
 def _api_call_with_retry(func, *args, **kwargs):
+    """
+    Call the given function with the provided args/kwargs.
+    If any exception occurs (e.g., rate limit, network), wait 5–20s and retry.
+    Retries indefinitely until success.
+    """
     while True:
         try:
             return func(*args, **kwargs)
@@ -245,10 +250,13 @@ def _cache_key_for_text(text: str) -> str:
 
 # ----------------- Embedding & similarity -----------------
 def embed_text(text: str) -> List[float]:
+    # Cache check
     key = _cache_key_for_text(text)
     with _EMB_CACHE_LOCK:
         if key in _EMB_CACHE:
             return list(_EMB_CACHE[key])
+
+    # Throttle and call
     with _EMBED_SEM:
         _EMBED_QPS.acquire()
         t0 = now_ms()
@@ -269,9 +277,12 @@ def embed_text(text: str) -> List[float]:
         raise RuntimeError("Unexpected embedding response shape for embeddings")
     out = _as_float_list(vec)
     log(f"[Embed] text_len={len(text)} -> vec_len={len(out)} | {dur_ms(t0):.0f} ms", level="DEBUG")
+
+    # Cache store (bounded)
     with _EMB_CACHE_LOCK:
         if len(_EMB_CACHE) >= CACHE_EMBED_MAX_ITEMS:
             try:
+                # Evict an arbitrary item (simple bound control)
                 _EMB_CACHE.pop(next(iter(_EMB_CACHE)))
             except Exception:
                 _EMB_CACHE.clear()
@@ -288,17 +299,29 @@ def cos_sim(a: List[float], b: List[float]) -> float:
         return 0.0
     return dot / (na * nb)
 
-# ----------------- Language detection (ID vs EN) -----------------
+# ----------------- Simple language detection (ID vs EN) -----------------
 def detect_user_language(text: str) -> str:
+    """
+    Lightweight heuristic to detect Indonesian ('id') vs English ('en')
+    for the purpose of matching the user's query language in the final answer.
+    """
     t = (text or "").lower()
+
+    # Strong hints
     if re.search(r"\b(pasal|undang[- ]?undang|uu\s*\d|peraturan|menteri|ayat|bab|bagian|paragraf|ketentuan|sebagaimana|dimaksud)\b", t):
         return "id"
     if re.search(r"\b(article|act|law|regulation|minister|section|paragraph|chapter|pursuant|provided that)\b", t):
         return "en"
-    id_tokens = {"yang","dan","atau","tidak","adalah","berdasarkan","sebagaimana","pada","dalam","dapat","harus","wajib",
-                 "pasal","undang","peraturan","menteri","ayat","bab","bagian","paragraf","ketentuan","pengundangan","apabila","jika"}
-    en_tokens = {"the","and","or","not","is","based","as","provided","pursuant","in","may","must","shall",
-                 "article","act","law","regulation","minister","section","paragraph","chapter","whereas"}
+
+    # Token-based scoring
+    id_tokens = {
+        "yang","dan","atau","tidak","adalah","berdasarkan","sebagaimana","pada","dalam","dapat","harus","wajib",
+        "pasal","undang","peraturan","menteri","ayat","bab","bagian","paragraf","ketentuan","pengundangan","apabila","jika"
+    }
+    en_tokens = {
+        "the","and","or","not","is","based","as","provided","pursuant","in","may","must","shall",
+        "article","act","law","regulation","minister","section","paragraph","chapter","whereas"
+    }
     words = re.findall(r"[a-z]+", t)
     score_id = sum(1 for w in words if w in id_tokens)
     score_en = sum(1 for w in words if w in en_tokens)
@@ -306,6 +329,8 @@ def detect_user_language(text: str) -> str:
         return "id"
     if score_en > score_id:
         return "en"
+
+    # Fallback: prefer English for safety
     return "en"
 
 # ----------------- Safe LLM helpers -----------------
@@ -354,6 +379,7 @@ def safe_generate_json(prompt: str, schema: Dict[str, Any], temp: float = 0.0) -
         response_mime_type="application/json",
         response_schema=schema,
     )
+    # Throttle
     with _GEN_SEM:
         _GEN_QPS.acquire()
         t0 = now_ms()
@@ -377,6 +403,7 @@ def safe_generate_json(prompt: str, schema: Dict[str, Any], temp: float = 0.0) -
 
 def safe_generate_text(prompt: str, max_tokens: int, temperature: float = 0.2) -> str:
     cfg = GenerationConfig(temperature=temperature, max_output_tokens=max_tokens)
+    # Throttle
     with _GEN_SEM:
         _GEN_QPS.acquire()
         t0 = now_ms()
@@ -390,154 +417,77 @@ def safe_generate_text(prompt: str, max_tokens: int, temperature: float = 0.2) -
     log(f"[LLM text warning] No text returned. Diagnostics: {info}. Took={took:.0f} ms", level="WARN")
     return f"(Model returned no text. finish_info={info})"
 
-# ----------------- Pipeline brief for AJ/QM prompts -----------------
-PIPELINE_BRIEF = """
-GraphRAG pipeline summary:
-1) Agent 1 extracts legal entities/predicates from the query (e.g., UU numbers, Pasal/Article, verbs like mewajibkan/melarang).
-2) Agent 1b extracts query triples: subject [predicate] object.
-3) Triple-centric retrieval: embed "s [p] o" and query a triple_vec index to find similar knowledge-graph triples.
-4) Entity-centric retrieval: embed key entities, match similar KG entities via vector indexes, expand a 1-hop subgraph to collect related triples.
-5) Merge triples, rerank by similarity to the query/triples.
-6) Collect candidate document chunks for those triples (doc_id/chunk_id), then embed and rerank chunks by similarity to the whole query.
-7) Answerer (Agent 2) must answer strictly from the selected chunks; if context lacks specifics, the answer will be vague or incomplete.
-Common issues degrading answers:
-- Missing precise statute identifiers (UU number/year, Pasal/Ayat).
-- Ambiguous entities/terms; need aliases, jurisdiction, or timeframe.
-- Predicate/relationship too vague (e.g., “aturan” vs. “mewajibkan/melarang/mengubah”).
-- Scope too broad; constrain to a sector/institution or date range.
-Your feedback/modification should adjust the query so that entity/triple extraction and vector matching return more precise triples and chunks, improving the final answer.
-""".strip()
-
-# ----------------- Agent AJ: Answer Judge -----------------
-AJ_SCHEMA = {
+# ----------------- Agent 0: Subgoal Generator -----------------
+SUBGOAL_SCHEMA = {
     "type": "object",
     "properties": {
-        "acceptable": {"type": "boolean"},
-        "problems": {"type": "string"},
-        "suggestion": {"type": "string"},
-        "notes": {"type": "string"}
+        "decomposition_needed": {"type": "boolean"},
+        "subgoals": {
+            "type": "array",
+            "items": {"type": "string"}
+        },
+        "justification": {"type": "string"}
     },
-    "required": ["acceptable", "problems", "suggestion"]
+    "required": ["decomposition_needed", "subgoals"]
 }
 
-def _truncate(s: str, max_chars: int) -> str:
-    if not isinstance(s, str):
-        return ""
-    if len(s) <= max_chars:
-        return s
-    return s[: max_chars - 20] + " ...[truncated]"
-
-def agent_aj_answer_judge(
-    current_query: str,
-    current_answer: str,
-    prior_qaf_history: List[Dict[str, Any]],
-    user_lang: str
-) -> Dict[str, Any]:
-    history_str = json.dumps(prior_qaf_history, ensure_ascii=False, indent=2) if prior_qaf_history else "[]"
+def agent0_generate_subgoals(query: str, user_lang: str) -> Dict[str, Any]:
     prompt = f"""
-You are Agent AJ (Answer Judge).
-Task: Evaluate whether the generated answer sufficiently and accurately addresses the current query, given how the GraphRAG pipeline works.
+You are Agent 0 (Subgoal Generator).
+Goal: break the user's query into a small set of independent, parallelizable subgoals that can be answered separately with minimal overlap.
+If decomposition is unnecessary, return a single subgoal equal to the original query.
 
-Pipeline brief:
-{PIPELINE_BRIEF}
+Rules:
+- Output at most {SUBGOAL_MAX_COUNT} subgoals.
+- Subgoals must be concise, self-contained, and non-overlapping.
+- Keep subgoals in the same language as the user's query ("{user_lang}").
+- If the query is atomic, set "decomposition_needed" to false and return [original_query].
 
-Guidelines:
-- Mark "acceptable": true only if the answer is relevant, sufficiently specific, and plausibly grounded (e.g., cites UU/Article or key text).
-- If unacceptable, diagnose concrete issues in "problems" (e.g., vague, missing statute identifiers, wrong scope/jurisdiction, incomplete, lacks references).
-- Provide an actionable "suggestion" for modifying the next query so the pipeline can retrieve better context and produce a stronger answer.
-- Keep outputs in the same language as the user's query ("{user_lang}").
+Return JSON with keys:
+- "decomposition_needed": boolean
+- "subgoals": array of strings (1..{SUBGOAL_MAX_COUNT})
+- "justification": short explanation (1–2 sentences)
 
-Current query:
-\"\"\"{current_query}\"\"\"
-
-Generated answer (truncated if long):
-\"\"\"{_truncate(current_answer, AJ_ANSWER_MAX_CHARS)}\"\"\"
-
-Prior query–answer–feedback history (latest last):
-{history_str}
-
-Return JSON:
-- "acceptable": boolean
-- "problems": short diagnosis of answer issues (if any)
-- "suggestion": concrete improvements to the next query
-- "notes": optional
+User query:
+\"\"\"{query}\"\"\"
 """
     est_tokens = estimate_tokens_for_text(prompt)
-    log("\n[Agent AJ] Prompt:")
+    log("\n[Agent 0] Prompt:")
     log(prompt)
-    log(f"[Agent AJ] Prompt size: {len(prompt)} chars, est_tokens≈{est_tokens}")
+    log(f"[Agent 0] Prompt size: {len(prompt)} chars, est_tokens≈{est_tokens}")
     t0 = now_ms()
-    out = safe_generate_json(prompt, AJ_SCHEMA, temp=0.0)
+    data = safe_generate_json(prompt, SUBGOAL_SCHEMA, temp=0.0)
     took = dur_ms(t0)
-    acceptable = bool(out.get("acceptable")) if isinstance(out, dict) else False
-    problems = (out.get("problems") or "").strip() if isinstance(out, dict) else ""
-    suggestion = (out.get("suggestion") or "").strip() if isinstance(out, dict) else ""
-    notes = (out.get("notes") or "").strip() if isinstance(out, dict) else ""
-    log(f"[Agent AJ] Verdict: acceptable={acceptable} | problems='{problems[:120]}' | suggestion='{suggestion[:120]}' | {took:.0f} ms")
-    return {"acceptable": acceptable, "problems": problems, "suggestion": suggestion, "notes": notes}
 
-# ----------------- Agent QM: Query Modifier -----------------
-QM_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "modified_query": {"type": "string"},
-        "rationale": {"type": "string"}
-    },
-    "required": ["modified_query"]
-}
+    # Sanitize results
+    subgoals_raw = data.get("subgoals", []) if isinstance(data, dict) else []
+    if not isinstance(subgoals_raw, list):
+        subgoals_raw = []
+    # Deduplicate, trim, enforce cap and language neutrality (we rely on instruction)
+    seen = set()
+    cleaned: List[str] = []
+    for s in subgoals_raw:
+        if not isinstance(s, str):
+            continue
+        s2 = s.strip()
+        if not s2:
+            continue
+        if s2 in seen:
+            continue
+        seen.add(s2)
+        cleaned.append(s2)
+        if len(cleaned) >= SUBGOAL_MAX_COUNT:
+            break
 
-def agent_qm_modify_query(
-    current_query: str,
-    current_answer: str,
-    judge_problems: str,
-    judge_suggestion: str,
-    prior_qaf_history: List[Dict[str, Any]],
-    user_lang: str
-) -> Dict[str, Any]:
-    history_str = json.dumps(prior_qaf_history, ensure_ascii=False, indent=2) if prior_qaf_history else "[]"
-    prompt = f"""
-You are Agent QM (Query Modifier).
-Task: Rewrite the current query to improve retrieval quality and, consequently, the final answer. Use the Answer Judge's feedback and prior history.
-
-Pipeline brief:
-{PIPELINE_BRIEF}
-
-Guidelines:
-- Preserve the user's original intent and language ("{user_lang}").
-- Apply the judge's suggestion(s) concretely to the query text (e.g., add UU number/year, Pasal/Ayat, scope, relation verbs, timeframe, aliases).
-- Produce ONE improved query string; do not include explanations in the query text.
-
-Current query:
-\"\"\"{current_query}\"\"\"
-
-Current answer (truncated if long):
-\"\"\"{_truncate(current_answer, AJ_ANSWER_MAX_CHARS)}\"\"\"
-
-Answer Judge feedback:
-- Problems: {judge_problems}
-- Suggestion: {judge_suggestion}
-
-Prior query–answer–feedback history (latest last):
-{history_str}
-
-Return JSON:
-- "modified_query": string (only the improved query, same language and intent)
-- "rationale": (optional) short explanation for logs
-"""
-    est_tokens = estimate_tokens_for_text(prompt)
-    log("\n[Agent QM] Prompt:")
-    log(prompt)
-    log(f"[Agent QM] Prompt size: {len(prompt)} chars, est_tokens≈{est_tokens}")
-    t0 = now_ms()
-    out = safe_generate_json(prompt, QM_SCHEMA, temp=0.0)
-    took = dur_ms(t0)
-    modified_query = (out.get("modified_query") or "").strip() if isinstance(out, dict) else ""
-    rationale = (out.get("rationale") or "").strip() if isinstance(out, dict) else ""
-    if not modified_query:
-        modified_query = current_query
-        rationale = (rationale + " (fallback to current query)").strip()
-    log(f"[Agent QM] Modified query: '{modified_query}' | {took:.0f} ms")
-    return {"modified_query": modified_query, "rationale": rationale}
+    # Fallback if empty
+    if not cleaned:
+        cleaned = [query.strip()]
+        data["decomposition_needed"] = False
+    data["subgoals"] = cleaned
+    data["justification"] = data.get("justification") or ""
+    log(f"[Agent 0] Decomposition needed? {data.get('decomposition_needed')} | subgoals={len(cleaned)} | {took:.0f} ms")
+    log(f"[Agent 0] Subgoals: {cleaned}")
+    return data
 
 # ----------------- Agent 1: entity/predicate extraction -----------------
 LEGAL_ENTITY_TYPES = [
@@ -558,7 +508,7 @@ QUERY_SCHEMA = {
         "type": "object",
         "properties": {
           "text": {"type": "string"},
-          "type": {"type": "string"}
+          "type": {"type": "string"}   # Indonesian type if known, else ""
         },
         "required": ["text"]
       }
@@ -654,6 +604,7 @@ User question:
     t0 = now_ms()
     out = safe_generate_json(prompt, QUERY_TRIPLES_SCHEMA, temp=0.0)
     triples = out.get("triples", []) if isinstance(out, dict) else []
+    # sanitize minimal fields
     clean: List[Dict[str, Any]] = []
     for t in triples:
         try:
@@ -708,9 +659,14 @@ def _summarize_params(params: Dict[str, Any]) -> str:
     return ", ".join(parts)
 
 def run_cypher_with_retry(cypher: str, params: Dict[str, Any]) -> List[Any]:
+    """
+    Execute a Cypher query with bounded retries on error.
+    Logs attempt start, success, and failure with timestamps, PID, and durations.
+    """
     attempts = 0
     last_e: Optional[Exception] = None
     qid = _next_query_id()
+    # compact one-line preview of cypher
     preview = " ".join((cypher or "").split())
     if len(preview) > 220:
         preview = preview[:220] + "..."
@@ -756,7 +712,7 @@ def _vector_query_nodes(index_name: str, q_emb: List[float], k: int) -> List[Dic
         n = r["n"]
         rows.append({
             "key": n.get("key"),
-            "elem_id": r["elem_id"],
+            "elem_id": r["elem_id"],  # NEW
             "name": n.get("name"),
             "type": n.get("type"),
             "score": r["score"],
@@ -780,6 +736,7 @@ def search_similar_entities_by_embedding(q_emb: List[float], k: int) -> List[Dic
 
     best: Dict[str, Dict[str, Any]] = {}
     for row in candidates:
+        # Prefer elementId if present, else fall back to key+type
         dedup_key = row.get("elem_id") or f"{row.get('key')}|{row.get('type')}"
         if dedup_key not in best or (row.get("score", -1) > best[dedup_key].get("score", -1)):
             best[dedup_key] = row
@@ -789,6 +746,9 @@ def search_similar_entities_by_embedding(q_emb: List[float], k: int) -> List[Dic
     return merged[:k]
 
 def search_similar_triples_by_embedding(q_emb: List[float], k: int) -> List[Dict[str, Any]]:
+    """
+    Query triple_vec; return dict rows with triple + subject/object if available.
+    """
     q_emb = _as_float_list(q_emb)
     cypher = """
     CALL db.index.vector.queryNodes('triple_vec', $k, $q_emb) YIELD node AS tr, score
@@ -821,12 +781,12 @@ def search_similar_triples_by_embedding(q_emb: List[float], k: int) -> List[Dict
         })
     return rows
 
-# ----------------- Graph expansion -----------------
+# ----------------- Graph expansion (as in LexID) -----------------
 def expand_from_entities(
     entity_keys: List[str],
     hops: int,
     per_hop_limit: int,
-    entity_elem_ids: Optional[List[str]] = None
+    entity_elem_ids: Optional[List[str]] = None  # NEW: optional fast-path by id
 ) -> List[Dict[str, Any]]:
     triples: Dict[str, Dict[str, Any]] = {}
     current_ids: Set[str] = set(x for x in (entity_elem_ids or []) if x)
@@ -884,12 +844,16 @@ def expand_from_entities(
                     "object_key": o.get("key") if o else None,
                     "object_type": o.get("type") if o else None,
                 }
-            if s and s.get("key"): next_keys.add(s.get("key"))
-            if o and o.get("key"): next_keys.add(o.get("key"))
+            # Seed next hop by keys and ids if available
+            if s:
+                if s.get("key"): next_keys.add(s.get("key"))
+            if o:
+                if o.get("key"): next_keys.add(o.get("key"))
             s_id = r.get("s_id");  o_id = r.get("o_id")
             if s_id: next_ids.add(s_id)
             if o_id: next_ids.add(o_id)
 
+        # Prefer id-based expansion when available
         current_ids = next_ids if next_ids else set()
         current_keys = set() if next_ids else next_keys
 
@@ -900,7 +864,9 @@ class ChunkStore:
     def __init__(self, root: Path, skip: Set[str]):
         self.root = root
         self.skip = skip
+        # Primary index: (doc_id, chunk_id) -> text
         self._index: Dict[Tuple[str, str], str] = {}
+        # Secondary index: chunk_id -> list of (doc_id, chunk_id)
         self._by_chunk: Dict[str, List[Tuple[str, str]]] = {}
         self._loaded_files: Set[Path] = set()
         self._built = False
@@ -921,16 +887,19 @@ class ChunkStore:
                 try:
                     with open(pkl, "rb") as f:
                         chunks = pickle.load(f)
+
                     loaded_count = 0
                     for ch in chunks:
                         meta = getattr(ch, "metadata", {}) if hasattr(ch, "metadata") else {}
                         doc_id = _norm_id(meta.get("document_id"))
                         chunk_id = _norm_id(meta.get("chunk_id"))
                         text = getattr(ch, "page_content", None)
+
                         if doc_id and chunk_id and isinstance(text, str):
                             self._index[(doc_id, chunk_id)] = text
                             self._by_chunk.setdefault(chunk_id, []).append((doc_id, chunk_id))
                             loaded_count += 1
+
                     self._loaded_files.add(pkl)
                     total_chunks_indexed += loaded_count
                     log(f"[ChunkStore] Loaded {loaded_count} chunks from {pkl.name}")
@@ -949,11 +918,13 @@ class ChunkStore:
         doc_id_s = _norm_id(document_id)
         chunk_id_s = _norm_id(chunk_id)
 
+        # 1) Exact match
         val = self._index.get((doc_id_s, chunk_id_s))
         if val is not None:
             log(f"[ChunkStore] HIT exact: doc={doc_id_s} chunk={chunk_id_s} len={len(val)}")
             return val
 
+        # 2) Strip ::part suffix if present and try exact again
         if "::" in chunk_id_s:
             base_id = chunk_id_s.split("::", 1)[0]
             val = self._index.get((doc_id_s, base_id))
@@ -961,6 +932,7 @@ class ChunkStore:
                 log(f"[ChunkStore] HIT base-id: doc={doc_id_s} chunk={chunk_id_s} -> base={base_id} len={len(val)}")
                 return val
 
+        # 3) Fallback by chunk_id only (rescue doc_id mismatches)
         matches = self._by_chunk.get(chunk_id_s)
         if matches:
             chosen_doc, chosen_chunk = matches[0]
@@ -970,7 +942,7 @@ class ChunkStore:
                 log(f"[ChunkStore] HIT by chunk_id only: requested doc={doc_id_s} chunk={chunk_id_s}; using doc={chosen_doc}{note}. len={len(val)}")
                 return val
 
-        log(f"[ChunkStore] MISS: doc={doc_id_s} chunk={chunk_id_s}")
+        log(f"[ChunkStore] MISS: doc={doc_id_s} chunk={chunk_id_s} (no exact/base-id/chunk-id-only match)")
         return None
 
 # ----------------- Scoring helpers -----------------
@@ -984,31 +956,7 @@ def mean_similarity_to_query_triples(triple_emb: Optional[List[float]], q_trip_e
         return 0.0
     return sum(sims) / len(sims)
 
-# ----------------- Retrieval pipeline (reusable) -----------------
-def triple_centric_retrieval(query_triples: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[List[float]]]:
-    triples_map: Dict[str, Dict[str, Any]] = {}
-    q_trip_embs: List[List[float]] = []
-    for qt in query_triples:
-        try:
-            txt = query_triple_to_text(qt)
-            emb = embed_text(txt)
-            q_trip_embs.append(emb)
-        except Exception as ex:
-            log(f"[TripleRetrieval] Embedding failed for query triple '{qt}': {ex}", level="WARN")
-            continue
-        matches = search_similar_triples_by_embedding(emb, k=QUERY_TRIPLE_MATCH_TOP_K_PER)
-        for m in matches:
-            uid = m.get("triple_uid")
-            if uid:
-                if uid not in triples_map:
-                    triples_map[uid] = m
-                else:
-                    if m.get("score", 0.0) > triples_map[uid].get("score", 0.0):
-                        triples_map[uid] = m
-    merged = list(triples_map.values())
-    log(f"[TripleRetrieval] Collected {len(merged)} unique KG triples across {len(q_trip_embs)} query triple(s)")
-    return merged, q_trip_embs
-
+# ----------------- New retrieval pipeline pieces -----------------
 def entity_centric_retrieval(
     query_entities: List[Dict[str, Any]],
     q_trip_embs: List[List[float]],
@@ -1061,15 +1009,54 @@ def entity_centric_retrieval(
     log(f"[EntityRetrieval] Selected top-{len(top)} triples from subgraph")
     return top
 
+def triple_centric_retrieval(query_triples: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[List[float]]]:
+    """
+    For each extracted query triple:
+      - embed "s [p] o"
+      - search top-K similar KG triples
+    Return merged, deduped triples and the list of query triple embeddings used.
+    """
+    triples_map: Dict[str, Dict[str, Any]] = {}
+    q_trip_embs: List[List[float]] = []
+    for qt in query_triples:
+        try:
+            txt = query_triple_to_text(qt)
+            emb = embed_text(txt)
+            q_trip_embs.append(emb)
+        except Exception as ex:
+            log(f"[TripleRetrieval] Embedding failed for query triple '{qt}': {ex}", level="WARN")
+            continue
+
+        matches = search_similar_triples_by_embedding(emb, k=QUERY_TRIPLE_MATCH_TOP_K_PER)
+        for m in matches:
+            uid = m.get("triple_uid")
+            if uid:
+                if uid not in triples_map:
+                    triples_map[uid] = m
+                else:
+                    if m.get("score", 0.0) > triples_map[uid].get("score", 0.0):
+                        triples_map[uid] = m
+
+    merged = list(triples_map.values())
+    log(f"[TripleRetrieval] Collected {len(merged)} unique KG triples across {len(q_trip_embs)} query triple(s)")
+    return merged, q_trip_embs
+
 def collect_chunks_for_triples(
     triples: List[Dict[str, Any]],
     chunk_store: ChunkStore
 ) -> List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]]:
+    """
+    From triples, gather unique (doc_id, chunk_id) and load texts.
+    Returns list of (key_pair, text, triple) for each chunk instance.
+    Adds t['_is_quote_fallback']=True when we have to fall back.
+    """
     seen_pairs: Set[Tuple[Any, Any]] = set()
     out: List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]] = []
+
     for t in triples:
         doc_id = t.get("document_id")
         chunk_id = t.get("chunk_id")
+
         if doc_id is None or chunk_id is None:
             quote = t.get("evidence_quote")
             if quote:
@@ -1079,9 +1066,12 @@ def collect_chunks_for_triples(
                     out.append((key, quote, t))
                     seen_pairs.add(key)
             continue
+
+        # Use normalized key for dedupe
         norm_key = (_norm_id(doc_id), _norm_id(chunk_id))
         if norm_key in seen_pairs:
             continue
+
         text = chunk_store.get_chunk(doc_id, chunk_id)
         if text:
             t["_is_quote_fallback"] = False
@@ -1096,6 +1086,7 @@ def collect_chunks_for_triples(
                     log(f"[ChunkStore] FALLBACK to quote for doc={_norm_id(doc_id)} chunk={_norm_id(chunk_id)}", level="WARN")
                     out.append((key2, quote, t))
                     seen_pairs.add(key2)
+
     return out
 
 def rerank_chunks_by_query(
@@ -1104,6 +1095,11 @@ def rerank_chunks_by_query(
     top_k: int,
     cand_limit: Optional[int] = None
 ) -> List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]]:
+    """
+    Embed chunk texts and score similarity to whole user query.
+    Returns list of records augmented with score, sorted desc.
+    """
+    # Optionally cap to limit embedding cost
     limit = cand_limit if isinstance(cand_limit, int) and cand_limit > 0 else CHUNK_RERANK_CAND_LIMIT
     cand = chunk_records[:limit]
     t0 = now_ms()
@@ -1127,6 +1123,10 @@ def rerank_triples_by_query_triples(
     q_emb_fallback: Optional[List[float]],
     top_k: int
 ) -> List[Dict[str, Any]]:
+    """
+    Sort triples by mean similarity to all query triple embeddings.
+    If no query triple embeddings, fallback to whole-query embedding similarity.
+    """
     t0 = now_ms()
     def score(t: Dict[str, Any]) -> float:
         emb = t.get("embedding")
@@ -1135,6 +1135,7 @@ def rerank_triples_by_query_triples(
         if q_emb_fallback and isinstance(emb, list):
             return cos_sim(q_emb_fallback, emb)
         return 0.0
+
     ranked = sorted(triples, key=score, reverse=True)
     took = dur_ms(t0)
     log(f"[TripleRerank] Input={len(triples)} | Output={min(top_k, len(ranked))} | {took:.0f} ms")
@@ -1144,6 +1145,12 @@ def build_combined_context_text(
     triples_ranked: List[Dict[str, Any]],
     chunks_ranked: List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]]
 ) -> Tuple[str, str, List[Dict[str, Any]]]:
+    """
+    Create a readable context text with:
+      - Triple summary (top up to 50)
+      - Selected chunk texts (annotate when quote fallback is used)
+    Returns (context_text, summary_text, list_of_chunk_records_dict)
+    """
     summary_lines = []
     summary_lines.append("Ringkasan triple yang relevan:")
     for t in triples_ranked[:min(50, len(triples_ranked))]:
@@ -1162,27 +1169,30 @@ def build_combined_context_text(
         fb = " | quote-fallback" if t.get("_is_quote_fallback") else ""
         lines.append(f"[Chunk {idx}] doc={doc_id} chunk={chunk_id} | {uu} | score={score:.3f}{fb}\n{text}")
     context = "\n".join(lines)
+
     chunk_records = [{"key": key, "text": text, "triple": t, "score": score} for key, text, t, score in chunks_ranked]
     return context, summary_text, chunk_records
 
-# ----------------- Agent 2 (Answerer) -----------------
+# ----------------- Agent 2 (Intermediate answer) -----------------
 def agent2_answer(query_original: str, context: str, guidance: Optional[str], output_lang: str = "id") -> str:
     instructions = (
         "Answer concisely and accurately based strictly on the provided context. "
         "Cite UU/Article references when they are clear. "
         "Respond in the same language as the user's question."
     )
-    guidance_text = guidance.strip() if isinstance(guidance, str) and guidance.strip() else "(No additional guidance.)"
+
+    guidance_text = guidance.strip() if isinstance(guidance, str) and guidance.strip() else "(No additional guidance from the Judge in the previous iteration.)"
+
     prompt = f"""
 You are Agent 2 (Answerer). Task: provide an answer based on the context only.
 
 Core instructions:
 {instructions}
 
-Additional guidance (if any):
+Additional guidance from Judge (if any):
 \"\"\"{guidance_text}\"\"\"
 
-Original question:
+Original user question:
 \"\"\"{query_original}\"\"\"
 
 Context:
@@ -1192,51 +1202,102 @@ Context:
     log("\n[Agent 2] Prompt:")
     log(prompt)
     log(f"[Agent 2] Prompt size: {len(prompt)} chars, est_tokens≈{est_tokens}")
+
     t0 = now_ms()
     answer = safe_generate_text(prompt, max_tokens=ANSWER_MAX_TOKENS, temperature=0.2)
     took = dur_ms(t0)
-    log(f"[Agent 2] Answer length={len(answer)} | {took:.0f} ms")
+    log(f"[Agent 2] Intermediate answer length={len(answer)} | {took:.0f} ms")
     return answer
 
-# ----------------- Retrieval-only runner -----------------
-def run_retrieval_for_query(
+# ----------------- Agent 3 (Final Aggregator) -----------------
+def agent3_aggregate(
+    original_query: str,
+    qa_pairs: List[Dict[str, str]],
+    output_lang: str = "en"
+) -> str:
+    """
+    Aggregate multiple subgoal answers into a single final answer to the original query.
+    Uses ONLY information present in the subanswers; does not invent new facts.
+    """
+    pairs_text_lines = []
+    for i, qa in enumerate(qa_pairs, start=1):
+        q = (qa.get("question") or "").strip()
+        a = (qa.get("answer") or "").strip()
+        pairs_text_lines.append(f"[Subgoal {i}] Q: {q}\nA: {a}\n")
+    pairs_text = "\n".join(pairs_text_lines)
+
+    prompt = f"""
+You are Agent 3 (Final Aggregator).
+Task: Answer the original user query using ONLY the information contained in the provided subgoal answers.
+Do NOT introduce new facts that are not supported by the subanswers.
+Resolve overlaps and contradictions transparently; prefer statements supported by explicit legal references (e.g., UU, Pasal/Article).
+Write clearly and concisely in the same language as the user's query ("{output_lang}").
+
+Original user query:
+\"\"\"{original_query}\"\"\"
+
+Subgoal question–answer pairs:
+\"\"\"{pairs_text}\"\"\"
+
+Now produce ONE final answer to the original query. If there are gaps or contradictions, explain briefly.
+"""
+    est_tokens = estimate_tokens_for_text(prompt)
+    log("\n[Agent 3] Prompt:")
+    log(prompt)
+    log(f"[Agent 3] Prompt size: {len(prompt)} chars, est_tokens≈{est_tokens}")
+
+    t0 = now_ms()
+    final_answer = safe_generate_text(prompt, max_tokens=AGGREGATOR_MAX_TOKENS, temperature=0.2)
+    took = dur_ms(t0)
+    log(f"[Agent 3] Final answer length={len(final_answer)} | {took:.0f} ms")
+    return final_answer
+
+# ----------------- Single-pass subgoal runner (refactor of original pipeline) -----------------
+def run_single_pass_for_subgoal(
     query_original: str,
     chunk_store: ChunkStore,
     user_lang: Optional[str] = None,
-    cand_limit_override: Optional[int] = None
+    cand_limit_override: Optional[int] = None,
+    guidance: Optional[str] = None
 ) -> Dict[str, Any]:
+    """
+    Runs the original single-pass GraphRAG (Agents 1 & 2) for a single subgoal query.
+    Returns dict with intermediate answer and context summary.
+    """
+    # Detect user language if not provided
     user_lang = user_lang or detect_user_language(query_original)
 
-    # Step 0: Embed whole query
+    # Step 0: Embed whole user query (for chunk reranking and fallback)
     t0 = now_ms()
     q_emb_query = embed_text(query_original)
     t_embed = dur_ms(t0)
-    log(f"[Retrieval] Step 0 (embed) in {t_embed:.0f} ms")
+    log(f"[Step 0] Whole-query embedding in {t_embed:.0f} ms")
 
     # Step 1: Agent 1 – extract entities/predicates
     t1 = now_ms()
     extraction = agent1_extract_entities_predicates(query_original)
     ents = extraction.get("entities", [])
+    preds = extraction.get("predicates", [])
     t_extract = dur_ms(t1)
-    log(f"[Retrieval] Step 1 (entities/predicates) in {t_extract:.0f} ms")
+    log(f"[Step 1] Entity/Predicate extraction done in {t_extract:.0f} ms")
 
     # Step 1b: Agent 1b – extract triples from query
     t1b = now_ms()
     query_triples = agent1b_extract_query_triples(query_original)
     t_extract_tr = dur_ms(t1b)
-    log(f"[Retrieval] Step 1b (query triples) in {t_extract_tr:.0f} ms")
+    log(f"[Step 1b] Query triple extraction done in {t_extract_tr:.0f} ms")
 
-    # Step 2: Triple-centric retrieval
+    # Step 2: Triple-centric retrieval (per query triple)
     t2 = now_ms()
     ctx2_triples, q_trip_embs = triple_centric_retrieval(query_triples)
     t_triple = dur_ms(t2)
-    log(f"[Retrieval] Step 2 (triple-centric) in {t_triple:.0f} ms; triples={len(ctx2_triples)}")
+    log(f"[Step 2] Triple-centric retrieval in {t_triple:.0f} ms; ctx2_triples={len(ctx2_triples)}, q_trip_embs={len(q_trip_embs)}")
 
-    # Step 3: Entity-centric retrieval
+    # Step 3: Entity-centric retrieval (entity→KG entities→expand→triples scored vs query triples)
     t3 = now_ms()
     ctx1_triples = entity_centric_retrieval(ents, q_trip_embs=q_trip_embs, q_emb_fallback=q_emb_query)
     t_entity = dur_ms(t3)
-    log(f"[Retrieval] Step 3 (entity-centric) in {t_entity:.0f} ms; triples={len(ctx1_triples)}")
+    log(f"[Step 3] Entity-centric retrieval in {t_entity:.0f} ms; ctx1_triples={len(ctx1_triples)}")
 
     # Step 4: Merge contexts, dedupe triples
     t4 = now_ms()
@@ -1249,258 +1310,56 @@ def run_retrieval_for_query(
                 triple_map[uid] = t
     merged_triples = list(triple_map.values())
     t_merge = dur_ms(t4)
-    log(f"[Retrieval] Step 4 (merge triples) in {t_merge:.0f} ms; merged={len(merged_triples)}")
+    log(f"[Step 4] Merged triples from contexts: {len(merged_triples)} | {t_merge:.0f} ms")
 
-    # Step 5: Gather chunks and rerank
+    # Step 5: Gather chunks from merged triples, dedupe, rerank by whole-query similarity
     t5 = now_ms()
     chunk_records = collect_chunks_for_triples(merged_triples, chunk_store)
-    log(f"[Retrieval] Step 5a (collect chunks) candidates={len(chunk_records)}")
-    chunks_ranked = rerank_chunks_by_query(
-        chunk_records, q_emb_query, top_k=MAX_CHUNKS_FINAL, cand_limit=cand_limit_override
-    )
+    log(f"[Step 5] Collected {len(chunk_records)} chunk candidates (pre-rerank)")
+    chunks_ranked = rerank_chunks_by_query(chunk_records, q_emb_query, top_k=MAX_CHUNKS_FINAL, cand_limit=cand_limit_override)
     t_chunks = dur_ms(t5)
-    log(f"[Retrieval] Step 5b (rerank chunks) in {t_chunks:.0f} ms; selected={len(chunks_ranked)}")
+    log(f"[Step 5] Chunk rerank done in {t_chunks:.0f} ms; selected {len(chunks_ranked)}")
 
-    # Step 6: Rerank triples
+    # Step 6: Rerank triples by mean similarity to query triples (fallback to query embedding)
     t6 = now_ms()
-    triples_ranked = rerank_triples_by_query_triples(
-        merged_triples, q_trip_embs=q_trip_embs, q_emb_fallback=q_emb_query, top_k=MAX_TRIPLES_FINAL
-    )
+    triples_ranked = rerank_triples_by_query_triples(merged_triples, q_trip_embs=q_trip_embs, q_emb_fallback=q_emb_query, top_k=MAX_TRIPLES_FINAL)
     t_rerank = dur_ms(t6)
-    log(f"[Retrieval] Step 6 (rerank triples) in {t_rerank:.0f} ms; selected={len(triples_ranked)}")
+    log(f"[Step 6] Triple rerank done in {t_rerank:.0f} ms; selected {len(triples_ranked)}")
 
-    # Build combined context
+    # Build combined context text (summary + chunks)
     t_ctx = now_ms()
     context_text, context_summary, _ = build_combined_context_text(triples_ranked, chunks_ranked)
-    t_ctx_build = dur_ms(t_ctx)
-    log(f"[Retrieval] Context built in {t_ctx_build:.0f} ms")
+    log(f"[Context] Built in {dur_ms(t_ctx):.0f} ms")
+    log("\n[Context summary for this pass]:")
+    log(context_summary)
 
-    diagnostics = {
+    # Step 7: Agent 2 – Answer
+    t7 = now_ms()
+    intermediate_answer = agent2_answer(query_original, context_text, guidance=guidance, output_lang=user_lang)
+    t_answer = dur_ms(t7)
+    log(f"[Step 7] Answer generated in {t_answer:.0f} ms")
+
+    return {
+        "subgoal": query_original,
+        "answer": intermediate_answer,
+        "context_summary": context_summary,
+        "counts": {
+            "chunks_selected": len(chunks_ranked),
+            "triples_selected": len(triples_ranked),
+            "chunk_candidates": len(chunk_records)
+        },
         "timings_ms": {
             "embed": int(t_embed),
             "extract_entities": int(t_extract),
             "extract_triples": int(t_extract_tr),
             "triple_retrieval": int(t_triple),
             "entity_retrieval": int(t_entity),
-            "merge_triples": int(t_merge),
+            "merge": int(t_merge),
             "chunks_rerank": int(t_chunks),
             "triples_rerank": int(t_rerank),
-            "context_build": int(t_ctx_build),
-        },
-        "counts": {
-            "ctx2_triples": len(ctx2_triples),
-            "ctx1_triples": len(ctx1_triples),
-            "merged_triples": len(merged_triples),
-            "chunk_candidates": len(chunk_records),
-            "chunks_selected": len(chunks_ranked),
-            "triples_selected": len(triples_ranked),
+            "answer": int(t_answer),
         }
     }
-
-    return {
-        "context_text": context_text,
-        "context_summary": context_summary,
-        "diagnostics": diagnostics
-    }
-
-# ----------------- Single-pass runner (compatibility) -----------------
-def run_single_pass_for_question(
-    query_original: str,
-    chunk_store: ChunkStore,
-    user_lang: Optional[str] = None,
-    cand_limit_override: Optional[int] = None,
-    guidance: Optional[str] = None
-) -> Dict[str, Any]:
-    user_lang = user_lang or detect_user_language(query_original)
-    r = run_retrieval_for_query(
-        query_original=query_original,
-        chunk_store=chunk_store,
-        user_lang=user_lang,
-        cand_limit_override=cand_limit_override
-    )
-    context_text = r["context_text"]
-    context_summary = r["context_summary"]
-    t_ans = now_ms()
-    intermediate_answer = agent2_answer(query_original, context_text, guidance=guidance, output_lang=user_lang)
-    t_ans_ms = dur_ms(t_ans)
-    log(f"[SinglePass] Answered in {t_ans_ms:.0f} ms")
-    return {
-        "question": query_original,
-        "answer": intermediate_answer,
-        "context_summary": context_summary,
-        "counts": r["diagnostics"]["counts"],
-        "timings_ms": r["diagnostics"]["timings_ms"]
-    }
-
-# ----------------- Orchestrator: Answer Judge + Query Modifier loop -----------------
-def agentic_graph_rag_answer_judge(query_original: str) -> Dict[str, Any]:
-    """
-    Full agentic pipeline with Answer Judge and Query Modifier:
-      - Iteratively: retrieve context → answer → judge:
-          - If AJ says acceptable: stop and return the answer.
-          - Else: QM modifies the query → next iteration with modified query.
-      - Maintains history of query–answer–feedback triples.
-      - Hard cap via MAX_ANSWER_JUDGE_ITERS; if reached, return the latest answer.
-    """
-    global _LOGGER
-    ts_name = make_timestamp_name()
-    log_file = Path.cwd() / f"{ts_name}.txt"
-    _LOGGER = FileLogger(log_file, also_console=True)
-    set_log_context(None)
-
-    t_all = now_ms()
-    try:
-        log("=== Agentic GraphRAG (Answer Judge + Query Modifier) run started ===")
-        log(f"Process info: pid={_pid()}")
-        log(f"Log file: {log_file}")
-        log(f"Original Query: {query_original}")
-        log(f"Parameters: MAX_ANSWER_JUDGE_ITERS={MAX_ANSWER_JUDGE_ITERS} (hardcoded), "
-            f"ENTITY_MATCH_TOP_K={ENTITY_MATCH_TOP_K}, ENTITY_SUBGRAPH_HOPS={ENTITY_SUBGRAPH_HOPS}, "
-            f"ENTITY_SUBGRAPH_PER_HOP_LIMIT={ENTITY_SUBGRAPH_PER_HOP_LIMIT}, SUBGRAPH_TRIPLES_TOP_K={SUBGRAPH_TRIPLES_TOP_K}, "
-            f"QUERY_TRIPLE_MATCH_TOP_K_PER={QUERY_TRIPLE_MATCH_TOP_K_PER}, MAX_TRIPLES_FINAL={MAX_TRIPLES_FINAL}, "
-            f"MAX_CHUNKS_FINAL={MAX_CHUNKS_FINAL}, CHUNK_RERANK_CAND_LIMIT={CHUNK_RERANK_CAND_LIMIT}, "
-            f"ANSWER_MAX_TOKENS={ANSWER_MAX_TOKENS}")
-        log(f"LLM limits: EMBED(max_conc={LLM_EMBED_MAX_CONCURRENCY}, qps={LLM_EMBED_QPS}), GEN(max_conc={LLM_GEN_MAX_CONCURRENCY}, qps={LLM_GEN_QPS})")
-        log(f"Neo4j: NEO4J_MAX_ATTEMPTS={NEO4J_MAX_ATTEMPTS}, NEO4J_TX_TIMEOUT_S={NEO4J_TX_TIMEOUT_S:.1f}, NEO4J_MAX_CONCURRENCY={NEO4J_MAX_CONCURRENCY or 'unlimited'}")
-        log("Mode: Answer-Judge loop (retrieve → answer → judge → modify or stop) with hard iteration cap")
-
-        # Detect language once
-        user_lang = detect_user_language(query_original)
-        log(f"[Language] Detected user language: {user_lang}")
-
-        # Build ChunkStore once
-        chunk_store = ChunkStore(LANGCHAIN_DIR, set(SKIP_FILES))
-
-        # History of query–answer–feedback triples
-        qaf_history: List[Dict[str, Any]] = []
-
-        # Iterative loop
-        current_query = query_original
-        final_answer = ""
-        per_iteration: List[Dict[str, Any]] = []
-
-        for i in range(1, MAX_ANSWER_JUDGE_ITERS + 1):
-            set_log_context(f"{i}/{MAX_ANSWER_JUDGE_ITERS}")
-            log(f"--- Iteration {i}/{MAX_ANSWER_JUDGE_ITERS} START ---")
-            iter_start = now_ms()
-
-            # Retrieval
-            retr = run_retrieval_for_query(
-                query_original=current_query,
-                chunk_store=chunk_store,
-                user_lang=user_lang,
-                cand_limit_override=None
-            )
-            context_text = retr["context_text"]
-            context_summary = retr["context_summary"]
-            diagnostics = retr["diagnostics"]
-
-            # Answer
-            answer = agent2_answer(current_query, context_text, guidance=None, output_lang=user_lang)
-
-            # Judge the answer
-            aj = agent_aj_answer_judge(
-                current_query=current_query,
-                current_answer=answer,
-                prior_qaf_history=qaf_history,
-                user_lang=user_lang
-            )
-            acceptable = bool(aj.get("acceptable"))
-            problems = (aj.get("problems") or "").strip()
-            suggestion = (aj.get("suggestion") or "").strip()
-            notes = (aj.get("notes") or "").strip()
-
-            if acceptable:
-                log("[Loop] Answer acceptable; stopping.")
-                final_answer = answer
-                per_iteration.append({
-                    "query": current_query,
-                    "answer": answer,
-                    "judge": {"acceptable": True, "problems": problems, "suggestion": suggestion, "notes": notes},
-                    "modified_query": None,
-                    "context_summary": context_summary,
-                    "retrieval_diagnostics": diagnostics
-                })
-                log(f"--- Iteration {i}/{MAX_ANSWER_JUDGE_ITERS} DONE (accepted) ---")
-                break
-
-            # If not acceptable and we're at cap: return latest answer
-            if i >= MAX_ANSWER_JUDGE_ITERS:
-                log("[Loop] Iteration cap reached; returning latest answer despite judge rejection.", level="WARN")
-                final_answer = answer
-                per_iteration.append({
-                    "query": current_query,
-                    "answer": answer,
-                    "judge": {"acceptable": False, "problems": problems, "suggestion": suggestion, "notes": notes, "stopped_at_cap": True},
-                    "modified_query": None,
-                    "context_summary": context_summary,
-                    "retrieval_diagnostics": diagnostics
-                })
-                log(f"--- Iteration {i}/{MAX_ANSWER_JUDGE_ITERS} DONE (cap) ---")
-                break
-
-            # Otherwise, modify the query and continue
-            qm = agent_qm_modify_query(
-                current_query=current_query,
-                current_answer=answer,
-                judge_problems=problems,
-                judge_suggestion=suggestion,
-                prior_qaf_history=qaf_history,
-                user_lang=user_lang
-            )
-            modified_query = (qm.get("modified_query") or current_query).strip()
-            rationale = (qm.get("rationale") or "").strip()
-
-            # Record history for AJ/QM in subsequent iterations
-            qaf_history.append({
-                "query": current_query,
-                "answer": answer,
-                "feedback": {"problems": problems, "suggestion": suggestion},
-                "modified_query": modified_query
-            })
-
-            per_iteration.append({
-                "query": current_query,
-                "answer": answer,
-                "judge": {"acceptable": False, "problems": problems, "suggestion": suggestion, "notes": notes},
-                "modified_query": modified_query,
-                "modifier_rationale": rationale,
-                "context_summary": context_summary,
-                "retrieval_diagnostics": diagnostics
-            })
-
-            if modified_query == current_query:
-                log("[Loop] Modified query identical to current; continuing due to cap protection.", level="WARN")
-            current_query = modified_query
-
-            dur_iter = dur_ms(iter_start)
-            log(f"--- Iteration {i}/{MAX_ANSWER_JUDGE_ITERS} DONE | {dur_iter:.0f} ms ---")
-
-        # If loop ended but final_answer not set (edge case)
-        if not final_answer and per_iteration:
-            final_answer = per_iteration[-1].get("answer", "") or "(No answer produced)"
-
-        # Summary
-        total_ms = dur_ms(t_all)
-        set_log_context(None)
-        log("\n=== Agentic GraphRAG (Answer Judge loop) summary ===")
-        log(f"- Iterations used: {len(per_iteration)} (cap={MAX_ANSWER_JUDGE_ITERS})")
-        log(f"- Total runtime: {total_ms:.0f} ms")
-        log("\n=== Final Answer ===")
-        log(final_answer)
-        log(f"\nLogs saved to: {log_file}")
-
-        return {
-            "final_answer": final_answer,
-            "log_file": str(log_file),
-            "iterations_used": len(per_iteration),
-            "qaf_history": qaf_history,
-            "per_iteration": per_iteration
-        }
-    finally:
-        if _LOGGER is not None:
-            _LOGGER.close()
-            _LOGGER = None
 
 # ----------------- Original single-pass GraphRAG (kept for compatibility) -----------------
 def agentic_graph_rag(query_original: str) -> Dict[str, Any]:
@@ -1523,17 +1382,18 @@ def agentic_graph_rag(query_original: str) -> Dict[str, Any]:
             f"ENTITY_SUBGRAPH_PER_HOP_LIMIT={ENTITY_SUBGRAPH_PER_HOP_LIMIT}, SUBGRAPH_TRIPLES_TOP_K={SUBGRAPH_TRIPLES_TOP_K}, "
             f"QUERY_TRIPLE_MATCH_TOP_K_PER={QUERY_TRIPLE_MATCH_TOP_K_PER}, MAX_TRIPLES_FINAL={MAX_TRIPLES_FINAL}, "
             f"MAX_CHUNKS_FINAL={MAX_CHUNKS_FINAL}, CHUNK_RERANK_CAND_LIMIT={CHUNK_RERANK_CAND_LIMIT}, "
-            f"ANSWER_MAX_TOKENS={ANSWER_MAX_TOKENS}, MAX_ANSWER_JUDGE_ITERS={MAX_ANSWER_JUDGE_ITERS}")
-        log(f"LLM limits: EMBED(max_conc={LLM_EMBED_MAX_CONCURRENCY}, qps={LLM_EMBED_QPS}), GEN(max_conc={LLM_GEN_MAX_CONCURRENCY}, qps={LLM_GEN_QPS})")
-        log(f"Neo4j retry/timeout: NEO4J_MAX_ATTEMPTS={NEO4J_MAX_ATTEMPTS}, NEO4J_TX_TIMEOUT_S={NEO4J_TX_TIMEOUT_S:.1f}, NEO4J_MAX_CONCURRENCY={NEO4J_MAX_CONCURRENCY or 'unlimited'}")
+            f"ANSWER_MAX_TOKENS={ANSWER_MAX_TOKENS}, MAX_ITERS={MAX_ITERS}, OUTPUT_LANG={OUTPUT_LANG}")
+        log(f"Neo4j retry/timeout: NEO4J_MAX_ATTEMPTS={NEO4J_MAX_ATTEMPTS}, NEO4J_TX_TIMEOUT_S={NEO4J_TX_TIMEOUT_S:.1f}")
         log("Mode: Single-pass (Agents 1 & 2 only)")
 
         chunk_store = ChunkStore(LANGCHAIN_DIR, set(SKIP_FILES))
 
+        # Detect user language once
         user_lang = detect_user_language(query_original)
         log(f"[Language] Detected user language: {user_lang}")
 
-        result = run_single_pass_for_question(
+        # Run single-pass
+        result = run_single_pass_for_subgoal(
             query_original=query_original,
             chunk_store=chunk_store,
             user_lang=user_lang,
@@ -1543,6 +1403,7 @@ def agentic_graph_rag(query_original: str) -> Dict[str, Any]:
 
         final_answer = result["answer"]
 
+        # Summary
         total_ms = dur_ms(t_all)
         log("\n=== Agentic GraphRAG summary ===")
         log(f"- Iterations used: 1")
@@ -1554,8 +1415,136 @@ def agentic_graph_rag(query_original: str) -> Dict[str, Any]:
         return {
             "final_answer": final_answer,
             "log_file": str(log_file),
-            "iterations_used": 1,
-            "per_iteration": [result]
+            "iterations": 1,
+            "judge_reports": [],
+            "subgoals": [query_original],
+            "subgoal_results": [result]
+        }
+    finally:
+        if _LOGGER is not None:
+            _LOGGER.close()
+            _LOGGER = None
+
+# ----------------- New Orchestrator: Agentic with Subgoals (0 → parallel 1&2 → 3) -----------------
+def agentic_graph_rag_agentic(query_original: str) -> Dict[str, Any]:
+    """
+    Full agentic pipeline:
+      - Agent 0: generate subgoals (capped)
+      - Parallel per-subgoal single-pass GraphRAG (Agents 1 & 2)
+      - Agent 3: aggregate subanswers into final answer
+    """
+    global _LOGGER
+    ts_name = make_timestamp_name()
+    log_file = Path.cwd() / f"{ts_name}.txt"
+    _LOGGER = FileLogger(log_file, also_console=True)
+    set_log_context(None)
+
+    t_all = now_ms()
+    try:
+        log("=== Agentic GraphRAG (Subgoals + Aggregator) run started ===")
+        log(f"GOOGLE API KEY: {GOOGLE_API_KEY}")
+        log(f"Process info: pid={_pid()}")
+        log(f"Log file: {log_file}")
+        log(f"Original Query: {query_original}")
+        log(f"Parameters: SUBGOAL_MAX_COUNT={SUBGOAL_MAX_COUNT} (hardcoded), SUBGOAL_MAX_PARALLELISM={SUBGOAL_MAX_PARALLELISM}, "
+            f"ENTITY_MATCH_TOP_K={ENTITY_MATCH_TOP_K}, ENTITY_SUBGRAPH_HOPS={ENTITY_SUBGRAPH_HOPS}, "
+            f"ENTITY_SUBGRAPH_PER_HOP_LIMIT={ENTITY_SUBGRAPH_PER_HOP_LIMIT}, SUBGRAPH_TRIPLES_TOP_K={SUBGRAPH_TRIPLES_TOP_K}, "
+            f"QUERY_TRIPLE_MATCH_TOP_K_PER={QUERY_TRIPLE_MATCH_TOP_K_PER}, MAX_TRIPLES_FINAL={MAX_TRIPLES_FINAL}, "
+            f"MAX_CHUNKS_FINAL={MAX_CHUNKS_FINAL}, CHUNK_RERANK_CAND_LIMIT={CHUNK_RERANK_CAND_LIMIT}, "
+            f"ANSWER_MAX_TOKENS={ANSWER_MAX_TOKENS}, AGGREGATOR_MAX_TOKENS={AGGREGATOR_MAX_TOKENS}")
+        log(f"LLM limits: EMBED(max_conc={LLM_EMBED_MAX_CONCURRENCY}, qps={LLM_EMBED_QPS}), GEN(max_conc={LLM_GEN_MAX_CONCURRENCY}, qps={LLM_GEN_QPS})")
+        log(f"Neo4j: NEO4J_MAX_ATTEMPTS={NEO4J_MAX_ATTEMPTS}, NEO4J_TX_TIMEOUT_S={NEO4J_TX_TIMEOUT_S:.1f}, NEO4J_MAX_CONCURRENCY={NEO4J_MAX_CONCURRENCY or 'unlimited'}")
+        log("Mode: Agentic (Agent 0 → parallel Agents 1 & 2 → Agent 3)")
+
+        # Detect language once
+        user_lang = detect_user_language(query_original)
+        log(f"[Language] Detected user language: {user_lang}")
+
+        # Agent 0: subgoal generation
+        t0 = now_ms()
+        sg = agent0_generate_subgoals(query_original, user_lang)
+        subgoals: List[str] = sg.get("subgoals", []) or [query_original]
+        # Strictly enforce cap (again)
+        subgoals = subgoals[:SUBGOAL_MAX_COUNT]
+        log(f"[Agent 0] Final subgoal list (used): {subgoals}")
+        t0_ms = dur_ms(t0)
+
+        # Build ChunkStore once (shared)
+        chunk_store = ChunkStore(LANGCHAIN_DIR, set(SKIP_FILES))
+
+        # Distribute chunk candidate budget across subgoals
+        if len(subgoals) > 0:
+            per_subgoal_cand_limit = max(10, CHUNK_RERANK_CAND_LIMIT // len(subgoals))
+        else:
+            per_subgoal_cand_limit = CHUNK_RERANK_CAND_LIMIT
+        log(f"[Budget] CHUNK_RERANK_CAND_LIMIT per subgoal: {per_subgoal_cand_limit} (global={CHUNK_RERANK_CAND_LIMIT})")
+
+        # Parallel execution of subgoals (Agents 1 & 2)
+        subgoal_results: List[Optional[Dict[str, Any]]] = [None] * len(subgoals)
+
+        def _subgoal_worker(idx: int, total: int, subgoal_text: str) -> Tuple[int, Dict[str, Any]]:
+            set_log_context(f"{idx+1}/{total}")
+            log(f"--- Subgoal {idx+1}/{total} START ---")
+            try:
+                result = run_single_pass_for_subgoal(
+                    query_original=subgoal_text,
+                    chunk_store=chunk_store,
+                    user_lang=user_lang,
+                    cand_limit_override=per_subgoal_cand_limit,
+                    guidance=None
+                )
+                log(f"--- Subgoal {idx+1}/{total} DONE ---")
+                return idx, result
+            except Exception as e:
+                log(f"[Subgoal {idx+1}] Error: {e}", level="WARN")
+                # Return a failure result with minimal info
+                fail = {
+                    "subgoal": subgoal_text,
+                    "answer": f"(No evidence found or subgoal failed: {e})",
+                    "context_summary": "",
+                    "counts": {"chunks_selected": 0, "triples_selected": 0, "chunk_candidates": 0},
+                    "timings_ms": {}
+                }
+                log(f"--- Subgoal {idx+1}/{total} FAILED ---", level="WARN")
+                return idx, fail
+            finally:
+                set_log_context(None)
+
+        t_parallel = now_ms()
+        with ThreadPoolExecutor(max_workers=max(1, SUBGOAL_MAX_PARALLELISM)) as executor:
+            futures = [executor.submit(_subgoal_worker, i, len(subgoals), s) for i, s in enumerate(subgoals)]
+            for fut in as_completed(futures):
+                idx, res = fut.result()
+                subgoal_results[idx] = res
+        t_parallel_ms = dur_ms(t_parallel)
+        log(f"[Parallel] All subgoals completed in {t_parallel_ms:.0f} ms")
+
+        # Prepare aggregation input
+        qa_pairs = [{"question": r["subgoal"], "answer": r["answer"]} for r in subgoal_results if r is not None]
+
+        # Agent 3: Final Aggregator
+        t3 = now_ms()
+        final_answer = agent3_aggregate(query_original, qa_pairs, output_lang=user_lang)
+        t3_ms = dur_ms(t3)
+
+        # Summary
+        total_ms = dur_ms(t_all)
+        log("\n=== Agentic GraphRAG summary ===")
+        log(f"- Agent 0 time: {t0_ms:.0f} ms")
+        log(f"- Parallel subgoals time: {t_parallel_ms:.0f} ms for {len(subgoals)} subgoal(s)")
+        log(f"- Aggregator time: {t3_ms:.0f} ms")
+        log(f"- Total runtime: {total_ms:.0f} ms")
+        log("\n=== Final Answer ===")
+        log(final_answer)
+        log(f"\nLogs saved to: {log_file}")
+
+        return {
+            "final_answer": final_answer,
+            "log_file": str(log_file),
+            "iterations": 1,
+            "judge_reports": [],  # no judge in this pipeline
+            "subgoals": subgoals,
+            "subgoal_results": subgoal_results,
         }
     finally:
         if _LOGGER is not None:
@@ -1569,8 +1558,8 @@ if __name__ == "__main__":
         if not user_query:
             print("Empty query. Exiting.")
         else:
-            # Run the new Answer-Judge agentic pipeline by default
-            agentic_graph_rag_answer_judge(user_query)
+            # Run the new agentic pipeline with subgoals and aggregator
+            agentic_graph_rag_agentic(user_query)
     finally:
         try:
             driver.close()

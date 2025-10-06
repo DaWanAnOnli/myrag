@@ -73,7 +73,7 @@ TOP_P = 0.0
 TOP_K = 1
 
 # Requests per minute (RPM). All attempts (including failed ones) respect this limit.
-RPM = 10
+RPM = 13
 
 # Maximum attempts per question when response is invalid (labels/scores/JSON/exception)
 MAX_ATTEMPTS = 10
@@ -97,24 +97,18 @@ LOG_DIR = (SCRIPT_DIR / "llm_judge_logs").resolve()
 
 # Preferred label ordering for known models (extras will be appended)
 PREFERRED_LABEL_ORDER = [
-    "naiverag",
-    "lexidkg_graphrag_0_hop",
-    "lexidkg_graphrag_1_hop",
-    "lexidkg_graphrag_2_hop",
-    "lexidkg_graphrag_3_hop",
-    "lexidkg_graphrag_4_hop",
-    "lexidkg_graphrag_5_hop",
+    "graph_rag_answer",
+    "naive_rag_answer",
+    "naive_rag_4_answer_judge",
+    "naive_rag_5_answer_judge",
 ]
 
 # Map JSONL keys to friendly, stable labels (optional explicit mapping)
 MODEL_KEY_TO_LABEL = {
-    "naive_rag_answer": "naiverag",
-    "lexidkg_graphrag_0_hop_answer": "lexidkg_graphrag_0_hop",
-    "lexidkg_graphrag_1_hop_answer": "lexidkg_graphrag_1_hop",
-    "lexidkg_graphrag_2_hop_answer": "lexidkg_graphrag_2_hop",
-    "lexidkg_graphrag_3_hop_answer": "lexidkg_graphrag_3_hop",
-    "lexidkg_graphrag_4_hop_answer": "lexidkg_graphrag_4_hop",
-    "lexidkg_graphrag_5_hop_answer": "lexidkg_graphrag_5_hop",
+    "graph_rag_answer": "graph_rag_answer",
+    "naive_rag_answer": "naive_rag_answer",
+    "naive_rag_4_answer_judge_answer": "naive_rag_4_answer_judge",
+    "naive_rag_5_answer_judge_answer": "naive_rag_5_answer_judge",
 }
 
 

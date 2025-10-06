@@ -33,7 +33,7 @@ else:
 # -----------------------------
 # Sampling configuration (edit here)
 # -----------------------------
-N_SAMPLE = 5000          # set to desired sample size; set to 0 or None to keep all filtered lines
+N_SAMPLE = 1250          # set to desired sample size; set to 0 or None to keep all filtered lines
 RANDOM_SEED = 42        # set to None for different samples each run
 if RANDOM_SEED is not None:
     random.seed(RANDOM_SEED)

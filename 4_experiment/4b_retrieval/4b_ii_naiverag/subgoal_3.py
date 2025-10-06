@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 # agentic_rag.py
-# Agentic RAG with Subgoal Generator and Final Aggregator
-#
-# Pipeline:
+# Agentic RAG with Subgoals and Aggregator:
 # - Detect user language
-# - Subgoal Generator produces up to SUBGOAL_MAX independent, parallelizable subgoals
-#   (falls back to a single subgoal identical to the original query if decomposition isn't needed)
-# - Execute each subgoal through the existing RAG loop (Agent 2 Answerer + Agent 3 Judge) in parallel
-# - Final Aggregator synthesizes the final answer from the original query + all subgoal Q/A pairs
-# - Verbose, thread-safe logging to a timestamped file (and console)
+# - Subgoal Generator agent: decomposes the query into independent, parallelizable subgoals (bounded by MAX_SUBGOALS)
+# - Answer each subgoal in parallel using existing GraphRAG pipeline (embed -> vector search -> answerer)
+# - Aggregator agent: synthesizes final answer from original query + subgoal Q/A pairs
+# - Logging to a timestamped file (and console)
+# - Rate limiting: LLM_CALLS_PER_MINUTE applies ONLY to text generation (not embeddings). Thread-safe.
 
 import os, time, json, pickle, re, random, threading
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
@@ -33,20 +32,22 @@ GEN_MODEL   = os.getenv("GEN_MODEL", "models/gemini-2.5-flash")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "models/text-embedding-004")
 
 # Retrieval params (naive vector search over chunks)
-TOP_K_CHUNKS = int(os.getenv("TOP_K_CHUNKS", "30"))          # initial k from vector index
+TOP_K_CHUNKS = int(os.getenv("TOP_K_CHUNKS", "40"))          # initial k from vector index
 MAX_CHUNKS_FINAL = int(os.getenv("MAX_CHUNKS_FINAL", "40"))  # chunks kept for final context
 CHUNK_TEXT_CLAMP = int(os.getenv("CHUNK_TEXT_CLAMP", "1000000")) # max chars per chunk included in context
 
-# Agent loop
+# Agent loop (Answerer)
 ANSWER_MAX_TOKENS = int(os.getenv("ANSWER_MAX_TOKENS", "4096"))
-MAX_ITERS = int(os.getenv("MAX_ITERS", "3"))
+MAX_ITERS = 1  # We maintain single-pass for answerer per prompt
 
-# Subgoal + Aggregator (new)
-# Hardcoded maximum number of subgoals as requested (not env-driven).
-SUBGOAL_MAX = 4
-# Concurrency cap for parallel subgoal execution (kept conservative).
-SUBGOAL_MAX_PARALLEL = min(SUBGOAL_MAX, 4)
-AGGREGATOR_MAX_TOKENS = int(os.getenv("AGGREGATOR_MAX_TOKENS", str(ANSWER_MAX_TOKENS)))
+# Subgoals + Aggregator
+MAX_SUBGOALS = int(os.getenv("MAX_SUBGOALS", "2"))  # hard cap on subgoals
+SUBGOAL_TOP_K = int(os.getenv("SUBGOAL_TOP_K", str(TOP_K_CHUNKS)))  # top-k per subgoal retrieval
+SUBGOAL_MAX_WORKERS = int(os.getenv("SUBGOAL_MAX_WORKERS", "2"))  # parallelism for subgoal answering
+AGGREGATOR_MAX_TOKENS = int(os.getenv("AGGREGATOR_MAX_TOKENS", "4096"))
+
+# LLM generation rate limit (calls per minute). Applies ONLY to generation (not embeddings).
+LLM_CALLS_PER_MINUTE = int(os.getenv("LLM_CALLS_PER_MINUTE", "13"))
 
 # ----------------- Initialize SDKs -----------------
 genai.configure(api_key=GOOGLE_API_KEY)
@@ -76,8 +77,7 @@ class FileLogger:
     def close(self):
         try:
             with self._lock:
-                self._fh.flush()
-                self._fh.close()
+                self._fh.flush(); self._fh.close()
         except Exception:
             pass
 
@@ -87,14 +87,6 @@ def log(msg: str = ""):
         _LOGGER.log(msg)
     else:
         print(msg)
-
-def log_with_prefix(prefix: str, msg: str = ""):
-    if not isinstance(msg, str):
-        log(f"{prefix} {msg}")
-        return
-    lines = msg.splitlines() or [""]
-    for line in lines:
-        log(f"{prefix} {line}")
 
 def make_timestamp_name() -> str:
     t = time.time()
@@ -106,25 +98,62 @@ def make_timestamp_name() -> str:
 def estimate_tokens_for_text(text: str) -> int:
     return max(1, int(len(text) / 4))
 
-def clamp(s: Optional[str], n: int) -> str:
-    t = (s or "").strip()
-    return t[:n]
+# --- Thread-safe per-process rate limiter (calls/minute) for LLM generations ---
+class RateLimiter:
+    def __init__(self, calls_per_minute: int):
+        self.calls_per_minute = max(0, int(calls_per_minute))
+        self.window = deque()  # monotonic timestamps of recent calls
+        self.window_seconds = 60.0
+        self._lock = threading.Lock()
+
+    def wait_for_slot(self):
+        if self.calls_per_minute <= 0:
+            return  # disabled
+        while True:
+            now = time.monotonic()
+            with self._lock:
+                # evict old timestamps
+                while self.window and (now - self.window[0]) >= self.window_seconds:
+                    self.window.popleft()
+                if len(self.window) < self.calls_per_minute:
+                    self.window.append(now)
+                    return
+                sleep_time = self.window_seconds - (now - self.window[0])
+            if sleep_time > 0:
+                log(f"[LLM RateLimit] Sleeping {sleep_time:.2f}s to respect LLM_CALLS_PER_MINUTE={self.calls_per_minute}")
+                time.sleep(sleep_time)
+            else:
+                time.sleep(0.01)
+
+_LLM_RATE_LIMITER = RateLimiter(LLM_CALLS_PER_MINUTE)
 
 def _rand_wait_seconds() -> float:
     return random.uniform(5.0, 20.0)
 
-def _api_call_with_retry(func, *args, **kwargs):
+# --- Retry helpers split by API type ---
+def _llm_call_with_retry(func, *args, **kwargs):
+    # For text generation only (rate-limited)
+    while True:
+        try:
+            _LLM_RATE_LIMITER.wait_for_slot()
+            return func(*args, **kwargs)
+        except Exception as e:
+            wait_s = _rand_wait_seconds()
+            log(f"[Retry] LLM call failed: {e}. Retrying in {wait_s:.1f}s.")
+            time.sleep(wait_s)
+
+def _embedding_call_with_retry(func, *args, **kwargs):
+    # For embeddings: NO LLM rate limiter
     while True:
         try:
             return func(*args, **kwargs)
         except Exception as e:
             wait_s = _rand_wait_seconds()
-            log(f"[Retry] API call failed: {e}. Retrying in {wait_s:.1f}s.")
+            log(f"[Retry] Embedding call failed: {e}. Retrying in {wait_s:.1f}s.")
             time.sleep(wait_s)
 
-# ----------------- Embedding + Neo4j -----------------
 def embed_text(text: str) -> List[float]:
-    res = _api_call_with_retry(genai.embed_content, model=EMBED_MODEL, content=text)
+    res = _embedding_call_with_retry(genai.embed_content, model=EMBED_MODEL, content=text)
     if isinstance(res, dict):
         emb = res.get("embedding")
         if isinstance(emb, dict) and "values" in emb:
@@ -196,14 +225,14 @@ def extract_text_from_response(resp) -> Optional[str]:
                 for p in parts.parts:
                     t = getattr(p, "text", None)
                     if isinstance(t, str): buf.append(t)
-                if buf: return "\n".join(buf).strip()
+                if buf: return "".join(buf).strip()
     except Exception:
         pass
     return None
 
 def safe_generate_json(prompt: str, schema: Dict[str, Any], temp: float = 0.0) -> Dict[str, Any]:
     cfg = GenerationConfig(temperature=temp, response_mime_type="application/json", response_schema=schema)
-    resp = _api_call_with_retry(gen_model.generate_content, prompt, generation_config=cfg)
+    resp = _llm_call_with_retry(gen_model.generate_content, prompt, generation_config=cfg)
     try:
         if isinstance(resp.text, str) and resp.text.strip():
             return json.loads(resp.text)
@@ -219,7 +248,7 @@ def safe_generate_json(prompt: str, schema: Dict[str, Any], temp: float = 0.0) -
 
 def safe_generate_text(prompt: str, max_tokens: int, temperature: float = 0.2) -> str:
     cfg = GenerationConfig(temperature=temperature, max_output_tokens=max_tokens)
-    resp = _api_call_with_retry(gen_model.generate_content, prompt, generation_config=cfg)
+    resp = _llm_call_with_retry(gen_model.generate_content, prompt, generation_config=cfg)
     text = extract_text_from_response(resp)
     if text: return text
     info = get_finish_info(resp)
@@ -251,7 +280,7 @@ User question:
 \"\"\"{query}\"\"\"
 """
     est = estimate_tokens_for_text(prompt)
-    log("\n[Agent 1] Prompt:")
+    log("[Agent 1] Prompt:")
     log(prompt)
     log(f"[Agent 1] Prompt size: {len(prompt)} chars, est_tokens≈{est}")
     out = safe_generate_json(prompt, QUERY_SCHEMA, temp=0.0)
@@ -286,7 +315,7 @@ User question:
 \"\"\"{query}\"\"\"
 """
     est = estimate_tokens_for_text(prompt)
-    log("\n[Agent 1b] Prompt:")
+    log("[Agent 1b] Prompt:")
     log(prompt)
     log(f"[Agent 1b] Prompt size: {len(prompt)} chars, est_tokens≈{est}")
     out = safe_generate_json(prompt, QUERY_TRIPLES_SCHEMA, temp=0.0) or {}
@@ -337,6 +366,10 @@ def vector_query_chunks(q_emb: List[float], k: int) -> List[Dict[str, Any]]:
     return out
 
 # ----------------- Build context -----------------
+def clamp(s: Optional[str], n: int) -> str:
+    t = (s or "").strip()
+    return t[:n]
+
 def build_context_from_chunks(chunks: List[Dict[str, Any]], max_chunks: int) -> str:
     chosen = chunks[:max_chunks]
     lines = ["Potongan teks terkait (chunk):"]
@@ -346,8 +379,8 @@ def build_context_from_chunks(chunks: List[Dict[str, Any]], max_chunks: int) -> 
         uu = c.get("uu_number") or ""
         pg = c.get("pages")
         txt = clamp(c.get("content") or "", CHUNK_TEXT_CLAMP)
-        lines.append(f"[Chunk {i}] doc={doc} chunk={cid} | {uu} | pages={pg} | score={c.get('score'):.3f}\n{txt}")
-    return "\n".join(lines)
+        lines.append(f"[Chunk {i}] doc={doc} chunk={cid} | {uu} | pages={pg} | score={c.get('score'):.3f}\n{txt}\n")
+    return "".join(lines)
 
 # ----------------- Agent 2 (Answerer) -----------------
 def agent2_answer(query_original: str, context: str, guidance: Optional[str], output_lang: str = "id") -> str:
@@ -356,14 +389,14 @@ def agent2_answer(query_original: str, context: str, guidance: Optional[str], ou
         "Cite UU/Article references when they are clear. "
         "Respond in the same language as the user's question."
     )
-    guidance_text = guidance.strip() if isinstance(guidance, str) and guidance.strip() else "(No additional guidance from the Judge.)"
+    guidance_text = guidance.strip() if isinstance(guidance, str) and guidance.strip() else "(No additional guidance.)"
     prompt = f"""
 You are Agent 2 (Answerer). Provide an answer based on the context only.
 
 Core instructions:
 {instructions}
 
-Additional guidance from Judge (if any):
+Additional guidance (if any):
 \"\"\"{guidance_text}\"\"\"
 
 Original user question:
@@ -373,66 +406,16 @@ Context:
 \"\"\"{context}\"\"\"
 """
     est = estimate_tokens_for_text(prompt)
-    log("\n[Agent 2] Prompt:")
+    log("[Agent 2] Prompt:")
     log(prompt)
     log(f"[Agent 2] Prompt size: {len(prompt)} chars, est_tokens≈{est}")
     answer = safe_generate_text(prompt, max_tokens=ANSWER_MAX_TOKENS, temperature=0.2)
-    log("[Agent 2] Intermediate answer:")
+    log("[Agent 2] Answer:")
     log(answer)
     return answer
 
-# ----------------- Agent 3 (Judge) -----------------
-JUDGE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "is_sufficient": {"type": "boolean"},
-        "rationale": {"type": "string"},
-        "issues_found": {"type": "array", "items": {"type": "string"}},
-        "rewritten_query": {"type": "string"},
-        "guidance_next": {"type": "string"}
-    },
-    "required": ["is_sufficient","rationale"]
-}
-
-def agent3_judge(query_original: str, intermediate_answer: str, context_full: str, output_lang: str = "id") -> Dict[str, Any]:
-    prompt = f"""
-You are Agent 3 (Judge). Evaluate whether the intermediate answer is sufficient and grounded in the context.
-
-Sufficiency criteria:
-- Correctly addresses the core of the question.
-- Grounded in the provided context (chunks).
-- Cites UU/Article references when conclusive.
-- No fabrication beyond the context.
-
-If NOT sufficient:
-- Provide "rewritten_query": a sharper, more targeted version of the user question.
-- Provide "guidance_next": specific guidance for the next Agent 2 iteration.
-
-Original user question:
-\"\"\"{query_original}\"\"\"
-
-Context (full chunk text):
-\"\"\"{context_full}\"\"\"
-
-Intermediate answer:
-\"\"\"{intermediate_answer}\"\"\"
-"""
-    est = estimate_tokens_for_text(prompt)
-    log("\n[Agent 3] Prompt:")
-    log(prompt)
-    log(f"[Agent 3] Prompt size: {len(prompt)} chars, est_tokens≈{est}")
-    out = safe_generate_json(prompt, JUDGE_SCHEMA, temp=0.0) or {}
-    out["is_sufficient"] = bool(out.get("is_sufficient", False))
-    out["rationale"] = out.get("rationale", "")
-    if "issues_found" not in out or not isinstance(out["issues_found"], list): out["issues_found"] = []
-    out["rewritten_query"] = (out.get("rewritten_query") or "").strip()
-    out["guidance_next"] = (out.get("guidance_next") or "").strip()
-    log("[Agent 3] Judgment output:")
-    log(json.dumps(out, ensure_ascii=False, indent=2))
-    return out
-
 # ----------------- Subgoal Generator (new) -----------------
-SUBGOAL_LIST_SCHEMA = {
+SUBGOALS_SCHEMA = {
   "type": "object",
   "properties": {
     "subgoals": {
@@ -440,8 +423,9 @@ SUBGOAL_LIST_SCHEMA = {
       "items": {
         "type": "object",
         "properties": {
+          "id": {"type": "string"},
           "question": {"type": "string"},
-          "reason": {"type": "string"}
+          "rationale": {"type": "string"}
         },
         "required": ["question"]
       }
@@ -450,224 +434,212 @@ SUBGOAL_LIST_SCHEMA = {
   "required": ["subgoals"]
 }
 
-def generate_subgoals(query_original: str, user_lang: str) -> List[Dict[str, Any]]:
+def _normalize_question(q: str) -> str:
+    q = (q or "").strip().lower()
+    q = re.sub(r"\s+", " ", q)
+    return q
+
+def generate_subgoals(query_original: str, max_subgoals: int, output_lang: str = "en") -> List[Dict[str, str]]:
+    """
+    Generate up to max_subgoals independent, parallelizable subgoals.
+    Fallback: one subgoal identical to the original query if decomposition isn't needed.
+    """
+    instruction = (
+        "Decompose the user's query into independent, parallelizable sub-questions only if it improves clarity or answerability. "
+        f"Return at most {max_subgoals} subgoals. "
+        "If decomposition is unnecessary, return exactly one subgoal identical to the original query. "
+        "Write subgoals in the same language as the user's query."
+    )
     prompt = f"""
 You are the Subgoal Generator.
-Task: Decompose the user's question into up to {SUBGOAL_MAX} independent, parallelizable subgoals.
-- If decomposition is unnecessary, return exactly one subgoal identical to the original question.
-- Each subgoal must be self-contained, answerable independently, and avoid referencing other subgoals.
-- Keep them minimal and non-overlapping.
-- Do NOT answer any subgoal; only generate them.
-- Respond in the same language as the user's question.
 
-Original user question:
+Instruction:
+{instruction}
+
+User query:
 \"\"\"{query_original}\"\"\"
 
-Return JSON with key "subgoals": list of objects:
-  - question: string (the subgoal question)
-  - reason: brief string (why this subgoal helps)
+Output JSON schema:
+- subgoals: array of items with fields:
+  - id (string; optional; you may leave blank)
+  - question (string; REQUIRED; an independently answerable sub-question)
+  - rationale (string; optional; why this subgoal helps)
 """
     est = estimate_tokens_for_text(prompt)
-    log("\n[Subgoal Generator] Prompt:")
+    log("=== Subgoal Generation ===")
+    log("[SubgoalGen] Prompt:")
     log(prompt)
-    log(f"[Subgoal Generator] Prompt size: {len(prompt)} chars, est_tokens≈{est}")
-    out = safe_generate_json(prompt, SUBGOAL_LIST_SCHEMA, temp=0.2) or {}
-    raw = out.get("subgoals", []) or []
-    # Normalize, deduplicate, clamp, and fallback
-    seen = set()
+    log(f"[SubgoalGen] Prompt size: {len(prompt)} chars, est_tokens≈{est}")
+
+    out = safe_generate_json(prompt, SUBGOALS_SCHEMA, temp=0.0) or {}
+    raw_subgoals = out.get("subgoals", []) or []
+
+    # Cleanup, deduplicate, clamp
     cleaned = []
-    for sg in raw:
-        q = clamp((sg.get("question") or "").strip(), 2000)
+    seen = set()
+    for i, sg in enumerate(raw_subgoals, 1):
+        q = (sg.get("question") or "").strip()
         if not q:
             continue
-        key = re.sub(r"\s+", " ", q.lower())
+        key = _normalize_question(q)
         if key in seen:
             continue
         seen.add(key)
-        cleaned.append({"question": q, "reason": clamp((sg.get("reason") or "").strip(), 500)})
-        if len(cleaned) >= SUBGOAL_MAX:
+        rid = (sg.get("id") or "").strip() or f"SG{i}"
+        rationale = (sg.get("rationale") or "").strip()
+        cleaned.append({"id": rid, "question": q, "rationale": rationale})
+        if len(cleaned) >= max_subgoals:
             break
+
+    # Fallback if nothing valid
     if not cleaned:
-        cleaned = [{"question": query_original, "reason": "Fallback: decomposition not required or failed; use original question as single subgoal."}]
-    # Attach ids
-    for i, sg in enumerate(cleaned, 1):
-        sg["id"] = i
-    log("[Subgoal Generator] Subgoals:")
-    log(json.dumps(cleaned, ensure_ascii=False, indent=2))
+        cleaned = [{"id": "SG1", "question": query_original.strip(), "rationale": "Decomposition not needed; answer the original query directly."}]
+
+    log(f"[SubgoalGen] Produced {len(cleaned)} subgoal(s):")
+    for sg in cleaned:
+        log(f"  - {sg['id']}: {sg['question']} (rationale: {sg.get('rationale','')})")
+
     return cleaned
 
-# ----------------- Subgoal Executor (wrapper over existing loop) -----------------
-def run_agentic_loop_for_query(query_original: str, user_lang: str, log_prefix: str = "") -> Dict[str, Any]:
+# ----------------- Subgoal Answering (parallel GraphRAG) -----------------
+def _format_context_preview(ctx: str, max_lines: int = 30) -> str:
+    lines = ctx.splitlines()
+    return "\n".join(lines[:max_lines])
+
+def answer_single_subgoal(subgoal: Dict[str, str], user_lang: str) -> Dict[str, Any]:
     """
-    Executes the existing Answerer+Judge iterative loop for a single query (used per subgoal).
-    Returns a dict with the final answer, judge reports, and stats.
+    Answer a single subgoal using the existing RAG pipeline.
+    Returns a dict with id, question, answer, retrieval_meta.
     """
-    if log_prefix:
-        lp = lambda m: log_with_prefix(log_prefix, m)
-    else:
-        lp = log
+    sg_id = subgoal.get("id", "")
+    q = subgoal.get("question", "").strip()
+    start = time.time()
+    log(f"[Subgoal {sg_id}] Start answering")
 
-    final_answer: Optional[str] = None
-    judge_reports: List[Dict[str, Any]] = []
-    guidance_prev = None
-    query_for_iter = query_original
-    intermediate_answer = ""
-    last_candidates_count = 0
-
-    for it in range(1, MAX_ITERS + 1):
-        lp(f"\n--- Iteration {it}/{MAX_ITERS} ---")
-
-        # Step 0: whole-query embedding
+    try:
         t0 = time.time()
-        q_emb = embed_text(query_for_iter)
-        lp(f"[Step 0] Embedded query in {(time.time()-t0)*1000:.0f} ms")
-        lp(f"[Step 0] Query used this iteration: {query_for_iter}")
+        q_emb = embed_text(q)
+        log(f"[Subgoal {sg_id}] Embedded in {(time.time()-t0)*1000:.0f} ms")
 
-        # Agent 1 & 1b (optional signals)
         t1 = time.time()
-        extraction = agent1_extract_entities_predicates(query_for_iter)
-        _ = agent1b_extract_query_triples(query_for_iter)
-        lp(f"[Step 1] Entity/Triple extraction in {(time.time()-t1)*1000:.0f} ms")
-
-        # Retrieval: vector search over TextChunk
-        t2 = time.time()
-        candidates = vector_query_chunks(q_emb, k=TOP_K_CHUNKS)
-        last_candidates_count = len(candidates)
-        lp(f"[Step 2] Vector search returned {len(candidates)} candidates in {(time.time()-t2)*1000:.0f} ms")
+        candidates = vector_query_chunks(q_emb, k=SUBGOAL_TOP_K)
+        log(f"[Subgoal {sg_id}] Vector search returned {len(candidates)} candidates in {(time.time()-t1)*1000:.0f} ms")
 
         if not candidates:
             context_text = "Tidak ada potongan teks yang ditemukan." if user_lang == "id" else "No relevant chunks found."
-            intermediate_answer = agent2_answer(query_for_iter, context_text, guidance_prev, output_lang=user_lang)
-            judge = agent3_judge(query_for_iter, intermediate_answer, context_text, output_lang=user_lang)
-            judge_reports.append(judge)
-            final_answer = intermediate_answer
-            break
-
-        # Build context from top chunks
-        top_context = build_context_from_chunks(candidates, max_chunks=MAX_CHUNKS_FINAL)
-        lp("\n[Context preview]:")
-        lp("\n".join(top_context.splitlines()[:30]))  # preview at most 30 lines
-
-        # Agent 2: Answer
-        t3 = time.time()
-        intermediate_answer = agent2_answer(query_for_iter, top_context, guidance_prev, output_lang=user_lang)
-        lp(f"[Step 3] Intermediate answer in {(time.time()-t3)*1000:.0f} ms")
-
-        # Agent 3: Judge
-        t4 = time.time()
-        judge = agent3_judge(query_for_iter, intermediate_answer, top_context, output_lang=user_lang)
-        lp(f"[Step 4] Judge in {(time.time()-t4)*1000:.0f} ms")
-        judge_reports.append(judge)
-
-        if judge.get("is_sufficient", False):
-            final_answer = intermediate_answer
-            lp("\n[Judge] Verdict: Sufficient. Using intermediate answer as final.")
-            break
         else:
-            lp("\n[Judge] Verdict: Not sufficient.")
-            rq = (judge.get("rewritten_query") or "").strip()
-            gn = (judge.get("guidance_next") or "").strip()
-            if rq:
-                query_for_iter = rq
-                lp(f"[Judge] Rewritten query for next iteration: {rq}")
-            else:
-                query_for_iter = query_original
-                lp("[Judge] No rewritten query provided; will reuse original query.")
-            guidance_prev = gn if gn else None
-            if gn:
-                lp(f"[Judge] Guidance for next iteration:\n{gn}")
+            context_text = build_context_from_chunks(candidates, max_chunks=MAX_CHUNKS_FINAL)
+            log(f"[Subgoal {sg_id}] Context preview:\n{_format_context_preview(context_text, max_lines=20)}")
 
-    if final_answer is None:
-        final_answer = intermediate_answer
-        lp("\n[Loop] Reached max iterations. Returning the last intermediate answer as final.")
+        t2 = time.time()
+        ans = agent2_answer(q, context_text, guidance=None, output_lang=user_lang)
+        log(f"[Subgoal {sg_id}] Answer generated in {(time.time()-t2)*1000:.0f} ms")
 
-    return {
-        "final_answer": final_answer,
-        "iterations": len(judge_reports),
-        "judge_reports": judge_reports,
-        "retrieval_candidates": last_candidates_count
-    }
+        # Build retrieval meta (lightweight)
+        meta_top = []
+        for c in (candidates[:5] if candidates else []):
+            meta_top.append({
+                "document_id": c.get("document_id"),
+                "chunk_id": c.get("chunk_id"),
+                "uu_number": c.get("uu_number"),
+                "pages": c.get("pages"),
+                "score": c.get("score"),
+            })
 
-def run_subgoal(subgoal: Dict[str, Any], user_lang: str) -> Dict[str, Any]:
-    sid = subgoal.get("id", 0)
-    q = subgoal.get("question", "")
-    reason = subgoal.get("reason", "")
-    prefix = f"[Subgoal {sid}]"
-    log_with_prefix(prefix, f"Question: {q}")
-    if reason:
-        log_with_prefix(prefix, f"Reason: {reason}")
-    try:
-        result = run_agentic_loop_for_query(q, user_lang=user_lang, log_prefix=prefix)
+        total_ms = (time.time() - start) * 1000.0
+        log(f"[Subgoal {sg_id}] Done in {total_ms:.0f} ms")
+
         return {
-            "id": sid,
+            "id": sg_id,
             "question": q,
-            "reason": reason,
-            "answer": result["final_answer"],
-            "iterations": result["iterations"],
-            "judge_reports": result["judge_reports"],
-            "judge_sufficient": bool(result["judge_reports"] and result["judge_reports"][-1].get("is_sufficient", False)),
-            "retrieval_candidates": result.get("retrieval_candidates", 0),
-            "error": None
+            "answer": ans,
+            "retrieval_meta": {
+                "num_candidates": len(candidates) if candidates else 0,
+                "top_chunks": meta_top
+            }
         }
     except Exception as e:
-        log_with_prefix(prefix, f"[Error] Subgoal execution failed: {e}")
+        log(f"[Subgoal {sg_id}] ERROR: {e}")
         return {
-            "id": sid,
+            "id": sg_id,
             "question": q,
-            "reason": reason,
-            "answer": f"(Subgoal failed with error: {e})",
-            "iterations": 0,
-            "judge_reports": [],
-            "judge_sufficient": False,
-            "retrieval_candidates": 0,
-            "error": str(e)
+            "answer": "",
+            "error": str(e),
+            "retrieval_meta": {
+                "num_candidates": 0,
+                "top_chunks": []
+            }
         }
 
-# ----------------- Final Aggregator (new) -----------------
-def aggregate_subgoal_answers(original_query: str, subgoal_results: List[Dict[str, Any]], user_lang: str) -> str:
-    # Prepare a compact, structured summary of subgoal Q/A pairs
-    lines = []
-    for r in sorted(subgoal_results, key=lambda x: x.get("id", 0)):
-        sid = r.get("id")
-        lines.append(f"--- Subgoal S{sid} ---")
-        lines.append(f"Question: {r.get('question')}")
-        lines.append(f"Judge sufficient: {bool(r.get('judge_sufficient'))}; iterations: {r.get('iterations')}")
-        if r.get("error"):
-            lines.append(f"Error: {r.get('error')}")
-        ans = r.get("answer") or ""
-        # Clamp extremely long subgoal answers to keep aggregator prompt manageable
-        lines.append("Answer:\n" + clamp(ans, 12000))
-    subgoals_summary = "\n".join(lines)
+def answer_subgoals_parallel(subgoals: List[Dict[str, str]], user_lang: str) -> List[Dict[str, Any]]:
+    """
+    Answer all subgoals in parallel and return list of Q/A dicts in the same order as input.
+    """
+    log("=== Subgoal Answering (Parallel) ===")
+    results: List[Optional[Dict[str, Any]]] = [None] * len(subgoals)
+    with ThreadPoolExecutor(max_workers=SUBGOAL_MAX_WORKERS) as executor:
+        futures = {}
+        for idx, sg in enumerate(subgoals):
+            futures[executor.submit(answer_single_subgoal, sg, user_lang)] = idx
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            try:
+                res = fut.result()
+            except Exception as e:
+                log(f"[Subgoal index {idx}] Future error: {e}")
+                sg = subgoals[idx]
+                res = {"id": sg.get("id",""), "question": sg.get("question",""), "answer": "", "error": str(e), "retrieval_meta": {"num_candidates": 0, "top_chunks": []}}
+            results[idx] = res
+    # Fill any gaps (safety)
+    return [r if r is not None else {"id": subgoals[i].get("id",""), "question": subgoals[i].get("question",""), "answer": "", "retrieval_meta": {"num_candidates": 0, "top_chunks": []}} for i, r in enumerate(results)]
 
-    instructions = (
-        "You are Agent 4 (Final Aggregator). Synthesize the best possible final answer to the user's original question "
-        "using ONLY the information contained in the subgoal answers below. Do not invent facts. "
-        "Resolve any conflicts by prioritizing answers that were marked as 'Judge sufficient: True' and that provide clearer citations. "
-        "When relevant, include concrete UU/Article references that appear in the subgoal answers. "
-        "Respond concisely in the same language as the user's question."
+# ----------------- Aggregator Agent (final synthesis) -----------------
+def aggregate_answers(original_query: str, subgoal_qas: List[Dict[str, Any]], output_lang: str = "en") -> str:
+    """
+    Aggregate subgoal answers into a final answer to the original query.
+    """
+    # Build a compact list of Q/A pairs
+    lines = []
+    for i, qa in enumerate(subgoal_qas, 1):
+        sgid = qa.get("id", f"SG{i}")
+        q = qa.get("question", "").strip()
+        a = (qa.get("answer", "") or "").strip()
+        if not a:
+            a = "(No answer or retrieval failed.)"
+        lines.append(f"[{sgid}] Question: {q}\n[{sgid}] Answer: {a}\n")
+    qa_block = "\n".join(lines)
+
+    instruction = (
+        "Synthesize a final, concise, and accurate answer to the original query using ONLY the information contained in the subgoal answers. "
+        "If there are conflicts among subgoal answers, resolve them explicitly and explain your reasoning briefly. "
+        "If evidence is missing or inconclusive, state the limitation clearly. "
+        "Preserve any UU/Article references or citations mentioned in the subgoal answers. "
+        "Respond in the same language as the user's question."
     )
 
     prompt = f"""
-{instructions}
+You are the Final Aggregator.
 
-Original user question:
+Original user query:
 \"\"\"{original_query}\"\"\"
 
 Subgoal Q/A pairs:
-\"\"\"{subgoals_summary}\"\"\"
+\"\"\"{qa_block}\"\"\"
 
-Now produce the final answer to the original question. Provide only the final answer (no preamble).
+Instructions:
+{instruction}
 """
     est = estimate_tokens_for_text(prompt)
-    log("\n[Aggregator] Prompt:")
+    log("=== Aggregation ===")
+    log("[Aggregator] Prompt:")
     log(prompt)
     log(f"[Aggregator] Prompt size: {len(prompt)} chars, est_tokens≈{est}")
-    final_answer = safe_generate_text(prompt, max_tokens=AGGREGATOR_MAX_TOKENS, temperature=0.2)
-    log("\n[Aggregator] Final synthesized answer:")
-    log(final_answer)
-    return final_answer
+    out = safe_generate_text(prompt, max_tokens=AGGREGATOR_MAX_TOKENS, temperature=0.2)
+    log("[Aggregator] Final Answer:")
+    log(out)
+    return out
 
-# ----------------- Agentic RAG main -----------------
+# ----------------- Agentic RAG main (with Subgoals + Aggregator) -----------------
 def agentic_rag(query_original: str) -> Dict[str, Any]:
     global _LOGGER
     ts_name = make_timestamp_name()
@@ -678,53 +650,49 @@ def agentic_rag(query_original: str) -> Dict[str, Any]:
         log("=== Agentic RAG run started ===")
         log(f"Log file: {log_file}")
         log(f"Original Query: {query_original}")
-        log("Parameters:")
-        log(f"- TOP_K_CHUNKS={TOP_K_CHUNKS}, MAX_CHUNKS_FINAL={MAX_CHUNKS_FINAL}, CHUNK_TEXT_CLAMP={CHUNK_TEXT_CLAMP}")
-        log(f"- ANSWER_MAX_TOKENS={ANSWER_MAX_TOKENS}, MAX_ITERS={MAX_ITERS}")
-        log(f"- SUBGOAL_MAX (hardcoded)={SUBGOAL_MAX}, SUBGOAL_MAX_PARALLEL={SUBGOAL_MAX_PARALLEL}, AGGREGATOR_MAX_TOKENS={AGGREGATOR_MAX_TOKENS}")
+        log(f"Parameters: TOP_K_CHUNKS={TOP_K_CHUNKS}, MAX_CHUNKS_FINAL={MAX_CHUNKS_FINAL}, CHUNK_TEXT_CLAMP={CHUNK_TEXT_CLAMP}, "
+            f"ANSWER_MAX_TOKENS={ANSWER_MAX_TOKENS}, AGGREGATOR_MAX_TOKENS={AGGREGATOR_MAX_TOKENS}, MAX_SUBGOALS={MAX_SUBGOALS}, "
+            f"SUBGOAL_TOP_K={SUBGOAL_TOP_K}, SUBGOAL_MAX_WORKERS={SUBGOAL_MAX_WORKERS}, MAX_ITERS={MAX_ITERS}, "
+            f"LLM_CALLS_PER_MINUTE={LLM_CALLS_PER_MINUTE}")
 
         user_lang = detect_user_language(query_original)
         log(f"[Language] Detected user language: {user_lang}")
 
-        # Step A: Generate subgoals
-        subgoals = generate_subgoals(query_original, user_lang)
+        # Subgoal Generation
+        subgoals = generate_subgoals(query_original, MAX_SUBGOALS, output_lang=user_lang)
 
-        # Step B: Execute subgoals in parallel
-        log("\n=== Executing subgoals in parallel ===")
-        subgoal_results: List[Dict[str, Any]] = []
-        with ThreadPoolExecutor(max_workers=SUBGOAL_MAX_PARALLEL) as ex:
-            futures = {ex.submit(run_subgoal, sg, user_lang): sg for sg in subgoals}
-            for fut in as_completed(futures):
-                res = fut.result()
-                subgoal_results.append(res)
+        # Optional: Agent 1 & 1b on the original query (kept for structure)
+        t1 = time.time()
+        _ = agent1_extract_entities_predicates(query_original)
+        _ = agent1b_extract_query_triples(query_original)
+        log(f"[Step] Entity/Triple extraction on original query in {(time.time()-t1)*1000:.0f} ms")
 
-        # Keep results ordered by id
-        subgoal_results.sort(key=lambda r: r.get("id", 0))
+        # Answer subgoals in parallel
+        t2 = time.time()
+        subgoal_qas = answer_subgoals_parallel(subgoals, user_lang)
+        log(f"[Step] Subgoal answering completed in {(time.time()-t2)*1000:.0f} ms")
 
-        # Step C: Aggregate into final answer
-        log("\n=== Aggregating subgoal answers into final answer ===")
-        final_answer = aggregate_subgoal_answers(query_original, subgoal_results, user_lang)
+        # Aggregate into final answer
+        t3 = time.time()
+        final_answer = aggregate_answers(query_original, subgoal_qas, output_lang=user_lang)
+        log(f"[Step] Aggregation completed in {(time.time()-t3)*1000:.0f} ms")
 
         # Summary
-        sufficient_count = sum(1 for r in subgoal_results if r.get("judge_sufficient"))
-        total_iters = sum(r.get("iterations", 0) for r in subgoal_results)
-        aggregator_notes = f"Synthesized from {len(subgoal_results)} subgoals; {sufficient_count} marked sufficient by Judge; total iterations across subgoals: {total_iters}."
-
-        log("\n=== Agentic RAG summary ===")
-        log(f"- Subgoals generated: {len(subgoals)}")
-        log(f"- Subgoals executed: {len(subgoal_results)} (sufficient={sufficient_count})")
-        log(f"- Total iterations (across subgoals): {total_iters}")
-        log("\n=== Final Answer ===")
-        log(final_answer)
-        log(f"\nLogs saved to: {log_file}")
+        log("=== Agentic RAG summary ===")
+        log(f"- Subgoals: {len(subgoals)}")
+        for sg in subgoals:
+            log(f"  • {sg['id']}: {sg['question']}")
+        log("=== Final Answer ===")
+        log(final_answer or "")
+        log(f"Logs saved to: {log_file}")
 
         return {
-            "final_answer": final_answer,
-            "log_file": str(log_file),
+            "final_answer": final_answer or "",
             "subgoals": subgoals,
-            "subgoal_results": subgoal_results,
-            "aggregator_notes": aggregator_notes,
-            "iterations_total": total_iters
+            "subgoal_answers": subgoal_qas,
+            "log_file": str(log_file),
+            "iterations": 1,
+            "judge_reports": []  # kept for downstream compatibility; empty
         }
     finally:
         if _LOGGER is not None:
@@ -737,10 +705,7 @@ if __name__ == "__main__":
         if not user_query:
             print("Empty query. Exiting.")
         else:
-            result = agentic_rag(user_query)
-            # Optionally, print final answer to console explicitly:
-            print("\n----- FINAL ANSWER -----\n")
-            print(result["final_answer"])
+            agentic_rag(user_query)
     finally:
         try:
             driver.close()

@@ -32,6 +32,8 @@ from typing import List, Dict, Any
 # Set to a positive integer; values <= 0 will default to "all at once".
 BATCH_SIZE = 9
 
+csv.field_size_limit(sys.maxsize)
+
 try:
     from dotenv import load_dotenv
 except ImportError:
