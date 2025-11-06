@@ -1,28 +1,11 @@
 #!/usr/bin/env python3
-"""
-run_multi_agent.py
-Batched parallel runner for multi_agent.py (self-contained multi-agent RAG).
-
-- Reads QA JSONL from underscore paths (sample/full controlled by IS_SAMPLE in .env).
-- Distributes tasks evenly across GOOGLE_API_KEY_N entries from .env.
-- Launches workers in batches (BATCH_SIZE). Each worker:
-  * Sets its GOOGLE_API_KEY (env + refresh Gemini).
-  * Imports multi_agent and calls multi_agent_answer(question).
-  * Tees stdout/stderr to per-question logs.
-  * Streams per-worker .part JSONL.
-- Merges part files into a combined JSONL.
-
-Output JSONL per line:
-  {
-    "id": <int>,
-    "question": <str>,
-    "ground_truth": <str>,
-    "graphrag_answer": <str>,
-    "naiverag_answer": <str>,
-    "final_answer": <str>,
-    "decision": <"graphrag"|"naiverag"|"hybrid">
-  }
-"""
+# run_multi_agent.py
+# Parallel multi-agent RAG runner over QA pairs with batched subprocess execution.
+# - Distributes tasks across workers (one per GOOGLE_API_KEY_N)
+# - Runs workers in batches (BATCH_SIZE)
+# - Per-question stdout/stderr is tee'd into log files
+# - Workers write .part JSONL; parent merges into one combined JSONL
+# - Uses underscore-only dataset paths controlled by IS_SAMPLE in .env
 
 import json
 import shutil
@@ -54,11 +37,11 @@ elif is_sample == "false":
 else:
     raise ValueError(f"Wrong configuration of IS_SAMPLE in .env file: {is_sample}")
 
-# Processing limits (0 or None => all)
-MAX_QUESTIONS = int(os.getenv("MAX_QUESTIONS", "0"))
-SELECTION_MODE = os.getenv("SELECTION_MODE", "random")  # "first" or "random"
+# Limit processing (0 or None = all)
+MAX_QUESTIONS = 0  # default: process all
+SELECTION_MODE = "random"  # "first" or "random"
 
-# Underscore-only paths
+# Paths (underscore-only)
 if IS_SAMPLE:
     QA_PAIRS_REL   = "../../../dataset/samples/4_experiment/4a_qa_generation/4a_iii_qa_pairs_with_id/qa_pairs.jsonl"
     OUTPUT_DIR_REL = "../../../dataset/samples/4_experiment/4b_experiment_answers/4b_iii_multi_agent"
@@ -70,8 +53,9 @@ PER_QUESTION_LOGS_DIRNAME = "question_terminal_logs_multi_agent"
 ENV_PATH_REL = "../../../.env"
 CLEAN_PART_FILES = True
 
-# Batched execution
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "5"))  # processes per batch; <=0 => all at once
+# Batched execution: number of subprocesses to run concurrently.
+# Set to 0 or <=0 to run all workers at once.
+BATCH_SIZE = 8
 
 # ----------------- Utilities & logging -----------------
 
@@ -101,9 +85,34 @@ def sanitize_snippet(text: str, max_len: int = 50) -> str:
     t = (text or "").strip()
     t = re.sub(r"\s+", " ", t)
     t = t[:max_len]
-    t = re.sub(r"[^a-zA-Z0-9\\-_. ]", "_", t)
+    t = re.sub(r"[^a-zA-Z0-9\-_. ]", "_", t)
     t = t.strip().replace(" ", "_")
     return t or "question"
+
+class TeeIO:
+    def __init__(self, primary, secondary_file):
+        self.primary = primary
+        self.secondary = secondary_file
+
+    def write(self, data):
+        try:
+            self.primary.write(data)
+        except Exception:
+            pass
+        try:
+            self.secondary.write(data)
+        except Exception:
+            pass
+
+    def flush(self):
+        try:
+            self.primary.flush()
+        except Exception:
+            pass
+        try:
+            self.secondary.flush()
+        except Exception:
+            pass
 
 def iter_jsonl(path: Path):
     with path.open("r", encoding="utf-8") as f:
@@ -116,11 +125,26 @@ def iter_jsonl(path: Path):
             except Exception as e:
                 print(f"[WARN] Skipping malformed JSON on line {i}: {e}", file=sys.stderr)
 
+def chunk_evenly(items, n_chunks):
+    if n_chunks <= 0:
+        return []
+    L = len(items)
+    base = L // n_chunks
+    rem = L % n_chunks
+    chunks = []
+    start = 0
+    for i in range(n_chunks):
+        sz = base + (1 if i < rem else 0)
+        end = start + sz
+        chunks.append(items[start:end])
+        start = end
+    return chunks
+
 def ensure_output_dir_ready(output_dir: Path):
     output_dir.mkdir(parents=True, exist_ok=True)
     not_empty = any(output_dir.iterdir())
     if not_empty:
-        print(f"WARNING: Output directory is not empty:\n {output_dir}")
+        print(f"WARNING: Output directory is not empty:\n  {output_dir}")
         print("Continuing will OVERWRITE (delete) all files in this folder.")
         resp = input("Type 'YES' to confirm and continue, or anything else to abort: ").strip()
         if resp != "YES":
@@ -152,22 +176,7 @@ def load_google_api_keys(env_path: Path):
     keys.sort(key=lambda x: x[2])
     return keys
 
-def chunk_evenly(items, n_chunks):
-    if n_chunks <= 0:
-        return []
-    L = len(items)
-    base = L // n_chunks
-    rem = L % n_chunks
-    chunks = []
-    start = 0
-    for i in range(n_chunks):
-        sz = base + (1 if i < rem else 0)
-        end = start + sz
-        chunks.append(items[start:end])
-        start = end
-    return chunks
-
-# ----------------- Worker -----------------
+# ----------------- Worker process -----------------
 
 def worker_main(worker_id: int,
                 key_label: str,
@@ -182,25 +191,24 @@ def worker_main(worker_id: int,
     logs_dir.mkdir(parents=True, exist_ok=True)
     part_path = Path(part_path)
 
-    # Configure key for this process
+    # Configure API key for this process
     if key_value:
         os.environ["GOOGLE_API_KEY"] = key_value
 
+    # Import after setting env so the module can read it
     try:
-        import multi_agent as rag
+        import both_iq_19 as rag
     except Exception as e:
         log(f"[Worker {worker_id}] ERROR: Could not import multi_agent.py: {e}")
         part_path.write_text("", encoding="utf-8")
         return
 
-    # Try to refresh Gemini SDK with this key (best-effort)
+    # Force constant override as a safety net
     try:
         if key_value:
             setattr(rag, "GOOGLE_API_KEY", key_value)
-            genai = __import__("google.generativeai", fromlist=["configure"])
-            genai.configure(api_key=key_value)
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"[Worker {worker_id}] WARN: Could not set rag.GOOGLE_API_KEY: {e}")
 
     masked = mask_key(key_value) if key_value else "(module default / env)"
     log(f"[Worker {worker_id}] Using {key_label} = {masked}. Assigned {len(tasks)} task(s). Part file: {part_path.name}")
@@ -213,6 +221,7 @@ def worker_main(worker_id: int,
             question     = task["question"]
             ground_truth = task["ground_truth"]
 
+            # Prepare per-question log file and tee outputs
             preview = (question or "")[:120]
             suffix = "..." if question and len(question) > 120 else ""
             q_snippet = sanitize_snippet(question or "", max_len=60)
@@ -221,21 +230,6 @@ def worker_main(worker_id: int,
 
             start_single = _time.monotonic()
             with log_file.open("w", encoding="utf-8") as lf:
-                class TeeIO:
-                    def __init__(self, primary, secondary_file):
-                        self.primary = primary
-                        self.secondary = secondary_file
-                    def write(self, data):
-                        try: self.primary.write(data)
-                        except Exception: pass
-                        try: self.secondary.write(data)
-                        except Exception: pass
-                    def flush(self):
-                        try: self.primary.flush()
-                        except Exception: pass
-                        try: self.secondary.flush()
-                        except Exception: pass
-
                 tee_out = TeeIO(sys.stdout, lf)
                 tee_err = TeeIO(sys.stderr, lf)
                 with contextlib.redirect_stdout(tee_out), contextlib.redirect_stderr(tee_err):
@@ -246,20 +240,22 @@ def worker_main(worker_id: int,
                     print("-" * 100)
 
                     final_answer = ""
+                    naive_answer = ""
                     graphrag_answer = ""
-                    naiverag_answer = ""
-                    decision = ""
+                    aggregator_decision = {}
+                    error_msg = None
                     try:
-                        result = rag.multi_agent_answer(question)
+                        result = rag.iq_orchestrator(question)
                         final_answer = (result or {}).get("final_answer", "") or ""
-                        answers = (result or {}).get("answers", {}) or {}
-                        graphrag_answer = answers.get("graphrag", "") or ""
-                        naiverag_answer = answers.get("naiverag", "") or ""
-                        decision = (result or {}).get("decision", "") or ""
+                        naive_answer = (result or {}).get("naive_answer", "") or ""
+                        graphrag_answer = (result or {}).get("graphrag_answer", "") or ""
+                        aggregator_decision = (result or {}).get("aggregator_decision", {}) or {}
+                        # mirror the orchestrator's log file path for discoverability
+                        print(f"[Worker {worker_id}] Orchestrator log file: {(result or {}).get('log_file')}", flush=True)
                     except Exception as e:
-                        final_answer = f"(error during multi_agent_answer: {e})"
-                        decision = "error"
-                        print(f"[ERROR] {e}", file=sys.stderr)
+                        error_msg = str(e)
+                        final_answer = f"(error during agentic_multi: {error_msg})"
+                        print(f"[ERROR] {error_msg}", file=sys.stderr)
 
                     dur_single = _time.monotonic() - start_single
                     print("-" * 100)
@@ -268,18 +264,26 @@ def worker_main(worker_id: int,
                     print(f"[Worker {worker_id}] Progress (within worker): processed {i} / {len(tasks)} | Left: {len(tasks) - i}")
                     print("=" * 100)
 
+            # Write JSONL output record (streaming)
             out_record = {
                 "id": qid,
                 "question": question,
                 "ground_truth": ground_truth,
+                "naive_answer": naive_answer,
                 "graphrag_answer": graphrag_answer,
-                "naiverag_answer": naiverag_answer,
                 "final_answer": final_answer,
-                "decision": decision
+                "aggregator_decision": aggregator_decision
             }
             out_f.write(json.dumps(out_record, ensure_ascii=False) + "\n")
             out_f.flush()
             processed += 1
+
+    # Cleanup Neo4j driver if exposed
+    try:
+        if hasattr(rag, "driver") and rag.driver is not None:
+            rag.driver.close()
+    except Exception:
+        pass
 
     dur = _time.monotonic() - start
     log(f"[Worker {worker_id}] DONE. Wrote {processed} record(s) to {part_path.name}. Duration: {format_duration(dur)}")
@@ -287,6 +291,7 @@ def worker_main(worker_id: int,
 # ----------------- Main orchestration -----------------
 
 def main():
+    # Use 'spawn' to avoid surprises with module state across processes
     try:
         mp.set_start_method("spawn")
     except RuntimeError:
@@ -304,20 +309,21 @@ def main():
     ensure_output_dir_ready(output_dir)
     logs_dir.mkdir(parents=True, exist_ok=True)
 
+    # Prepare output file name
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     out_path = output_dir / f"multi_agent_answers_{ts}.jsonl"
 
+    # Load all QA pairs
     all_records = list(iter_jsonl(input_path))
     total_records = len(all_records)
-
     log(f"Input file: {input_path}")
-    log(f"Total records: {total_records}")
+    log(f"Total QA pairs: {total_records}")
 
     if total_records == 0:
         log("No records to process. Exiting.")
         return
 
-    # Apply limit with selection mode
+    # Apply limit with selection mode (no extra filtering; upstream can filter)
     if MAX_QUESTIONS and MAX_QUESTIONS > 0:
         k = min(MAX_QUESTIONS, total_records)
         if SELECTION_MODE == "first":
@@ -328,14 +334,14 @@ def main():
             limit_info = f"limited to MAX_QUESTIONS={MAX_QUESTIONS} (selection=random)"
         else:
             selected = all_records[:k]
-            limit_info = f"limited to MAX_QUESTIONS={MAX_QUESTIONS} (selection=first; invalid SELECTION_MODE ignored)"
+            limit_info = f"limited to MAX_QUESTIONS={MAX_QUESTIONS} (selection=first; invalid mode ignored)"
     else:
         selected = all_records
         limit_info = "no limit (processing all records)"
 
     log(f"Processing {len(selected)} out of {total_records} ({limit_info}).")
 
-    # Build tasks
+    # Build tasks with stable global indices
     tasks = []
     for global_idx, rec in enumerate(selected, 1):
         question = (rec.get("question") or "").strip()
@@ -363,18 +369,18 @@ def main():
         log(f"No GOOGLE_API_KEY_* entries found in {env_path}. Running with a single worker using module default / existing environment.")
         api_keys = [("DEFAULT", None, 0)]
 
-    # Distribute tasks evenly
+    # Distribute tasks evenly across workers
     n_workers = min(len(api_keys), total_tasks)
     api_keys = api_keys[:n_workers]
     task_chunks = chunk_evenly(tasks, n_workers)
 
-    log("Worker assignment:")
+    log("Worker assignment overview:")
     for i, ((label, key, _), chunk) in enumerate(zip(api_keys, task_chunks)):
         ids_preview = [t["id"] for t in chunk[:5]]
         more = "" if len(chunk) <= 5 else f" ... (+{len(chunk)-5} more)"
         log(f"  - Worker {i}: {label}={mask_key(key)} | tasks={len(chunk)} | first IDs={ids_preview}{more}")
 
-    # Prepare workers
+    # Prepare worker specs and part files
     worker_specs = []
     part_paths = []
     for i, ((label, key, _), chunk) in enumerate(zip(api_keys, task_chunks)):
@@ -429,7 +435,7 @@ def main():
 
         log(f"Completed batch {b+1}/{num_batches}.")
 
-    # Merge part files
+    # Merge part files into single output
     merged = 0
     with out_path.open("w", encoding="utf-8") as out_f:
         for part in part_paths:
@@ -448,6 +454,7 @@ def main():
     log(f"Done. Merged {merged} record(s) into: {out_path}")
     log(f"Total time: {format_duration(dur)}")
 
+    # Cleanup part files
     if CLEAN_PART_FILES:
         for part in part_paths:
             try:

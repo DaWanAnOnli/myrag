@@ -67,17 +67,19 @@ MAX_QUESTIONS = None
 SELECTION_MODE = "random"  # change to "first" to select deterministically
 
 # New: number of processes to run concurrently per shift
-PROCESSES_PER_SHIFT = 9  # Adjust this to control shift size
+PROCESSES_PER_SHIFT = 6  # Adjust this to control shift size
 
 # ----------------- Paths (underscore-only) -----------------
 
-if IS_SAMPLE:
-    QA_PAIRS_REL = "../../../dataset/samples/4_experiment/4a_qa_generation/4a_iii_qa_pairs_with_id/qa_pairs.jsonl"
-    ANSWERS_OUT_REL = "../../../dataset/samples/4_experiment/4b_experiment_answers/4b_i_lexidkg_graphrag"
-else:
-    QA_PAIRS_REL = "../../../dataset/4_experiment/4a_qa_generation/4a_iii_qa_pairs_with_id/qa_pairs.jsonl"
-    ANSWERS_OUT_REL = "../../../dataset/4_experiment/4b_experiment_answers/4b_i_lexidkg_graphrag"
+# if IS_SAMPLE:
+#     QA_PAIRS_REL = "../../../dataset/samples/4_experiment/4a_qa_generation/4a_iii_qa_pairs_with_id/qa_pairs.jsonl"
+#     ANSWERS_OUT_REL = "../../../dataset/samples/4_experiment/4b_experiment_answers/4b_i_lexidkg_graphrag"
+# else:
+#     QA_PAIRS_REL = "../../../dataset/4_experiment/4a_qa_generation/4a_iii_qa_pairs_with_id/qa_pairs.jsonl"
+#     ANSWERS_OUT_REL = "../../../dataset/4_experiment/4b_experiment_answers/4b_i_lexidkg_graphrag"
 
+QA_PAIRS_REL = "../../../dataset/4_experiment/4a_qa_generation/4a_v_amendment_questions/amendment_questions.jsonl"
+ANSWERS_OUT_REL = "../../../dataset/4_experiment/4b_experiment_answers/4b_i_lexidkg_graphrag"
 PER_QUESTION_LOGS_DIRNAME = "question_terminal_logs"
 ENV_PATH_REL = "../../../.env"
 CLEAN_PART_FILES = True  # remove worker part files after merging
@@ -241,7 +243,7 @@ def worker_main(worker_id: int,
 
     # Import after setting env so the module can also read env if it does.
     try:
-        import lexidkg_graphrag as rag
+        import lexidkg_graphrag_amendment_aware as rag
     except Exception as e:
         log(f"[Worker {worker_id}] ERROR: Could not import lexidkg_graphrag_agentic.py: {e}")
         # Still write an empty part file so parent can proceed

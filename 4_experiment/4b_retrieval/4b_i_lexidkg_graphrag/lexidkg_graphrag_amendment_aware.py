@@ -1,8 +1,17 @@
 # lexidkg_graphrag_agentic.py
-# Single-pass Agentic GraphRAG (Agents 1 & 2 only), with robust vector param handling for Neo4j,
-# and enhanced logging: timestamps, PID, Neo4j query attempts/success/failure, and durations.
+# Single-pass Agentic GraphRAG with version-aware law resolution:
+# - As-of intent parsing (latest vs historical date)
+# - Two retrieval branches:
+#   A) Core topical GraphRAG (triple-centric + entity-centric)
+#   B) Version-awareness (mod detection), itself with two sub-approaches:
+#       B1) Predicate-driven (AMENDS/REPEALS/etc.)
+#       B2) Node-type–driven (LawAmendment/LawModification/LawAddition/LawDeletion)
+# - Temporal filtering: exclude repealed content as of as-of date (keep mod-evidence; exclusions logged)
+# - Temporal-aware re-ranking with reserved budget for version-lineage chunks
+# - Short version lineage summary for the Answerer
+# - Indefinite retry for LLM generation (JSON/text) and embeddings
 
-import os, time, json, math, pickle, re, random
+import os, time, json, math, pickle, re, random, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional, Set
 from threading import Lock
@@ -16,17 +25,16 @@ from neo4j import GraphDatabase
 load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent.parent.parent / ".env")
 
 # ----------------- Config -----------------
-# Credentials and endpoints should stay in env for safety.
 GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY"]
 NEO4J_URI  = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASS = os.getenv("NEO4J_PASS", "password")
 
-# Neo4j retry/timeout controls (to prevent infinite loops on persistent errors)
-NEO4J_TX_TIMEOUT_S = float(os.getenv("NEO4J_TX_TIMEOUT_S", "60"))  # per-query transaction timeout (seconds)
-NEO4J_MAX_ATTEMPTS = int(os.getenv("NEO4J_MAX_ATTEMPTS", "10"))   # max attempts for run_cypher_with_retry
+# Neo4j retry/timeout controls
+NEO4J_TX_TIMEOUT_S = float(os.getenv("NEO4J_TX_TIMEOUT_S", "60"))
+NEO4J_MAX_ATTEMPTS = int(os.getenv("NEO4J_MAX_ATTEMPTS", "10"))
 
-# Gemini models (can be overridden via env if desired)
+# Gemini models
 GEN_MODEL = os.getenv("GEN_MODEL", "models/gemini-2.5-flash")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "models/text-embedding-004")
 
@@ -35,33 +43,61 @@ DEFAULT_LANGCHAIN_DIR = (Path(__file__).resolve().parent / "../../../dataset/3_i
 LANGCHAIN_DIR = Path(os.getenv("LANGCHAIN_DIR") or str(DEFAULT_LANGCHAIN_DIR))
 SKIP_FILES = {"all_langchain_documents.pkl"}
 
-# ----------------- Retrieval/agent parameters (hardcoded constants) -----------------
-# Independent hop-depth and top-k per step (each "n" is independent as requested)
-# Entity-centric path
-ENTITY_MATCH_TOP_K = 15                 # top similar KG entities per extracted query entity
-ENTITY_SUBGRAPH_HOPS = 5               # hop-depth for subgraph expansion from matched entities
-ENTITY_SUBGRAPH_PER_HOP_LIMIT = 2000   # per-hop expansion limit
-SUBGRAPH_TRIPLES_TOP_K = 30            # top triples selected from subgraph after triple-vs-triple similarity
+# ----------------- Retrieval/agent parameters -----------------
+# Core entity path
+ENTITY_MATCH_TOP_K = 15
+ENTITY_SUBGRAPH_HOPS = 5
+ENTITY_SUBGRAPH_PER_HOP_LIMIT = 2000
+SUBGRAPH_TRIPLES_TOP_K = 30
 
 # Triple-centric path
-QUERY_TRIPLE_MATCH_TOP_K_PER = 20      # per query-triple, top similar KG triples
+QUERY_TRIPLE_MATCH_TOP_K_PER = 20
 
 # Final context combination and reranking
-MAX_TRIPLES_FINAL = 60                 # final number of triples after reranking
-MAX_CHUNKS_FINAL = 40                  # final number of chunks after reranking
-CHUNK_RERANK_CAND_LIMIT = 200          # cap chunk candidates before embedding/reranking to control cost
+MAX_TRIPLES_FINAL = 60
+MAX_CHUNKS_FINAL = 40
+CHUNK_RERANK_CAND_LIMIT = 200
 
 # Agent loop and output
 ANSWER_MAX_TOKENS = 4096
-MAX_ITERS = 3  # Note: ignored in single-pass mode
+MAX_ITERS = 3  # Ignored in single-pass
 
 # Language setting
-OUTPUT_LANG = "id"  # retained for compatibility; we auto-detect based on query
+OUTPUT_LANG = "id"  # retained for compatibility
+
+# ----------------- Version-aware settings -----------------
+# Predicate-driven mod detection
+MOD_DOC_PREDICATES = {
+    # English normalized
+    "amends", "amended_by", "repeals",
+    # Indonesian normalized variants
+    "mengubah", "diubah", "mencabut", "dicabut", "tidak_berlaku"
+}
+MOD_CONTENT_PREDICATES = {
+    "modifies", "adds", "deletes",
+    "law_modification", "law_addition", "law_deletion",
+    "mengubah_ketentuan", "menambahkan", "menyisipkan", "menghapus"
+}
+VERSION_PREDICATES_ALLOWED = MOD_DOC_PREDICATES.union(MOD_CONTENT_PREDICATES)
+
+# Node-type–driven mod detection
+MOD_NODE_TYPES = {"LawAmendment", "LawModification", "LawAddition", "LawDeletion"}
+
+# Predicates that may indicate effective dates (best-effort parse)
+DATE_PREDICATES = {
+    "mulai_berlaku", "berlaku_mulai", "berlaku_sejak", "effective_from", "effective_date",
+    "has_enaction_date", "tanggal_diundangkan", "tanggal_berlaku"
+}
+
+# Guardrails / weights
+VERSION_RESERVED_CHUNKS_MIN = int(os.getenv("VERSION_RESERVED_CHUNKS_MIN", "6"))
+EXCLUDE_REPEALED_CONTENT = os.getenv("EXCLUDE_REPEALED_CONTENT", "1").strip().lower() in ("1", "true", "yes", "y", "on")
+TEMPORAL_BOOST_FOR_CURRENT = float(os.getenv("TEMPORAL_BOOST_FOR_CURRENT", "0.10"))
+TEMPORAL_DOWNWEIGHT_SUPERSEDED = float(os.getenv("TEMPORAL_DOWNWEIGHT_SUPERSEDED", "0.10"))
 
 # ----------------- Initialize SDKs -----------------
 genai.configure(api_key=GOOGLE_API_KEY)
 gen_model = genai.GenerativeModel(GEN_MODEL)
-
 driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
 
 # ----------------- Logger -----------------
@@ -107,7 +143,6 @@ def _fmt_msg(msg: Any, level: str) -> str:
             msg = json.dumps(msg, ensure_ascii=False, default=str)
         except Exception:
             msg = str(msg)
-    # prefix each line for readability
     lines = str(msg).splitlines() or [str(msg)]
     prefixed = [f"{_prefix(level)} {line}" for line in lines] if lines else [f"{_prefix(level)}"]
     return "\n".join(prefixed)
@@ -134,18 +169,12 @@ def dur_ms(start: float) -> float:
     return (time.time() - start) * 1000.0
 
 def _norm_id(x) -> str:
-    """Normalize IDs so (uuid object, stringified uuid, whitespace variants) compare the same."""
     return str(x).strip() if x is not None else ""
 
 def estimate_tokens_for_text(text: str) -> int:
-    # Quick heuristic: ~4 characters per token
     return max(1, int(len(text) / 4))
 
 def _as_float_list(vec) -> List[float]:
-    """
-    Normalize any vector-like to a fresh Python list[float].
-    Prevents Neo4j driver 'Existing exports of data: object cannot be re-sized.' errors.
-    """
     if vec is None:
         return []
     try:
@@ -161,46 +190,6 @@ def _as_float_list(vec) -> List[float]:
         except Exception:
             return []
 
-# Retry helpers for any external API call (e.g., rate limit errors)
-def _rand_wait_seconds() -> float:
-    # Uniform 5–20 seconds
-    return random.uniform(80.0, 120.0)
-
-def _api_call_with_retry(func, *args, **kwargs):
-    """
-    Call the given function with the provided args/kwargs.
-    If any exception occurs (e.g., rate limit, network), wait 5–20s and retry.
-    Retries indefinitely until success.
-    """
-    while True:
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            wait_s = _rand_wait_seconds()
-            log(f"[Retry] API call failed: {e}. Retrying in {wait_s:.1f}s.", level="WARN")
-            time.sleep(wait_s)
-
-def embed_text(text: str) -> List[float]:
-    t0 = now_ms()
-    res = _api_call_with_retry(genai.embed_content, model=EMBED_MODEL, content=text)
-    vec = None
-    if isinstance(res, dict):
-        emb = res.get("embedding")
-        if isinstance(emb, dict) and "values" in emb:
-            vec = emb["values"]
-        elif isinstance(emb, list):
-            vec = emb
-    if vec is None:
-        try:
-            vec = res.embedding.values  # type: ignore[attr-defined]
-        except Exception:
-            pass
-    if vec is None:
-        raise RuntimeError("Unexpected embedding response shape for embeddings")
-    out = _as_float_list(vec)
-    log(f"[Embed] text_len={len(text)} -> vec_len={len(out)} | {dur_ms(t0):.0f} ms", level="DEBUG")
-    return out
-
 def cos_sim(a: List[float], b: List[float]) -> float:
     a = _as_float_list(a)
     b = _as_float_list(b)
@@ -211,29 +200,25 @@ def cos_sim(a: List[float], b: List[float]) -> float:
         return 0.0
     return dot / (na * nb)
 
-# ----------------- Simple language detection (ID vs EN) -----------------
-def detect_user_language(text: str) -> str:
-    """
-    Lightweight heuristic to detect Indonesian ('id') vs English ('en')
-    for the purpose of matching the user's query language in the final answer.
-    """
-    t = (text or "").lower()
+def normalize_predicate_for_test(p: Optional[str]) -> str:
+    if not p:
+        return ""
+    p = p.strip().lower()
+    p = p.replace("-", "_").replace(" ", "_")
+    p = re.sub(r"[^a-z0-9_]", "", p)
+    return p
 
-    # Strong hints
+# ----------------- Language detection -----------------
+def detect_user_language(text: str) -> str:
+    t = (text or "").lower()
     if re.search(r"\b(pasal|undang[- ]?undang|uu\s*\d|peraturan|menteri|ayat|bab|bagian|paragraf|ketentuan|sebagaimana|dimaksud)\b", t):
         return "id"
     if re.search(r"\b(article|act|law|regulation|minister|section|paragraph|chapter|pursuant|provided that)\b", t):
         return "en"
-
-    # Token-based scoring
-    id_tokens = {
-        "yang","dan","atau","tidak","adalah","berdasarkan","sebagaimana","pada","dalam","dapat","harus","wajib",
-        "pasal","undang","peraturan","menteri","ayat","bab","bagian","paragraf","ketentuan","pengundangan","apabila","jika"
-    }
-    en_tokens = {
-        "the","and","or","not","is","based","as","provided","pursuant","in","may","must","shall",
-        "article","act","law","regulation","minister","section","paragraph","chapter","whereas"
-    }
+    id_tokens = {"yang","dan","atau","tidak","adalah","berdasarkan","sebagaimana","pada","dalam","dapat","harus","wajib",
+                 "pasal","undang","peraturan","menteri","ayat","bab","bagian","paragraf","ketentuan","pengundangan","apabila","jika"}
+    en_tokens = {"the","and","or","not","is","based","as","provided","pursuant","in","may","must","shall",
+                 "article","act","law","regulation","minister","section","paragraph","chapter","whereas"}
     words = re.findall(r"[a-z]+", t)
     score_id = sum(1 for w in words if w in id_tokens)
     score_en = sum(1 for w in words if w in en_tokens)
@@ -241,11 +226,108 @@ def detect_user_language(text: str) -> str:
         return "id"
     if score_en > score_id:
         return "en"
-
-    # Fallback: prefer English for safety
     return "en"
 
-# ----------------- Safe LLM helpers -----------------
+# ----------------- As-of parsing helpers -----------------
+_ID_MONTHS = {
+    "januari":1, "jan":1, "februari":2, "feb":2, "maret":3, "mar":3,
+    "april":4, "apr":4, "mei":5, "juni":6, "jun":6, "juli":7, "jul":7,
+    "agustus":8, "agu":8, "agt":8, "aug":8, "september":9, "sep":9, "sept":9,
+    "oktober":10, "okt":10, "oct":10, "november":11, "nov":11, "desember":12, "des":12, "dec":12
+}
+_EN_MONTHS = {
+    "january":1, "jan":1, "february":2, "feb":2, "march":3, "mar":3,
+    "april":4, "apr":4, "may":5, "june":6, "jun":6, "july":7, "jul":7,
+    "august":8, "aug":8, "september":9, "sep":9, "sept":9, "october":10, "oct":10,
+    "november":11, "nov":11, "december":12, "dec":12
+}
+
+def _try_parse_int(s: str) -> Optional[int]:
+    try:
+        return int(s)
+    except Exception:
+        return None
+
+def _parse_date_tokens(day: str, month: str, year: str) -> Optional[datetime.date]:
+    d = _try_parse_int(re.sub(r"[^\d]", "", day))
+    y = _try_parse_int(re.sub(r"[^\d]", "", year))
+    if not d or not y:
+        return None
+    m = None
+    m_txt = (month or "").lower()
+    if m_txt.isdigit():
+        m = _try_parse_int(m_txt)
+    if m is None:
+        m = _ID_MONTHS.get(m_txt) or _EN_MONTHS.get(m_txt)
+    if not m or m < 1 or m > 12:
+        return None
+    try:
+        return datetime.date(y, m, d)
+    except Exception:
+        return None
+
+_DATE_PATTERNS = [
+    re.compile(r"\b(\d{1,2})\s+([A-Za-z\.]+)\s+(\d{4})\b"),  # 1 Januari 2020
+    re.compile(r"\b(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})\b"),   # 01-01-2020 or 01/01/2020
+    re.compile(r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b"),     # 2020-01-31
+]
+
+def parse_date_any(text: str) -> Optional[datetime.date]:
+    if not text:
+        return None
+    t = text.strip()
+    for pat in _DATE_PATTERNS:
+        m = pat.search(t)
+        if not m:
+            continue
+        if pat is _DATE_PATTERNS[0]:
+            d, mon, y = m.group(1), m.group(2), m.group(3)
+            dt = _parse_date_tokens(d, mon, y)
+            if dt: return dt
+        elif pat is _DATE_PATTERNS[1]:
+            d, mth, y = m.group(1), m.group(2), m.group(3)
+            yy = _try_parse_int(y)
+            if yy and yy < 100:
+                yy = 2000 + yy
+            try:
+                return datetime.date(int(yy), int(mth), int(d))
+            except Exception:
+                pass
+        else:
+            y, mth, d = m.group(1), m.group(2), m.group(3)
+            try:
+                return datetime.date(int(y), int(mth), int(d))
+            except Exception:
+                pass
+    return None
+
+def parse_as_of_intent(query: str) -> Tuple[str, datetime.date]:
+    today = datetime.date.today()
+    q = (query or "").lower()
+    if re.search(r"\b(latest|current|today|now|terkini|terbaru|paling\s+baru|sekarang)\b", q):
+        return "latest", today
+    m = re.search(r"\b(per|as of|per\s*tanggal|per\s*tgl)\b", q)
+    if m:
+        window = q[m.end():m.end()+50]
+        dt = parse_date_any(window)
+        if dt:
+            return "as_of", dt
+    dt2 = parse_date_any(q)
+    if dt2:
+        return "as_of", dt2
+    return "latest", today
+
+def extract_uu_number_from_text(text: Optional[str]) -> Optional[str]:
+    if not text: return None
+    m = re.search(r"\buu\s*([0-9]{1,4}\s*/\s*[0-9]{4})\b", text.lower().replace("-", " "))
+    if m:
+        return m.group(1).replace(" ", "")
+    m2 = re.search(r"(?:undang[- ]?undang|uu)\s*(?:nomor|no\.?)\s*([0-9]{1,4})\s*(?:tahun)\s*([0-9]{4})", text.lower())
+    if m2:
+        return f"{m2.group(1)}/{m2.group(2)}"
+    return None
+
+# ----------------- Safe LLM helpers (with indefinite retry) -----------------
 def get_finish_info(resp) -> Dict[str, Any]:
     info = {}
     try:
@@ -285,6 +367,19 @@ def extract_text_from_response(resp) -> Optional[str]:
         pass
     return None
 
+def _rand_wait_seconds() -> float:
+    # Using the same backoff window as your original embed retry
+    return random.uniform(80.0, 120.0)
+
+def _api_call_with_retry(func, *args, **kwargs):
+    while True:
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            wait_s = _rand_wait_seconds()
+            log(f"[Retry] API call failed: {e}. Retrying in {wait_s:.1f}s.", level="WARN")
+            time.sleep(wait_s)
+
 def safe_generate_json(prompt: str, schema: Dict[str, Any], temp: float = 0.0) -> Dict[str, Any]:
     cfg = GenerationConfig(
         temperature=temp,
@@ -292,6 +387,7 @@ def safe_generate_json(prompt: str, schema: Dict[str, Any], temp: float = 0.0) -
         response_schema=schema,
     )
     t0 = now_ms()
+    # Indefinite retry on errors
     resp = _api_call_with_retry(gen_model.generate_content, prompt, generation_config=cfg)
     log(f"[LLM JSON] call completed in {dur_ms(t0):.0f} ms", level="DEBUG")
     try:
@@ -300,7 +396,7 @@ def safe_generate_json(prompt: str, schema: Dict[str, Any], temp: float = 0.0) -
     except Exception:
         pass
     try:
-        raw = resp.candidates[0].content.parts[0].text
+        raw = resp.candidates[0].content.parts[0].text  # type: ignore[attr-defined]
         return json.loads(raw)
     except Exception as e:
         info = get_finish_info(resp)
@@ -313,6 +409,7 @@ def safe_generate_json(prompt: str, schema: Dict[str, Any], temp: float = 0.0) -
 def safe_generate_text(prompt: str, max_tokens: int, temperature: float = 0.2) -> str:
     cfg = GenerationConfig(temperature=temperature, max_output_tokens=max_tokens)
     t0 = now_ms()
+    # Indefinite retry on errors
     resp = _api_call_with_retry(gen_model.generate_content, prompt, generation_config=cfg)
     took = dur_ms(t0)
     text = extract_text_from_response(resp)
@@ -342,7 +439,7 @@ QUERY_SCHEMA = {
         "type": "object",
         "properties": {
           "text": {"type": "string"},
-          "type": {"type": "string"}   # Indonesian type if known, else ""
+          "type": {"type": "string"}
         },
         "required": ["text"]
       }
@@ -381,7 +478,7 @@ User question:
     log(f"[Agent 1] Output: entities={ [e.get('text') for e in data['entities']] }, predicates={ data['predicates'] } | {took:.0f} ms")
     return data
 
-# ----------------- Agent 1b: triple extraction from query -----------------
+# ----------------- Agent 1b: query triple extraction -----------------
 QUERY_TRIPLES_SCHEMA = {
     "type": "object",
     "properties": {
@@ -390,23 +487,9 @@ QUERY_TRIPLES_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "subject": {
-                        "type": "object",
-                        "properties": {
-                            "text": {"type": "string"},
-                            "type": {"type": "string"}
-                        },
-                        "required": ["text"]
-                    },
+                    "subject": {"type": "object","properties":{"text":{"type":"string"},"type":{"type":"string"}},"required":["text"]},
                     "predicate": {"type": "string"},
-                    "object": {
-                        "type": "object",
-                        "properties": {
-                            "text": {"type": "string"},
-                            "type": {"type": "string"}
-                        },
-                        "required": ["text"]
-                    }
+                    "object": {"type": "object","properties":{"text":{"type":"string"},"type":{"type":"string"}},"required":["text"]}
                 },
                 "required": ["subject", "predicate", "object"]
             }
@@ -438,7 +521,6 @@ User question:
     t0 = now_ms()
     out = safe_generate_json(prompt, QUERY_TRIPLES_SCHEMA, temp=0.0)
     triples = out.get("triples", []) if isinstance(out, dict) else []
-    # sanitize minimal fields
     clean: List[Dict[str, Any]] = []
     for t in triples:
         try:
@@ -493,14 +575,9 @@ def _summarize_params(params: Dict[str, Any]) -> str:
     return ", ".join(parts)
 
 def run_cypher_with_retry(cypher: str, params: Dict[str, Any]) -> List[Any]:
-    """
-    Execute a Cypher query with bounded retries on error.
-    Logs attempt start, success, and failure with timestamps, PID, and durations.
-    """
     attempts = 0
     last_e: Optional[Exception] = None
     qid = _next_query_id()
-    # compact one-line preview of cypher
     preview = " ".join((cypher or "").split())
     if len(preview) > 220:
         preview = preview[:220] + "..."
@@ -540,7 +617,7 @@ def _vector_query_nodes(index_name: str, q_emb: List[float], k: int) -> List[Dic
         n = r["n"]
         rows.append({
             "key": n.get("key"),
-            "elem_id": r["elem_id"],  # NEW
+            "elem_id": r["elem_id"],
             "name": n.get("name"),
             "type": n.get("type"),
             "score": r["score"],
@@ -564,7 +641,6 @@ def search_similar_entities_by_embedding(q_emb: List[float], k: int) -> List[Dic
 
     best: Dict[str, Dict[str, Any]] = {}
     for row in candidates:
-        # Prefer elementId if present, else fall back to key+type
         dedup_key = row.get("elem_id") or f"{row.get('key')}|{row.get('type')}"
         if dedup_key not in best or (row.get("score", -1) > best[dedup_key].get("score", -1)):
             best[dedup_key] = row
@@ -574,9 +650,6 @@ def search_similar_entities_by_embedding(q_emb: List[float], k: int) -> List[Dic
     return merged[:k]
 
 def search_similar_triples_by_embedding(q_emb: List[float], k: int) -> List[Dict[str, Any]]:
-    """
-    Query triple_vec; return dict rows with triple + subject/object if available.
-    """
     q_emb = _as_float_list(q_emb)
     cypher = """
     CALL db.index.vector.queryNodes('triple_vec', $k, $q_emb) YIELD node AS tr, score
@@ -609,44 +682,63 @@ def search_similar_triples_by_embedding(q_emb: List[float], k: int) -> List[Dict
         })
     return rows
 
-# ----------------- Graph expansion (as in LexID) -----------------
+# ----------------- Graph expansion (predicate and node-type filters supported) -----------------
 def expand_from_entities(
     entity_keys: List[str],
     hops: int,
     per_hop_limit: int,
-    entity_elem_ids: Optional[List[str]] = None  # NEW: optional fast-path by id
+    entity_elem_ids: Optional[List[str]] = None,
+    allowed_predicates: Optional[List[str]] = None,
+    allowed_node_types: Optional[List[str]] = None
 ) -> List[Dict[str, Any]]:
+    """
+    Expand outward and collect triples. Apply filters:
+      - allowed_predicates: only include triples whose Triple.predicate is in list
+      - allowed_node_types: only include triples where subject.type or object.type is in list
+    Note: We seed next-hop only from triples that pass filters to constrain expansion when filters are used.
+    """
     triples: Dict[str, Dict[str, Any]] = {}
     current_ids: Set[str] = set(x for x in (entity_elem_ids or []) if x)
     current_keys: Set[str] = set(x for x in (entity_keys or []) if x)
+
+    where_pred = ""
+    params_extra: Dict[str, Any] = {}
+    # We can pre-filter on predicate in Cypher to reduce volume when allowed_predicates provided
+    if allowed_predicates:
+        where_pred = " AND r.predicate IN $allowed_preds "
+        params_extra["allowed_preds"] = [normalize_predicate_for_test(p) for p in allowed_predicates]
+
+    allowed_types_set: Optional[Set[str]] = set(allowed_node_types) if allowed_node_types else None
 
     for _ in range(hops):
         if not current_ids and not current_keys:
             break
 
         if current_ids:
-            cypher = """
+            cypher = f"""
             UNWIND $ids AS eid
             MATCH (e) WHERE elementId(e) = eid
             MATCH (e)-[r:PREDICATE]->()
+            WHERE 1=1 {where_pred}
             WITH DISTINCT r.triple_uid AS uid LIMIT $limit
-            MATCH (tr:Triple {triple_uid: uid})
+            MATCH (tr:Triple {{triple_uid: uid}})
             OPTIONAL MATCH (tr)-[:SUBJECT]->(s)
             OPTIONAL MATCH (tr)-[:OBJECT]->(o)
             RETURN tr, s, o, elementId(s) AS s_id, elementId(o) AS o_id
             """
-            params = {"ids": list(current_ids), "limit": per_hop_limit}
+            params = {"ids": list(current_ids), "limit": per_hop_limit, **params_extra}
         else:
-            cypher = """
+            cypher = f"""
             UNWIND $keys AS k
-            MATCH (e:Entity {key:k})-[r:PREDICATE]->()
+            MATCH (e:Entity {{key:k}})-[r:PREDICATE]->()
+            WHERE 1=1 {where_pred}
             WITH DISTINCT r.triple_uid AS uid LIMIT $limit
-            MATCH (tr:Triple {triple_uid: uid})
+            MATCH (tr:Triple {{triple_uid: uid}})
             OPTIONAL MATCH (tr)-[:SUBJECT]->(s)
             OPTIONAL MATCH (tr)-[:OBJECT]->(o)
             RETURN tr, s, o, elementId(s) AS s_id, elementId(o) AS o_id
             """
-            params = {"keys": list(current_keys), "limit": per_hop_limit}
+            params = {"keys": list(current_keys), "limit": per_hop_limit, **params_extra}
 
         res = run_cypher_with_retry(cypher, params)
 
@@ -655,33 +747,42 @@ def expand_from_entities(
         for r in res:
             tr = r["tr"]; s = r["s"]; o = r["o"]
             uid = tr.get("triple_uid")
-            if uid not in triples:
-                triples[uid] = {
-                    "triple_uid": uid,
-                    "predicate": tr.get("predicate"),
-                    "uu_number": tr.get("uu_number"),
-                    "evidence_quote": tr.get("evidence_quote"),
-                    "embedding": tr.get("embedding"),
-                    "document_id": tr.get("document_id"),
-                    "chunk_id": tr.get("chunk_id"),
-                    "evidence_article_ref": tr.get("evidence_article_ref"),
-                    "subject": s.get("name") if s else None,
-                    "subject_key": s.get("key") if s else None,
-                    "subject_type": s.get("type") if s else None,
-                    "object": o.get("name") if o else None,
-                    "object_key": o.get("key") if o else None,
-                    "object_type": o.get("type") if o else None,
-                }
-            # Seed next hop by both ids and keys if available
-            if s:
-                if s.get("key"): next_keys.add(s.get("key"))
-            if o:
-                if o.get("key"): next_keys.add(o.get("key"))
-            s_id = r.get("s_id");  o_id = r.get("o_id")
-            if s_id: next_ids.add(s_id)
-            if o_id: next_ids.add(o_id)
+            pred = normalize_predicate_for_test(tr.get("predicate"))
+            s_type = s.get("type") if s else None
+            o_type = o.get("type") if o else None
 
-        # Prefer id-based expansion when available
+            keep = True
+            if allowed_types_set is not None:
+                keep = ((s_type in allowed_types_set) or (o_type in allowed_types_set))
+            # allowed_predicates was already applied in Cypher WHERE, but we guard as well
+            if allowed_predicates is not None and pred not in [normalize_predicate_for_test(p) for p in allowed_predicates]:
+                keep = False
+
+            if keep:
+                if uid not in triples:
+                    triples[uid] = {
+                        "triple_uid": uid,
+                        "predicate": tr.get("predicate"),
+                        "uu_number": tr.get("uu_number"),
+                        "evidence_quote": tr.get("evidence_quote"),
+                        "embedding": tr.get("embedding"),
+                        "document_id": tr.get("document_id"),
+                        "chunk_id": tr.get("chunk_id"),
+                        "evidence_article_ref": tr.get("evidence_article_ref"),
+                        "subject": s.get("name") if s else None,
+                        "subject_key": s.get("key") if s else None,
+                        "subject_type": s.get("type") if s else None,
+                        "object": o.get("name") if o else None,
+                        "object_key": o.get("key") if o else None,
+                        "object_type": o.get("type") if o else None,
+                    }
+                # Seed next hop only from kept triples to constrain expansion when filters are active
+                if s and s.get("key"): next_keys.add(s.get("key"))
+                if o and o.get("key"): next_keys.add(o.get("key"))
+                s_id = r.get("s_id");  o_id = r.get("o_id")
+                if s_id: next_ids.add(s_id)
+                if o_id: next_ids.add(o_id)
+
         current_ids = next_ids if next_ids else set()
         current_keys = set() if next_ids else next_keys
 
@@ -692,9 +793,7 @@ class ChunkStore:
     def __init__(self, root: Path, skip: Set[str]):
         self.root = root
         self.skip = skip
-        # Primary index: (doc_id, chunk_id) -> text
         self._index: Dict[Tuple[str, str], str] = {}
-        # Secondary index: chunk_id -> list of (doc_id, chunk_id)
         self._by_chunk: Dict[str, List[Tuple[str, str]]] = {}
         self._loaded_files: Set[Path] = set()
         self._built = False
@@ -711,19 +810,16 @@ class ChunkStore:
             try:
                 with open(pkl, "rb") as f:
                     chunks = pickle.load(f)
-
                 loaded_count = 0
                 for ch in chunks:
                     meta = getattr(ch, "metadata", {}) if hasattr(ch, "metadata") else {}
                     doc_id = _norm_id(meta.get("document_id"))
                     chunk_id = _norm_id(meta.get("chunk_id"))
                     text = getattr(ch, "page_content", None)
-
                     if doc_id and chunk_id and isinstance(text, str):
                         self._index[(doc_id, chunk_id)] = text
                         self._by_chunk.setdefault(chunk_id, []).append((doc_id, chunk_id))
                         loaded_count += 1
-
                 self._loaded_files.add(pkl)
                 total_chunks_indexed += loaded_count
                 log(f"[ChunkStore] Loaded {loaded_count} chunks from {pkl.name}")
@@ -738,25 +834,18 @@ class ChunkStore:
     def get_chunk(self, document_id: Any, chunk_id: Any) -> Optional[str]:
         if not self._built:
             self._build_index()
-
         doc_id_s = _norm_id(document_id)
         chunk_id_s = _norm_id(chunk_id)
-
-        # 1) Exact match
         val = self._index.get((doc_id_s, chunk_id_s))
         if val is not None:
             log(f"[ChunkStore] HIT exact: doc={doc_id_s} chunk={chunk_id_s} len={len(val)}")
             return val
-
-        # 2) Strip ::part suffix if present and try exact again
         if "::" in chunk_id_s:
             base_id = chunk_id_s.split("::", 1)[0]
             val = self._index.get((doc_id_s, base_id))
             if val is not None:
                 log(f"[ChunkStore] HIT base-id: doc={doc_id_s} chunk={chunk_id_s} -> base={base_id} len={len(val)}")
                 return val
-
-        # 3) Fallback by chunk_id only (rescue doc_id mismatches)
         matches = self._by_chunk.get(chunk_id_s)
         if matches:
             chosen_doc, chosen_chunk = matches[0]
@@ -765,7 +854,6 @@ class ChunkStore:
                 note = "" if len(matches) == 1 else f" (warn: chunk_id occurs in {len(matches)} docs; chose doc={chosen_doc})"
                 log(f"[ChunkStore] HIT by chunk_id only: requested doc={doc_id_s} chunk={chunk_id_s}; using doc={chosen_doc}{note}. len={len(val)}")
                 return val
-
         log(f"[ChunkStore] MISS: doc={doc_id_s} chunk={chunk_id_s} (no exact/base-id/chunk-id-only match)")
         return None
 
@@ -780,7 +868,7 @@ def mean_similarity_to_query_triples(triple_emb: Optional[List[float]], q_trip_e
         return 0.0
     return sum(sims) / len(sims)
 
-# ----------------- New retrieval pipeline pieces -----------------
+# ----------------- Core retrieval: entity- and triple-centric -----------------
 def entity_centric_retrieval(
     query_entities: List[Dict[str, Any]],
     q_trip_embs: List[List[float]],
@@ -788,7 +876,6 @@ def entity_centric_retrieval(
 ) -> List[Dict[str, Any]]:
     all_matched_keys: Set[str] = set()
     all_matched_ids: Set[str] = set()
-
     for e in query_entities:
         text = (e.get("text") or "").strip()
         if not text:
@@ -801,8 +888,7 @@ def entity_centric_retrieval(
         matches = search_similar_entities_by_embedding(e_emb, k=ENTITY_MATCH_TOP_K)
         keys = [m.get("key") for m in matches if m.get("key")]
         ids  = [m.get("elem_id") for m in matches if m.get("elem_id")]
-        all_matched_keys.update(keys)
-        all_matched_ids.update(ids)
+        all_matched_keys.update(keys); all_matched_ids.update(ids)
 
     if not (all_matched_keys or all_matched_ids):
         log("[EntityRetrieval] No KG entity matches found from query entities.")
@@ -816,7 +902,6 @@ def entity_centric_retrieval(
         entity_elem_ids=list(all_matched_ids) if all_matched_ids else None
     )
     log(f"[EntityRetrieval] Expanded subgraph triples: {len(expanded_triples)} | {dur_ms(t0):.0f} ms")
-
     if not expanded_triples:
         return []
 
@@ -834,12 +919,6 @@ def entity_centric_retrieval(
     return top
 
 def triple_centric_retrieval(query_triples: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[List[float]]]:
-    """
-    For each extracted query triple:
-      - embed "s [p] o"
-      - search top-K similar KG triples
-    Return merged, deduped triples and the list of query triple embeddings used.
-    """
     triples_map: Dict[str, Dict[str, Any]] = {}
     q_trip_embs: List[List[float]] = []
     for qt in query_triples:
@@ -850,37 +929,135 @@ def triple_centric_retrieval(query_triples: List[Dict[str, Any]]) -> Tuple[List[
         except Exception as ex:
             log(f"[TripleRetrieval] Embedding failed for query triple '{qt}': {ex}", level="WARN")
             continue
-
         matches = search_similar_triples_by_embedding(emb, k=QUERY_TRIPLE_MATCH_TOP_K_PER)
         for m in matches:
             uid = m.get("triple_uid")
             if uid:
-                if uid not in triples_map:
+                if uid not in triples_map or (m.get("score", 0.0) > triples_map[uid].get("score", 0.0)):
                     triples_map[uid] = m
-                else:
-                    if m.get("score", 0.0) > triples_map[uid].get("score", 0.0):
-                        triples_map[uid] = m
-
     merged = list(triples_map.values())
     log(f"[TripleRetrieval] Collected {len(merged)} unique KG triples across {len(q_trip_embs)} query triple(s)")
     return merged, q_trip_embs
 
+# ----------------- Version-aware retrieval (Branch B): predicate + node-type driven -----------------
+def mod_centric_retrieval(
+    query_entities: List[Dict[str, Any]],
+    query_triples: List[Dict[str, Any]],
+    q_trip_embs_existing: List[List[float]],
+    q_emb_fallback: Optional[List[float]] = None
+) -> Tuple[List[Dict[str, Any]], List[List[float]], Dict[str, int]]:
+    """
+    Returns (merged_mod_triples, all_q_trip_embs_used_for_mod, counters).
+    Combines:
+      B1 (predicate-driven):
+        - triple-centric filter by VERSION_PREDICATES_ALLOWED
+        - entity-centric expansion constrained by allowed predicates
+      B2 (node-type–driven):
+        - triple-centric: subject_type/object_type in MOD_NODE_TYPES
+        - entity-centric expansion constrained by node types
+    """
+    counters = {"B1_triple":0, "B1_entity":0, "B2_triple":0, "B2_entity":0}
+    mod_map: Dict[str, Dict[str, Any]] = {}
+    q_embs: List[List[float]] = list(q_trip_embs_existing)
+
+    # Helper to add if better
+    def _add(m: Dict[str, Any]):
+        uid = m.get("triple_uid")
+        if not uid:
+            return
+        if uid not in mod_map or (m.get("score", 0.0) > mod_map[uid].get("score", 0.0)):
+            mod_map[uid] = m
+
+    # B1a: Predicate-driven triple-centric
+    for qt in query_triples:
+        try:
+            txt = query_triple_to_text(qt)
+            emb = embed_text(txt)
+            q_embs.append(emb)
+        except Exception as ex:
+            log(f"[ModRetrieval:B1a] Embedding failed for query triple '{qt}': {ex}", level="WARN")
+            continue
+        matches = search_similar_triples_by_embedding(emb, k=QUERY_TRIPLE_MATCH_TOP_K_PER * 2)
+        hit = 0
+        for m in matches:
+            pred = normalize_predicate_for_test(m.get("predicate"))
+            if pred in VERSION_PREDICATES_ALLOWED:
+                _add(m); hit += 1
+        counters["B1_triple"] += hit
+
+    # B1b: Predicate-driven entity-centric expansion
+    all_matched_keys: Set[str] = set(); all_matched_ids: Set[str] = set()
+    for e in query_entities:
+        text = (e.get("text") or "").strip()
+        if not text:
+            continue
+        try:
+            e_emb = embed_text(text)
+        except Exception as ex:
+            log(f"[ModRetrieval:B1b] Embedding failed for entity '{text}': {ex}", level="WARN")
+            continue
+        matches = search_similar_entities_by_embedding(e_emb, k=ENTITY_MATCH_TOP_K)
+        for m in matches:
+            if m.get("key"): all_matched_keys.add(m.get("key"))
+            if m.get("elem_id"): all_matched_ids.add(m.get("elem_id"))
+    if all_matched_keys or all_matched_ids:
+        expanded = expand_from_entities(
+            list(all_matched_keys),
+            hops=ENTITY_SUBGRAPH_HOPS,
+            per_hop_limit=ENTITY_SUBGRAPH_PER_HOP_LIMIT,
+            entity_elem_ids=list(all_matched_ids) if all_matched_ids else None,
+            allowed_predicates=list(VERSION_PREDICATES_ALLOWED),
+            allowed_node_types=None
+        )
+        for m in expanded:
+            _add(m)
+        counters["B1_entity"] += len(expanded)
+
+    # B2a: Node-type–driven triple-centric
+    for qt in query_triples:
+        try:
+            txt = query_triple_to_text(qt)
+            emb = embed_text(txt)
+            q_embs.append(emb)
+        except Exception as ex:
+            log(f"[ModRetrieval:B2a] Embedding failed for query triple '{qt}': {ex}", level="WARN")
+            continue
+        matches = search_similar_triples_by_embedding(emb, k=QUERY_TRIPLE_MATCH_TOP_K_PER * 2)
+        hit = 0
+        for m in matches:
+            st = m.get("subject_type")
+            ot = m.get("object_type")
+            if (st in MOD_NODE_TYPES) or (ot in MOD_NODE_TYPES):
+                _add(m); hit += 1
+        counters["B2_triple"] += hit
+
+    # B2b: Node-type–driven entity-centric expansion
+    if all_matched_keys or all_matched_ids:
+        expanded_nt = expand_from_entities(
+            list(all_matched_keys),
+            hops=ENTITY_SUBGRAPH_HOPS,
+            per_hop_limit=ENTITY_SUBGRAPH_PER_HOP_LIMIT,
+            entity_elem_ids=list(all_matched_ids) if all_matched_ids else None,
+            allowed_predicates=None,
+            allowed_node_types=list(MOD_NODE_TYPES)
+        )
+        for m in expanded_nt:
+            _add(m)
+        counters["B2_entity"] += len(expanded_nt)
+
+    merged_mod = list(mod_map.values())
+    log(f"[ModRetrieval] Combined mod triples: {len(merged_mod)} | counters={counters}")
+    return merged_mod, q_embs, counters
+
+# ----------------- Collect chunks -----------------
 def collect_chunks_for_triples(
     triples: List[Dict[str, Any]],
     chunk_store: ChunkStore
 ) -> List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]]:
-    """
-    From triples, gather unique (doc_id, chunk_id) and load texts.
-    Returns list of (key_pair, text, triple) for each chunk instance.
-    Adds t['_is_quote_fallback']=True when we have to fall back.
-    """
     seen_pairs: Set[Tuple[Any, Any]] = set()
     out: List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]] = []
-
     for t in triples:
-        doc_id = t.get("document_id")
-        chunk_id = t.get("chunk_id")
-
+        doc_id = t.get("document_id"); chunk_id = t.get("chunk_id")
         if doc_id is None or chunk_id is None:
             quote = t.get("evidence_quote")
             if quote:
@@ -890,12 +1067,9 @@ def collect_chunks_for_triples(
                     out.append((key, quote, t))
                     seen_pairs.add(key)
             continue
-
-        # Use normalized key for dedupe
         norm_key = (_norm_id(doc_id), _norm_id(chunk_id))
         if norm_key in seen_pairs:
             continue
-
         text = chunk_store.get_chunk(doc_id, chunk_id)
         if text:
             t["_is_quote_fallback"] = False
@@ -910,19 +1084,142 @@ def collect_chunks_for_triples(
                     log(f"[ChunkStore] FALLBACK to quote for doc={_norm_id(doc_id)} chunk={_norm_id(chunk_id)}", level="WARN")
                     out.append((key2, quote, t))
                     seen_pairs.add(key2)
-
     return out
+
+# ----------------- Temporal resolver -----------------
+def _triple_effective_date_guess(t: Dict[str, Any]) -> Optional[datetime.date]:
+    for field in [t.get("evidence_quote"), t.get("evidence_article_ref"), t.get("object"), t.get("subject")]:
+        if isinstance(field, str):
+            dt = parse_date_any(field)
+            if dt:
+                return dt
+    uu = (t.get("uu_number") or "").strip()
+    m = re.match(r"(\d{1,4})/(\d{4})", uu)
+    if m:
+        try:
+            return datetime.date(int(m.group(2)), 1, 1)
+        except Exception:
+            return None
+    return None
+
+def build_version_index(mod_triples: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Lightweight version index keyed by UU number 'X/YYYY'.
+    Only explicit doc-level amend/repeal predicates influence status.
+    """
+    index: Dict[str, Dict[str, Any]] = {}
+    def _uu_bucket(u: Optional[str]) -> Optional[str]:
+        if not u: return None
+        return u.replace(" ", "")
+
+    for t in mod_triples:
+        pred = normalize_predicate_for_test(t.get("predicate"))
+        subj_uu = extract_uu_number_from_text(t.get("subject") or "")
+        obj_uu  = extract_uu_number_from_text(t.get("object") or "")
+        triple_doc_uu = (t.get("uu_number") or "").strip() or None
+        eff_date = _triple_effective_date_guess(t)
+
+        if pred in {"amends", "mengubah", "diubah"}:
+            amender = _uu_bucket(subj_uu or triple_doc_uu)
+            amended = _uu_bucket(obj_uu)
+            if amended and amender:
+                d = index.setdefault(amended, {"amended_by": [], "repealed_by": []})
+                d["amended_by"].append({"uu": amender, "date": eff_date, "triple_uid": t.get("triple_uid")})
+        elif pred in {"repeals", "mencabut", "dicabut", "tidak_berlaku"}:
+            repealer = _uu_bucket(subj_uu or triple_doc_uu)
+            repealed = _uu_bucket(obj_uu)
+            if repealed and repealer:
+                d = index.setdefault(repealed, {"amended_by": [], "repealed_by": []})
+                d["repealed_by"].append({"uu": repealer, "date": eff_date, "triple_uid": t.get("triple_uid")})
+        else:
+            # Node-type–driven content changes are not treated as full doc repeal/amend without explicit doc-level links
+            pass
+    return index
+
+def resolve_doc_status(uu: str, idx: Dict[str, Dict[str, Any]], as_of_date: datetime.date) -> Dict[str, Any]:
+    info = idx.get(uu, {"amended_by": [], "repealed_by": []})
+    rep_candidates = [e for e in info.get("repealed_by", []) if e.get("date") is None or e["date"] <= as_of_date]
+    repealed = None
+    if rep_candidates:
+        repealed = sorted(rep_candidates, key=lambda x: (x["date"] or datetime.date.min))[0]
+    latest_amend = None
+    if not repealed:
+        amend_candidates = [e for e in info.get("amended_by", []) if e.get("date") is None or e["date"] <= as_of_date]
+        if amend_candidates:
+            latest_amend = sorted(amend_candidates, key=lambda x: (x["date"] or datetime.date.min))[-1]
+    return {
+        "uu": uu,
+        "is_repealed": repealed is not None,
+        "repealed_by": repealed,
+        "latest_amended_by": latest_amend
+    }
+
+def summarize_lineage_for_docs(target_uu_list: List[str], idx: Dict[str, Dict[str, Any]], as_of_date: datetime.date, lang: str) -> str:
+    lines: List[str] = []
+    for uu in sorted(set([u for u in target_uu_list if u])):
+        status = resolve_doc_status(uu, idx, as_of_date)
+        if status["is_repealed"]:
+            rb = status["repealed_by"]
+            when = rb.get("date").strftime("%d-%m-%Y") if rb and rb.get("date") else "tanggal tidak jelas"
+            line = f"UU {uu} telah dicabut oleh UU {rb.get('uu')} (efektif {when})."
+        else:
+            am = status["latest_amended_by"]
+            if am:
+                when = am.get("date").strftime("%d-%m-%Y") if am and am.get("date") else "tanggal tidak jelas"
+                line = f"UU {uu} (versi berlaku) terakhir diubah oleh UU {am.get('uu')} (efektif {when})."
+            else:
+                line = f"UU {uu} (tidak terdeteksi perubahan atau pencabutan hingga tanggal acuan)."
+        lines.append(line)
+    if not lines:
+        return "(Tidak ada garis keturunan versi yang relevan terdeteksi.)" if lang == "id" else "(No relevant version lineage detected.)"
+    return " ".join(lines)
+
+# ----------------- Temporal-aware filtering and reweighting -----------------
+def temporal_filter_and_weight_chunks(
+    chunk_records: List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]],
+    version_index: Dict[str, Dict[str, Any]],
+    as_of_date: datetime.date,
+    exclude_repealed: bool = True
+) -> Tuple[List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]], List[Tuple[Tuple[Any, Any], str, Dict[str, Any], str]]]:
+    kept: List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]] = []
+    excluded: List[Tuple[Tuple[Any, Any], str, Dict[str, Any], str]] = []
+    for rec in chunk_records:
+        key, text, t = rec
+        pred = normalize_predicate_for_test(t.get("predicate"))
+        uu = (t.get("uu_number") or "").strip()
+        if not uu:
+            kept.append(rec)
+            continue
+        status = resolve_doc_status(uu, version_index, as_of_date)
+        if exclude_repealed and status["is_repealed"]:
+            if pred in VERSION_PREDICATES_ALLOWED or (t.get("subject_type") in MOD_NODE_TYPES) or (t.get("object_type") in MOD_NODE_TYPES):
+                kept.append(rec)
+            else:
+                excluded.append((key, text, t, f"Excluded repealed UU {uu} as of {as_of_date.isoformat()}"))
+        else:
+            kept.append(rec)
+    return kept, excluded
+
+def temporal_reweight_chunk_score(base_score: float, t: Dict[str, Any], version_index: Dict[str, Dict[str, Any]], as_of_date: datetime.date) -> float:
+    uu = (t.get("uu_number") or "").strip()
+    if not uu:
+        return base_score
+    status = resolve_doc_status(uu, version_index, as_of_date)
+    score = base_score
+    if status["is_repealed"]:
+        score -= TEMPORAL_DOWNWEIGHT_SUPERSEDED
+    else:
+        if status["latest_amended_by"]:
+            score += TEMPORAL_BOOST_FOR_CURRENT
+    return score
 
 def rerank_chunks_by_query(
     chunk_records: List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]],
     q_emb_query: List[float],
-    top_k: int
+    top_k: int,
+    version_index: Optional[Dict[str, Dict[str, Any]]] = None,
+    as_of_date: Optional[datetime.date] = None
 ) -> List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]]:
-    """
-    Embed chunk texts and score similarity to whole user query.
-    Returns list of records augmented with score, sorted desc.
-    """
-    # Optionally cap to limit embedding cost
     cand = chunk_records[:CHUNK_RERANK_CAND_LIMIT]
     t0 = now_ms()
     scored: List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]] = []
@@ -930,6 +1227,8 @@ def rerank_chunks_by_query(
         try:
             emb = embed_text(text)
             s = cos_sim(q_emb_query, emb)
+            if version_index is not None and as_of_date is not None:
+                s = temporal_reweight_chunk_score(s, t, version_index, as_of_date)
             scored.append((key, text, t, s))
         except Exception as ex:
             log(f"[ChunkRerank] Embedding failed for chunk {key}: {ex}", level="WARN")
@@ -945,10 +1244,6 @@ def rerank_triples_by_query_triples(
     q_emb_fallback: Optional[List[float]],
     top_k: int
 ) -> List[Dict[str, Any]]:
-    """
-    Sort triples by mean similarity to all query triple embeddings.
-    If no query triple embeddings, fallback to whole-query embedding similarity.
-    """
     t0 = now_ms()
     def score(t: Dict[str, Any]) -> float:
         emb = t.get("embedding")
@@ -957,22 +1252,17 @@ def rerank_triples_by_query_triples(
         if q_emb_fallback and isinstance(emb, list):
             return cos_sim(q_emb_fallback, emb)
         return 0.0
-
     ranked = sorted(triples, key=score, reverse=True)
     took = dur_ms(t0)
     log(f"[TripleRerank] Input={len(triples)} | Output={min(top_k, len(ranked))} | {took:.0f} ms")
     return ranked[:top_k]
 
+# ----------------- Build combined context and lineage -----------------
 def build_combined_context_text(
     triples_ranked: List[Dict[str, Any]],
-    chunks_ranked: List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]]
+    chunks_ranked: List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]],
+    version_lineage_summary: str
 ) -> Tuple[str, str, List[Dict[str, Any]]]:
-    """
-    Create a readable context text with:
-      - Triple summary (top up to 50)
-      - Selected chunk texts (annotate when quote fallback is used)
-    Returns (context_text, summary_text, list_of_chunk_records_dict)
-    """
     summary_lines = []
     summary_lines.append("Ringkasan triple yang relevan:")
     for t in triples_ranked[:min(50, len(triples_ranked))]:
@@ -983,7 +1273,12 @@ def build_combined_context_text(
         summary_lines.append(f"- {s} [{p}] {o} | {uu} | {art} | bukti: {quote}")
     summary_text = "\n".join(summary_lines)
 
-    lines = [summary_text, "\nPotongan teks terkait (chunk):"]
+    lines = []
+    lines.append("Version lineage (ringkas):")
+    lines.append(version_lineage_summary.strip() or "(n/a)")
+    lines.append("")
+    lines.append(summary_text)
+    lines.append("\nPotongan teks terkait (chunk):")
     for idx, (key, text, t, score) in enumerate(chunks_ranked, start=1):
         doc_id = t.get("document_id")
         chunk_id = t.get("chunk_id")
@@ -995,15 +1290,26 @@ def build_combined_context_text(
     chunk_records = [{"key": key, "text": text, "triple": t, "score": score} for key, text, t, score in chunks_ranked]
     return context, summary_text, chunk_records
 
-# ----------------- Agent 2 (Intermediate answer) -----------------
-def agent2_answer(query_original: str, context: str, guidance: Optional[str], output_lang: str = "id") -> str:
+# ----------------- Agent 2 (Answerer) -----------------
+def agent2_answer(
+    query_original: str,
+    context: str,
+    guidance: Optional[str],
+    output_lang: str,
+    as_of_date: datetime.date,
+    version_lineage_summary: str
+) -> str:
     instructions = (
         "Answer concisely and accurately based strictly on the provided context. "
+        "Use the version of the law that is effective as of the specified date. "
+        "If newer amending or repealing provisions exist as of that date, they take precedence over older text. "
+        "If the question is historical (as-of a past date), use the provisions effective on that date and note later changes if relevant. "
         "Cite UU/Article references when they are clear. "
         "Respond in the same language as the user's question."
     )
-
     guidance_text = guidance.strip() if isinstance(guidance, str) and guidance.strip() else "(No additional guidance from the Judge in the previous iteration.)"
+    as_of_line = f"As-of date: {as_of_date.strftime('%d-%m-%Y')}"
+    lineage_line = f"Version lineage (short): {version_lineage_summary}"
 
     prompt = f"""
 You are Agent 2 (Answerer). Task: provide an answer based on the context only.
@@ -1013,6 +1319,9 @@ Core instructions:
 
 Additional guidance from Judge (if any):
 \"\"\"{guidance_text}\"\"\"
+
+{as_of_line}
+{lineage_line}
 
 Original user question:
 \"\"\"{query_original}\"\"\"
@@ -1031,8 +1340,29 @@ Context:
     log(f"[Agent 2] Intermediate answer length={len(answer)} | {took:.0f} ms")
     return answer
 
+# ----------------- Embedding with indefinite retry -----------------
+def embed_text(text: str) -> List[float]:
+    t0 = now_ms()
+    res = _api_call_with_retry(genai.embed_content, model=EMBED_MODEL, content=text)
+    vec = None
+    if isinstance(res, dict):
+        emb = res.get("embedding")
+        if isinstance(emb, dict) and "values" in emb:
+            vec = emb["values"]
+        elif isinstance(emb, list):
+            vec = emb
+    if vec is None:
+        try:
+            vec = res.embedding.values  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    if vec is None:
+        raise RuntimeError("Unexpected embedding response shape for embeddings")
+    out = _as_float_list(vec)
+    log(f"[Embed] text_len={len(text)} -> vec_len={len(out)} | {dur_ms(t0):.0f} ms", level="DEBUG")
+    return out
 
-# ----------------- Single-pass GraphRAG with Agents 1 and 2 only -----------------
+# ----------------- Single-pass GraphRAG with Version-aware logic -----------------
 def agentic_graph_rag(query_original: str) -> Dict[str, Any]:
     global _LOGGER
     ts_name = make_timestamp_name()
@@ -1049,92 +1379,134 @@ def agentic_graph_rag(query_original: str) -> Dict[str, Any]:
             f"ENTITY_SUBGRAPH_PER_HOP_LIMIT={ENTITY_SUBGRAPH_PER_HOP_LIMIT}, SUBGRAPH_TRIPLES_TOP_K={SUBGRAPH_TRIPLES_TOP_K}, "
             f"QUERY_TRIPLE_MATCH_TOP_K_PER={QUERY_TRIPLE_MATCH_TOP_K_PER}, MAX_TRIPLES_FINAL={MAX_TRIPLES_FINAL}, "
             f"MAX_CHUNKS_FINAL={MAX_CHUNKS_FINAL}, CHUNK_RERANK_CAND_LIMIT={CHUNK_RERANK_CAND_LIMIT}, "
-            f"ANSWER_MAX_TOKENS={ANSWER_MAX_TOKENS}, MAX_ITERS={MAX_ITERS}, OUTPUT_LANG={OUTPUT_LANG}")
+            f"ANSWER_MAX_TOKENS={ANSWER_MAX_TOKENS}, MAX_ITERS={MAX_ITERS}, OUTPUT_LANG={OUTPUT_LANG}, "
+            f"VERSION_RESERVED_CHUNKS_MIN={VERSION_RESERVED_CHUNKS_MIN}, EXCLUDE_REPEALED_CONTENT={EXCLUDE_REPEALED_CONTENT}")
         log(f"Neo4j retry/timeout: NEO4J_MAX_ATTEMPTS={NEO4J_MAX_ATTEMPTS}, NEO4J_TX_TIMEOUT_S={NEO4J_TX_TIMEOUT_S:.1f}")
         log("Mode: Single-pass (Agents 1 & 2 only; no Judge, no iterations)")
 
         chunk_store = ChunkStore(LANGCHAIN_DIR, set(SKIP_FILES))
 
-        # Detect user language once
+        # Language detection
         user_lang = detect_user_language(query_original)
         log(f"[Language] Detected user language: {user_lang}")
 
-        # --- Single pass start ---
-        # Step 0: Embed whole user query (for chunk reranking and fallback)
+        # As-of parsing
+        version_intent, as_of_date = parse_as_of_intent(query_original)
+        log(f"[As-Of] Intent={version_intent} | as_of_date={as_of_date.isoformat()}")
+
+        # Step 0: Whole-query embedding
         t0 = now_ms()
         q_emb_query = embed_text(query_original)
-        t_embed = dur_ms(t0)
-        log(f"[Step 0] Whole-query embedding in {t_embed:.0f} ms")
+        log(f"[Step 0] Whole-query embedding in {dur_ms(t0):.0f} ms")
 
         # Step 1: Agent 1 – extract entities/predicates
         t1 = now_ms()
         extraction = agent1_extract_entities_predicates(query_original)
         ents = extraction.get("entities", [])
-        preds = extraction.get("predicates", [])
-        t_extract = dur_ms(t1)
-        log(f"[Step 1] Entity/Predicate extraction done in {t_extract:.0f} ms")
+        _ = extraction.get("predicates", [])
+        log(f"[Step 1] Entity/Predicate extraction done in {dur_ms(t1):.0f} ms")
 
-        # Step 1b: Agent 1b – extract triples from query
+        # Step 1b: extract query triples
         t1b = now_ms()
         query_triples = agent1b_extract_query_triples(query_original)
-        t_extract_tr = dur_ms(t1b)
-        log(f"[Step 1b] Query triple extraction done in {t_extract_tr:.0f} ms")
+        log(f"[Step 1b] Query triple extraction done in {dur_ms(t1b):.0f} ms")
 
-        # Step 2: Triple-centric retrieval (per query triple)
+        # Branch A: Core topical retrieval
         t2 = now_ms()
         ctx2_triples, q_trip_embs = triple_centric_retrieval(query_triples)
-        t_triple = dur_ms(t2)
-        log(f"[Step 2] Triple-centric retrieval in {t_triple:.0f} ms; ctx2_triples={len(ctx2_triples)}, q_trip_embs={len(q_trip_embs)}")
+        log(f"[Branch A] Triple-centric retrieval in {dur_ms(t2):.0f} ms; ctx2_triples={len(ctx2_triples)}, q_trip_embs={len(q_trip_embs)}")
 
-        # Step 3: Entity-centric retrieval (entity→KG entities→expand→triples scored vs query triples)
         t3 = now_ms()
         ctx1_triples = entity_centric_retrieval(ents, q_trip_embs=q_trip_embs, q_emb_fallback=q_emb_query)
-        t_entity = dur_ms(t3)
-        log(f"[Step 3] Entity-centric retrieval in {t_entity:.0f} ms; ctx1_triples={len(ctx1_triples)}")
+        log(f"[Branch A] Entity-centric retrieval in {dur_ms(t3):.0f} ms; ctx1_triples={len(ctx1_triples)}")
 
-        # Step 4: Merge contexts, dedupe triples
+        # Branch B: Version-aware retrieval (predicate + node-type)
+        t3b = now_ms()
+        mod_triples, q_trip_embs_mod, mod_counters = mod_centric_retrieval(ents, query_triples, q_trip_embs, q_emb_fallback=q_emb_query)
+        log(f"[Branch B] Version-aware retrieval in {dur_ms(t3b):.0f} ms; mod_triples={len(mod_triples)} | counters={mod_counters}")
+
+        # Build version index from mod_triples (doc-level status via explicit predicates)
+        version_index = build_version_index(mod_triples)
+
+        # Merge A + B triples
         t4 = now_ms()
         triple_map: Dict[str, Dict[str, Any]] = {}
-        for t in ctx1_triples + ctx2_triples:
+        for t in ctx1_triples + ctx2_triples + mod_triples:
             uid = t.get("triple_uid")
             if uid:
                 prev = triple_map.get(uid)
                 if prev is None or (t.get("score", 0.0) > prev.get("score", 0.0)):
                     triple_map[uid] = t
         merged_triples = list(triple_map.values())
-        t_merge = dur_ms(t4)
-        log(f"[Step 4] Merged triples from contexts: {len(merged_triples)} | {t_merge:.0f} ms")
+        log(f"[Step 4] Merged triples from branches: {len(merged_triples)} | {dur_ms(t4):.0f} ms")
 
-        # Step 5: Gather chunks from merged triples, dedupe, rerank by whole-query similarity
+        # Step 5: Gather chunks
         t5 = now_ms()
-        chunk_records = collect_chunks_for_triples(merged_triples, chunk_store)
-        log(f"[Step 5] Collected {len(chunk_records)} chunk candidates (pre-rerank)")
-        chunks_ranked = rerank_chunks_by_query(chunk_records, q_emb_query, top_k=MAX_CHUNKS_FINAL)
-        t_chunks = dur_ms(t5)
-        log(f"[Step 5] Chunk rerank done in {t_chunks:.0f} ms; selected {len(chunks_ranked)}")
+        all_chunk_records = collect_chunks_for_triples(merged_triples, chunk_store)
+        log(f"[Step 5] Collected {len(all_chunk_records)} chunk candidates (pre-temporal-filter)")
 
-        # Step 6: Rerank triples by mean similarity to query triples (fallback to query embedding)
+        # Temporal filter: exclude repealed content (except mod-evidence)
+        kept_chunks, excluded_chunks = temporal_filter_and_weight_chunks(
+            all_chunk_records, version_index, as_of_date, exclude_repealed=EXCLUDE_REPEALED_CONTENT
+        )
+        if excluded_chunks:
+            log("[Temporal] Excluded repealed-content chunks (kept out of final context):")
+            for (key, _text, t, reason) in excluded_chunks[:100]:
+                log(f"  - key={key} uu={t.get('uu_number')} pred={t.get('predicate')} reason={reason}")
+
+        # Reserve min version-lineage chunks from Branch B
+        mod_uids = {t.get("triple_uid") for t in mod_triples}
+        kept_mod_chunks = [rec for rec in kept_chunks if (rec[2].get("triple_uid") in mod_uids)]
+        kept_main_chunks = [rec for rec in kept_chunks if (rec[2].get("triple_uid") not in mod_uids)]
+        log(f"[Temporal] Kept chunks: total={len(kept_chunks)} | mod={len(kept_mod_chunks)} | main={len(kept_main_chunks)}")
+
+        # Rerank with temporal weights
+        chunks_ranked_mod = rerank_chunks_by_query(
+            kept_mod_chunks, q_emb_query, top_k=min(VERSION_RESERVED_CHUNKS_MIN, MAX_CHUNKS_FINAL),
+            version_index=version_index, as_of_date=as_of_date
+        )
+        chunks_ranked_main = rerank_chunks_by_query(
+            kept_main_chunks, q_emb_query,
+            top_k=max(1, MAX_CHUNKS_FINAL - min(VERSION_RESERVED_CHUNKS_MIN, len(kept_mod_chunks))),
+            version_index=version_index, as_of_date=as_of_date
+        )
+
+        final_chunks_ranked = (chunks_ranked_mod[:VERSION_RESERVED_CHUNKS_MIN]) + chunks_ranked_main
+        final_chunks_ranked = final_chunks_ranked[:MAX_CHUNKS_FINAL]
+        log(f"[Step 5] Chunk rerank: selected={len(final_chunks_ranked)} (reserved mod={min(VERSION_RESERVED_CHUNKS_MIN, len(chunks_ranked_mod))}) | took {dur_ms(t5):.0f} ms")
+
+        # Step 6: Rerank triples (for summary)
         t6 = now_ms()
-        triples_ranked = rerank_triples_by_query_triples(merged_triples, q_trip_embs=q_trip_embs, q_emb_fallback=q_emb_query, top_k=MAX_TRIPLES_FINAL)
-        t_rerank = dur_ms(t6)
-        log(f"[Step 6] Triple rerank done in {t_rerank:.0f} ms; selected {len(triples_ranked)}")
+        triples_ranked = rerank_triples_by_query_triples(merged_triples, q_trip_embs=q_trip_embs_mod, q_emb_fallback=q_emb_query, top_k=MAX_TRIPLES_FINAL)
+        log(f"[Step 6] Triple rerank done in {dur_ms(t6):.0f} ms; selected {len(triples_ranked)}")
 
-        # Build combined context text (summary + chunks)
+        # Lineage summary for UUs in scope
+        candidate_uu: Set[str] = set()
+        for e in ents:
+            uu = extract_uu_number_from_text(e.get("text"))
+            if uu: candidate_uu.add(uu)
+        for _key, _text, t in kept_chunks:
+            uu = (t.get("uu_number") or "").strip()
+            if uu: candidate_uu.add(uu)
+        version_lineage_summary = summarize_lineage_for_docs(list(candidate_uu), version_index, as_of_date, user_lang)
+
+        # Build combined context
         t_ctx = now_ms()
-        context_text, context_summary, _ = build_combined_context_text(triples_ranked, chunks_ranked)
+        context_text, context_summary, _ = build_combined_context_text(triples_ranked, final_chunks_ranked, version_lineage_summary)
         log(f"[Context] Built in {dur_ms(t_ctx):.0f} ms")
         log("\n[Context summary for this pass]:")
         log(context_summary)
 
-        # Step 7: Agent 2 – Answer
+        # Step 7: Answer
         t7 = now_ms()
-        intermediate_answer = agent2_answer(query_original, context_text, guidance=None, output_lang=user_lang)
-        t_answer = dur_ms(t7)
-        log(f"[Step 7] Answer generated in {t_answer:.0f} ms")
+        intermediate_answer = agent2_answer(
+            query_original, context_text, guidance=None, output_lang=user_lang,
+            as_of_date=as_of_date, version_lineage_summary=version_lineage_summary
+        )
+        log(f"[Step 7] Answer generated in {dur_ms(t7):.0f} ms")
 
         final_answer = intermediate_answer
 
-        # Summary
         total_ms = dur_ms(t_all)
         log("\n=== Agentic GraphRAG summary ===")
         log(f"- Iterations used: 1")
@@ -1147,7 +1519,9 @@ def agentic_graph_rag(query_original: str) -> Dict[str, Any]:
             "final_answer": final_answer,
             "log_file": str(log_file),
             "iterations": 1,
-            "judge_reports": []  # No judge in single-pass mode
+            "judge_reports": [],
+            "as_of_date": as_of_date.isoformat(),
+            "version_lineage": version_lineage_summary
         }
     finally:
         if _LOGGER is not None:
@@ -1160,7 +1534,11 @@ if __name__ == "__main__":
         if not user_query:
             print("Empty query. Exiting.")
         else:
-            agentic_graph_rag(user_query)
+            result = agentic_graph_rag(user_query)
+            if isinstance(result, dict):
+                lineage = result.get("version_lineage") or ""
+                asof = result.get("as_of_date") or ""
+                print(f"\n[Version summary] as-of={asof}\n{lineage}")
     finally:
         try:
             driver.close()

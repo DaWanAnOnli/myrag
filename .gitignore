@@ -177,12 +177,15 @@ dataset
 3_indexing/3d_naivekg/run_logs
 3_indexing/3d_naivekg/naivekg_pipeline_run_*.py
 
+3_indexing/3e_whole_document/*.txt
+
 # 4_experiment logs
 ## 4a_qa_generation
 4_experiment/4a_qa_generation/file_lists
 4_experiment/4a_qa_generation/logs
 4_experiment/4a_qa_generation/qa_pairs
 4_experiment/4a_qa_generation/runner_logs
+4_experiment/4a_qa_generation/*.jsonl
 
 ## 4b_retrieval logs
 ### 4b_i_lexidkg_graphrag
@@ -196,6 +199,14 @@ dataset
 ### 4b_iii_naivekg_graphrag
 4_experiment/4b_retrieval/4b_iii_naivekg_graphrag/question_terminal_logs
 4_experiment/4b_retrieval/4b_iii_naivekg_graphrag/*.txt
+
+4_experiment/4b_retrieval/4b_iv_multi_agents/question_terminal_logs_multi_agent
+4_experiment/4b_retrieval/4b_iv_multi_agents/*.txt
+4_experiment/4b_retrieval/4b_iv_multi_agents/*.jsonl
+
+4_experiment/4c_results_and_analysis/get_durations/results
+4_experiment/4c_results_and_analysis/get_llm_calls/results
+
 
 ## 4c_results_and_analysis
 4_experiment/4c_results_and_analysis/llm_judge_logs

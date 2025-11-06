@@ -76,7 +76,7 @@ TOP_K = 1
 RPM = 13
 
 # Maximum attempts per question when response is invalid (labels/scores/JSON/exception)
-MAX_ATTEMPTS = 10
+MAX_ATTEMPTS = 100
 
 # I/O paths (relative to this script)
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -97,18 +97,20 @@ LOG_DIR = (SCRIPT_DIR / "llm_judge_logs").resolve()
 
 # Preferred label ordering for known models (extras will be appended)
 PREFERRED_LABEL_ORDER = [
-    "graph_rag_answer",
-    "naive_rag_answer",
-    "naive_rag_4_answer_judge",
-    "naive_rag_5_answer_judge",
+    "approach_1_both_6_answer_judge",
+    "approach_1_both_7_answer_judge",
+    "approach_1_both_8_answer_judge",
+    "approach_1_both_9_answer_judge",
+    "approach_1_both_10_answer_judge"
 ]
 
 # Map JSONL keys to friendly, stable labels (optional explicit mapping)
 MODEL_KEY_TO_LABEL = {
-    "graph_rag_answer": "graph_rag_answer",
-    "naive_rag_answer": "naive_rag_answer",
-    "naive_rag_4_answer_judge_answer": "naive_rag_4_answer_judge",
-    "naive_rag_5_answer_judge_answer": "naive_rag_5_answer_judge",
+    "approach_1_both_6_answer_judge_answer": "approach_1_both_6_answer_judge",
+    "approach_1_both_7_answer_judge_answer": "approach_1_both_7_answer_judge",
+    "approach_1_both_8_answer_judge_answer": "approach_1_both_8_answer_judge",
+    "approach_1_both_9_answer_judge_answer": "approach_1_both_9_answer_judge",
+    "approach_1_both_10_answer_judge_answer": "approach_1_both_10_answer_judge",
 }
 
 

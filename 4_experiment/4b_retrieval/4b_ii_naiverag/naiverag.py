@@ -121,7 +121,7 @@ _LLM_RATE_LIMITER = RateLimiter(LLM_CALLS_PER_MINUTE)
 _EMBED_RATE_LIMITER = RateLimiter(EMBEDDING_CALLS_PER_MINUTE)
 
 def _rand_wait_seconds() -> float:
-    return random.uniform(5.0, 20.0)
+    return random.uniform(80.0, 120.0)
 
 def _api_call_with_retry(func, *args, **kwargs):
     while True:
@@ -154,7 +154,7 @@ def run_cypher_with_retry(cypher: str, params: Dict[str, Any]) -> List[Any]:
                 res = session.run(cypher, **params)
                 return list(res)
         except Exception as e:
-            wait_s = _rand_wait_seconds()
+            wait_s = random.uniform(80.0, 120.0)
             log(f"[Retry] Neo4j query failed: {e}. Retrying in {wait_s:.1f}s.")
             time.sleep(wait_s)
 

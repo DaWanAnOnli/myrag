@@ -87,24 +87,24 @@ else:
 # ]
 
 PATTERN_1 = [
-    os.path.join(BASE_INPUT_DIRECTORY, "graph_rag_answers_*_5_hops_1250.jsonl")
+    os.path.join(BASE_INPUT_DIRECTORY, "multi_agent_answers_*_approach_1_both_6_answer_judge_5_hops_1250.jsonl")
 ]
 
 PATTERN_2 = [
-    os.path.join(BASE_INPUT_DIRECTORY, "naive_rag_answers_*_1250.jsonl")
+    os.path.join(BASE_INPUT_DIRECTORY, "multi_agent_answers_*_approach_1_both_7_answer_judge_5_hops_1250.jsonl")
 ]
 
 PATTERN_3 = [
-    os.path.join(BASE_INPUT_DIRECTORY, "naive_rag_answers_*_4_answer_judge_1250.jsonl")
+    os.path.join(BASE_INPUT_DIRECTORY, "multi_agent_answers_*_approach_1_both_8_answer_judge_5_hops_1250.jsonl")
 ]
 
 PATTERN_4 = [
-    os.path.join(BASE_INPUT_DIRECTORY, "naive_rag_answers_*_5_answer_judge_1250.jsonl")
+    os.path.join(BASE_INPUT_DIRECTORY, "multi_agent_answers_*_approach_1_both_9_answer_judge_5_hops_1250.jsonl")
 ]
 
-# NAIVERAG_2_SUBGOALS_PATTERN = [
-#     os.path.join(BASE_INPUT_DIRECTORY, "naive_rag_answers_*_2_subgoals_1250.jsonl")
-# ]
+PATTERN_5 = [
+    os.path.join(BASE_INPUT_DIRECTORY, "multi_agent_answers_*_approach_1_both_10_answer_judge_5_hops_1250.jsonl")
+]
 
 # NAIVERAG_3_SUBGOALS_PATTERN = [
 #     os.path.join(BASE_INPUT_DIRECTORY, "naive_rag_answers_*_3_subgoals_1250.jsonl")
@@ -233,6 +233,7 @@ def main():
     pattern_2_files = expand_paths(PATTERN_2)
     pattern_3_files = expand_paths(PATTERN_3)
     pattern_4_files = expand_paths(PATTERN_4)
+    pattern_5_files = expand_paths(PATTERN_5)
 
     # if not zero_hop_files and not naive_rag_files \
     #     and not one_hop_files and not two_hop_files \
@@ -308,32 +309,40 @@ def main():
 
     pattern_1_data = load_group(
         pattern_1_files,
-        source_answer_field="generated_answer",
-        dest_answer_field="graph_rag_answer",
+        source_answer_field="final_answer",
+        dest_answer_field="approach_1_both_6_answer_judge",
         include_question=True,
         include_ground_truth=True,
     )
 
     pattern_2_data = load_group(
         pattern_2_files,
-        source_answer_field="agentic_naive_rag_answer",
-        dest_answer_field="naive_rag_answer",
+        source_answer_field="final_answer",
+        dest_answer_field="approach_1_both_7_answer_judge",
         include_question=True,
         include_ground_truth=True,
     )
 
     pattern_3_data = load_group(
         pattern_3_files,
-        source_answer_field="agentic_naive_rag_answer",
-        dest_answer_field="naive_rag_4_answer_judge_answer",
+        source_answer_field="final_answer",
+        dest_answer_field="approach_1_both_8_answer_judge",
         include_question=True,
         include_ground_truth=True,
     )
 
     pattern_4_data = load_group(
         pattern_4_files,
-        source_answer_field="agentic_naive_rag_answer",
-        dest_answer_field="naive_rag_5_answer_judge_answer",
+        source_answer_field="final_answer",
+        dest_answer_field="approach_1_both_9_answer_judge",
+        include_question=True,
+        include_ground_truth=True,
+    )
+
+    pattern_5_data = load_group(
+        pattern_5_files,
+        source_answer_field="final_answer",
+        dest_answer_field="approach_1_both_10_answer_judge",
         include_question=True,
         include_ground_truth=True,
     )
@@ -341,7 +350,7 @@ def main():
 
     # all_ids = set(graph_data.keys()) | set(naive_rag_data.keys()) |# | set(naivekg_graphrag_data.keys())
     all_ids = set(pattern_1_data.keys()) | set(pattern_2_data.keys()) | set(pattern_3_data.keys()) | \
-    set (pattern_4_data.keys()) # | set (three_hop_data.keys()) | set (four_hop_data.keys()) | set(five_hop_data.keys())
+    set (pattern_4_data.keys()) | set(pattern_5_data.keys()) # | set (three_hop_data.keys()) | set (four_hop_data.keys()) | set(five_hop_data.keys())
     if not all_ids:
         eprint("[warn] No records found across inputs. Output will be empty.")
 
@@ -363,10 +372,11 @@ def main():
             p2 = pattern_2_data.get(id_key,{})
             p3 = pattern_3_data.get(id_key,{})
             p4 = pattern_4_data.get(id_key,{})
+            p5 = pattern_5_data.get(id_key,{})
 
             # Preserve original id type when possible
             # id_val = pick_first(g.get("id"), n.get("id"))# , k.get("id"))
-            id_val = pick_first(p1.get("id"), p2.get("id"), p3.get("id"), p4.get("id"))
+            id_val = pick_first(p1.get("id"), p2.get("id"), p3.get("id"), p4.get("id"), p5.get("id"))
             if id_val is None:
                 try:
                     id_val = int(id_key)
@@ -384,10 +394,11 @@ def main():
                 # "lexidkg_graphrag_3_hop_answer": g3.get("lexidkg_graphrag_3_hop_answer"),
                 # "lexidkg_graphrag_4_hop_answer": g4.get("lexidkg_graphrag_4_hop_answer"),
                 # "lexidkg_graphrag_5_hop_answer": g5.get("lexidkg_graphrag_5_hop_answer"),
-                "graph_rag_answer": p1.get("graph_rag_answer"),
-                "naive_rag_answer": p2.get("naive_rag_answer"),
-                "naive_rag_4_answer_judge_answer": p3.get("naive_rag_4_answer_judge_answer"),
-                "naive_rag_5_answer_judge_answer": p4.get("naive_rag_5_answer_judge_answer"),
+                "approach_1_both_6_answer_judge_answer": p1.get("approach_1_both_6_answer_judge"),
+                "approach_1_both_7_answer_judge_answer": p2.get("approach_1_both_7_answer_judge"),
+                "approach_1_both_8_answer_judge_answer": p3.get("approach_1_both_8_answer_judge"),
+                "approach_1_both_9_answer_judge_answer": p4.get("approach_1_both_9_answer_judge"),
+                "approach_1_both_10_answer_judge_answer": p5.get("approach_1_both_10_answer_judge"),
             }
 
             out_f.write(json.dumps(merged, ensure_ascii=False) + "\n")
