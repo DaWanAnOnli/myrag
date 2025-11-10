@@ -14,8 +14,8 @@ from collections import Counter
 
 # Relative paths from this script's location
 SCRIPT_DIR = Path(__file__).resolve().parent
-LOG_FOLDER = SCRIPT_DIR / "../../4b_retrieval/4b_i_lexidkg_graphrag/question_terminal_logs/lexidkg_5_iq_5_hop_1250"
-OUTPUT_FOLDER = SCRIPT_DIR / "llm_calls_analysis_results_lexidkg_5_iq_5_hop_1250"
+LOG_FOLDER = SCRIPT_DIR / "../../4b_retrieval/4b_i_lexidkg_graphrag/question_terminal_logs/lexidkg_3_iq_fix"
+OUTPUT_FOLDER = SCRIPT_DIR / "llm_calls_analysis_results_lexidkg_3_iq_fix"
 
 
 def extract_query_from_log(log_path: Path) -> str:

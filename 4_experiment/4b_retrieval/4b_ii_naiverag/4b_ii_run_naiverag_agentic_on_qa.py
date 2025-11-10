@@ -69,15 +69,15 @@ MAX_QUESTIONS = 0  # process all by default
 SELECTION_MODE = "random"  # "first" or "random"
 
 # Underscore-only paths
-# if IS_SAMPLE:
-#     QA_PAIRS_REL   = "../../../dataset/samples/4_experiment/4a_qa_generation/4a_iii_qa_pairs_with_id/qa_pairs.jsonl"
-#     OUTPUT_DIR_REL = "../../../dataset/samples/4_experiment/4b_experiment_answers/4b_ii_naive_rag"
-# else:
-#     QA_PAIRS_REL   = "../../../dataset/4_experiment/4a_qa_generation/4a_iii_qa_pairs_with_id/qa_pairs.jsonl"
-#     OUTPUT_DIR_REL = "../../../dataset/4_experiment/4b_experiment_answers/4b_ii_naive_rag"
+if IS_SAMPLE:
+    QA_PAIRS_REL   = "../../../dataset/samples/4_experiment/4a_qa_generation/4a_iii_qa_pairs_with_id/qa_pairs.jsonl"
+    OUTPUT_DIR_REL = "../../../dataset/samples/4_experiment/4b_experiment_answers/4b_ii_naive_rag"
+else:
+    QA_PAIRS_REL   = "../../../dataset/4_experiment/4a_qa_generation/4a_iii_qa_pairs_with_id/qa_pairs.jsonl"
+    OUTPUT_DIR_REL = "../../../dataset/4_experiment/4b_experiment_answers/4b_ii_naive_rag"
 
-QA_PAIRS_REL = "../../../dataset/4_experiment/4a_qa_generation/4a_v_amendment_questions/amendment_questions.jsonl"
-OUTPUT_DIR_REL = "../../../dataset/4_experiment/4b_experiment_answers/4b_ii_naive_rag"
+# QA_PAIRS_REL = "../../../dataset/4_experiment/4a_qa_generation/4a_v_amendment_questions/amendment_questions.jsonl"
+# OUTPUT_DIR_REL = "../../../dataset/4_experiment/4b_experiment_answers/4b_ii_naive_rag"
 
 PER_QUESTION_LOGS_DIRNAME = "question_terminal_logs_naive_over_graph"
 ENV_PATH_REL = "../../../.env"
@@ -85,7 +85,7 @@ CLEAN_PART_FILES = True  # remove worker part files after merging
 
 # Batched execution: number of subprocesses to run concurrently.
 # Set to 0 or a negative number to run all workers at once (legacy behavior).
-BATCH_SIZE = 4
+BATCH_SIZE = 6
 
 # ----------------- Utilities & logging -----------------
 
@@ -234,7 +234,7 @@ def worker_main(worker_id: int,
 
     # Import after setting env so the module can read it
     try:
-        import naiverag_amendment_aware_revised as rag
+        import subgoal_3 as rag
     except Exception as e:
         log(f"[Worker {worker_id}] ERROR: Could not import agentic_rag.py: {e}")
         part_path.write_text("", encoding="utf-8")
@@ -279,7 +279,7 @@ def worker_main(worker_id: int,
                     naive_answer = ""
                     error_msg = None
                     try:
-                        result = rag.agentic_rag_with_amendments(question)
+                        result = rag.agentic_rag(question)
                         naive_answer = (result or {}).get("final_answer", "")
                         if not isinstance(naive_answer, str):
                             naive_answer = json.dumps(naive_answer, ensure_ascii=False)

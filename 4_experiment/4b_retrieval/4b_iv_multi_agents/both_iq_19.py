@@ -1482,80 +1482,99 @@ def agentic_multi(query_original: str, logger: Optional[FileLogger] = None, log_
         set_log_context(prev_ctx)
 
 # ----------------- NEW: Intermediate Question (IQ) Generator Agent -----------------
-IQ_GEN_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "iqs": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string"},
-                    "text": {"type": "string"},
-                    "rationale": {"type": "string"},
-                    "depends_on": {"type": "array", "items": {"type": "string"}}
-                },
-                "required": ["text"]
-            }
-        }
-    },
-    "required": ["iqs"]
+# In Script 2, replace the IQ_GEN_SCHEMA with this (from Script 1):
+IQ_PLAN_SCHEMA = {
+  "type": "object",
+  "properties": {
+    "iqs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string"},
+          "question": {"type": "string"},
+          "rationale": {"type": "string"},
+          "depends_on": {"type": "array", "items": {"type": "string"}}
+        },
+        "required": ["question"]  # Changed from "text" to "question"
+      }
+    }
+  },
+  "required": ["iqs"]
 }
 
+# Replace the iq_generator_agent function with this:
 def iq_generator_agent(query_original: str, lang: str, max_n: int = IQ_MAX_N) -> List[Dict[str, str]]:
+    # Use exact same instruction text as Script 1
+    instruction = (
+        "Plan a short sequence of dependent intermediate questions (IQs) to answer the user's query. "
+        "Make later IQs depend on earlier answers only if that helps. "
+        f"Return at most {max_n} IQs. If decomposition isn't needed, return exactly one IQ identical to the original query. "
+        "Write IQs in the same language as the user's query."
+    )
+    
+    # Use exact same prompt structure as Script 1
     prompt = f"""
-You are the Intermediate Question (IQ) Generator.
+You are the Intermediate Question Planner.
 
-Task:
-- Decompose the user's query into up to {max_n} sequential, dependent intermediate questions (IQs) needed to solve it.
-- If decomposition is unnecessary, return a single IQ identical to the original query.
-- IQs may reference outcomes of previous IQs via placeholders (e.g., "(answer to iq1) + 8").
-- Keep IQs minimal and ordered (iq1, iq2, ...). Do NOT answer them.
-- Preserve key legal entities and references (e.g., UU, Pasal/Article).
-- Respond in {lang}.
+Instruction:
+{instruction}
 
-Output JSON:
-{{
-  "iqs": [
-    {{"id": "iq1", "text": "...", "rationale": "...", "depends_on": ["iq0"] }},
-    ...
-  ]
-}}
-
-Notes:
-- Use simple ids "iq1", "iq2", ...
-- "depends_on" can be omitted or list prior iq ids; typically iq(i-1).
-- Keep the texts concise, but include essential details.
-
-{STRICT_JSON_DIRECTIVE}
-
-User query ({lang}):
+User query:
 \"\"\"{query_original}\"\"\"
+
+Output JSON schema:
+- iqs: array of items with fields:
+  - id (string; optional; you may leave blank)
+  - question (string; REQUIRED; the intermediate question)
+  - rationale (string; optional; why this IQ is needed)
+  - depends_on (array of prior IQ ids, optional)
 """
+    
+    est = estimate_tokens_for_text(prompt)
     log("\n[IQGenerator] Prompt:", level="INFO")
     log(prompt, level="INFO")
-    out = safe_generate_json(prompt, IQ_GEN_SCHEMA, temp=0.0) or {}
-    iqs = out.get("iqs") or []
-    clean: List[Dict[str, str]] = []
-    for i, s in enumerate(iqs, 1):
-        try:
-            txt = (s.get("text") or "").strip()
-            if not txt:
-                continue
-            sid = (s.get("id") or f"iq{i}").strip()
-            rat = (s.get("rationale") or "").strip()
-            deps = s.get("depends_on") or []
-            if not isinstance(deps, list):
-                deps = []
-            clean.append({"id": sid, "text": txt, "rationale": rat, "depends_on": deps})
-        except Exception:
+    log(f"[IQGenerator] Prompt size: {len(prompt)} chars, est_tokens≈{est}", level="INFO")
+    
+    # Use the schema (note: no STRICT_JSON_DIRECTIVE like Script 1, keeping Script 2's approach)
+    out = safe_generate_json(prompt, IQ_PLAN_SCHEMA, temp=0.0) or {}
+    raw_iqs = out.get("iqs") or []
+    
+    # Use Script 1's normalization function
+    def _normalize_question(q: str) -> str:
+        q = (q or "").strip().lower()
+        q = re.sub(r"\s+", " ", q)
+        return q
+    
+    # Use Script 1's cleanup logic
+    cleaned: List[Dict[str, str]] = []
+    seen = set()
+    for i, iq in enumerate(raw_iqs, 1):
+        q = (iq.get("question") or "").strip()  # Changed from "text" to "question"
+        if not q:
             continue
-        if len(clean) >= max_n:
+        key = _normalize_question(q)
+        if key in seen:
+            continue
+        seen.add(key)
+        rid = (iq.get("id") or "").strip() or f"IQ{i}"
+        rationale = (iq.get("rationale") or "").strip()
+        deps = iq.get("depends_on") or []
+        cleaned.append({"id": rid, "question": q, "rationale": rationale, "depends_on": deps})
+        if len(cleaned) >= max_n:
             break
-    if not clean:
-        clean = [{"id": "iq1", "text": query_original.strip(), "rationale": "No decomposition needed.", "depends_on": []}]
-    log(f"[IQGenerator] Produced {len(clean)} IQ(s): {[x['id'] for x in clean]}", level="INFO")
-    return clean
+    
+    # Use Script 1's fallback
+    if not cleaned:
+        cleaned = [{"id": "IQ1", "question": query_original.strip(), "rationale": "Decomposition not needed; answer the original query directly.", "depends_on": []}]
+    
+    log(f"[IQGenerator] Produced {len(cleaned)} IQ(s):", level="INFO")
+    for iq in cleaned:
+        log(f"  - {iq['id']}: {iq['question']} (rationale: {iq.get('rationale','')})", level="INFO")
+    
+    return cleaned
+
+
 
 # ----------------- NEW: Query Modifier Agent -----------------
 QUERY_MOD_SCHEMA = {
@@ -1672,7 +1691,7 @@ def iq_orchestrator(query_original: str) -> Dict[str, Any]:
         # Step 2: Sequentially process IQs
         for i, iq in enumerate(iqs, start=1):
             sid = iq.get("id") or f"iq{i}"
-            draft_text = iq.get("text", "").strip()
+            draft_text = iq.get("question", "").strip()  # Changed from "text" to "question"
             if not draft_text:
                 log(f"[IQ Orchestrator] Skipping empty IQ {sid}", level="WARN")
                 continue
@@ -1715,13 +1734,15 @@ def iq_orchestrator(query_original: str) -> Dict[str, Any]:
             # Record result for output
             iq_results.append({
                 "id": sid,
-                "draft_text": draft_text,
-                "updated_text": updated_text,
+                "draft_question": draft_text,  # Renamed for consistency
+                "updated_question": updated_text,  # Renamed for consistency
                 "final_answer": final_answer,
                 "aggregator_decision": res.get("aggregator_decision", {}),
                 "iterations": res.get("iterations", 1)
             })
 
+
+        # If no IQ produced an answer, fallback: run once on original query
         # If no IQ produced an answer, fallback: run once on original query
         if not final_answer.strip():
             log("[IQ Orchestrator] No IQ produced an answer; running fallback on original query.", level="WARN")
@@ -1730,8 +1751,8 @@ def iq_orchestrator(query_original: str) -> Dict[str, Any]:
                 final_answer = (res0.get("final_answer") or "").strip()
                 iq_results.append({
                     "id": "iq_fallback",
-                    "draft_text": query_original,
-                    "updated_text": query_original,
+                    "draft_question": query_original,  # Renamed for consistency
+                    "updated_question": query_original,  # Renamed for consistency
                     "final_answer": final_answer,
                     "aggregator_decision": res0.get("aggregator_decision", {}),
                     "iterations": res0.get("iterations", 1)

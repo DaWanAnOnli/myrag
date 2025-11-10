@@ -32,7 +32,7 @@ NEO4J_PASS = os.getenv("NEO4J_PASS", "password")
 
 # Neo4j retry/timeout
 NEO4J_TX_TIMEOUT_S = float(os.getenv("NEO4J_TX_TIMEOUT_S", "60"))
-NEO4J_MAX_ATTEMPTS = int(os.getenv("NEO4J_MAX_ATTEMPTS", "10"))
+NEO4J_MAX_ATTEMPTS = int(os.getenv("NEO4J_MAX_ATTEMPTS", "100000"))
 
 # Models
 GEN_MODEL   = os.getenv("GEN_MODEL", "models/gemini-2.5-flash")
@@ -66,7 +66,7 @@ EMBEDDING_CALLS_PER_MINUTE = int(os.getenv("EMBEDDING_CALLS_PER_MINUTE", "0"))  
 
 # ---------- Agentic Supervisor parameters ----------
 # Hardcoded-style params for easy modification (env override optional)
-SUBGOAL_MAX_N = int(os.getenv("SUBGOAL_MAX_N", "4"))
+SUBGOAL_MAX_N = int(os.getenv("SUBGOAL_MAX_N", "5"))
 SUBGOALS_RUN_IN_PARALLEL = os.getenv("SUBGOALS_RUN_IN_PARALLEL", "true").lower() in ("1","true","yes","y")
 SUBGOALS_MAX_WORKERS = int(os.getenv("SUBGOALS_MAX_WORKERS", str(SUBGOAL_MAX_N)))
 SUBGOAL_ANSWER_SNIPPET_CLAMP = int(os.getenv("SUBGOAL_ANSWER_SNIPPET_CLAMP", "2000"))
@@ -81,6 +81,19 @@ LOG_JSON_RAW_PREVIEW_CHARS = int(os.getenv("LOG_JSON_RAW_PREVIEW_CHARS", "200"))
 genai.configure(api_key=GOOGLE_API_KEY)
 gen_model = genai.GenerativeModel(GEN_MODEL)
 driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+
+
+# ----------------- Config (add this constant) -----------------
+AGG_TEMPERATURE = 0.0  # Add this with other config constants
+
+# ----------------- Utilities (add this helper function) -----------------
+def _truncate(text: str, max_chars: int) -> str:
+    """Truncate text to max_chars, adding ellipsis if truncated."""
+    if not isinstance(text, str):
+        return ""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "..."
 
 # ----------------- Logger -----------------
 _THREAD_LOCAL = threading.local()
@@ -487,31 +500,38 @@ def _ensure_required_fields(obj: Dict[str, Any], schema: Optional[Dict[str, Any]
                         obj[k] = {}
     return obj
 
-def safe_generate_json(prompt: str, schema: Dict[str, Any], temp: float = 0.0) -> Dict[str, Any]:
+def safe_generate_json(prompt: str, schema: Dict[str, Any], temp: float = 0.0, max_tokens: int = 8192) -> Dict[str, Any]:
     """
-    Text-mode JSON generation:
-    - Adds strict JSON directive to the prompt externally (callers should include it).
-    - Calls normal text generation.
-    - Parses JSON from text with robust heuristics.
-    - Ensures required fields with basic defaults according to the provided schema.
+    Native JSON mode generation using response_mime_type and response_schema.
+    This matches the approach from agentic_rag.py (Script 1).
     """
-    # We assume callers have included STRICT_JSON_DIRECTIVE in the prompt.
-    est = estimate_tokens_for_text(prompt)
-    log("[LLM JSON-TEXT] Prompt (strict JSON mode) begins:", level="INFO")
-    log(prompt, level="INFO")
-    log(f"[LLM JSON-TEXT] Prompt size: {len(prompt)} chars, est_tokens≈{est}", level="INFO")
-
-    raw = safe_generate_text(prompt, max_tokens=JSON_MAX_TOKENS, temperature=temp)
-    preview = (raw[:LOG_JSON_RAW_PREVIEW_CHARS] + ("..." if len(raw) > LOG_JSON_RAW_PREVIEW_CHARS else ""))
-    log(f"[LLM JSON-TEXT] Raw output preview ({min(len(raw), LOG_JSON_RAW_PREVIEW_CHARS)} chars): {preview!r}", level="DEBUG")
-
-    parsed = try_parse_json_from_text(raw)
-    if not parsed:
-        log("[LLM JSON-TEXT] Parse failed; returning empty dict.", level="WARN")
+    cfg = GenerationConfig(
+        temperature=temp, 
+        response_mime_type="application/json", 
+        response_schema=schema,
+        max_output_tokens=max_tokens  # ✅ ADD THIS
+    )
+    t0 = now_ms()
+    resp = _api_call_with_retry(gen_model.generate_content, prompt, generation_config=cfg)
+    took = dur_ms(t0)
+    
+    try:
+        if isinstance(resp.text, str) and resp.text.strip():
+            parsed = json.loads(resp.text)
+            log(f"[LLM JSON] Native mode completed in {took:.0f} ms", level="DEBUG")
+            return parsed
+    except Exception:
+        pass
+    
+    try:
+        raw = resp.candidates[0].content.parts[0].text
+        parsed = json.loads(raw)
+        log(f"[LLM JSON] Native mode completed in {took:.0f} ms", level="DEBUG")
+        return parsed
+    except Exception as e:
+        info = get_finish_info(resp)
+        log(f"[LLM JSON warning] Native mode failed to parse. Diagnostics: {info}. Error: {e}", level="WARN")
         return {}
-
-    normalized = _ensure_required_fields(parsed, schema)
-    return normalized
 
 # ----------------- Agent 1 / 1b Schemas (GraphRAG) -----------------
 LEGAL_ENTITY_TYPES = [
@@ -583,11 +603,10 @@ Output format:
 - If entity type is provided, it MUST be one of: {", ".join(LEGAL_ENTITY_TYPES)}.
 - Predicates should ideally be one of: {", ".join(LEGAL_PREDICATES)}.
 
-{STRICT_JSON_DIRECTIVE}
-
 User question:
 \"\"\"{query}\"\"\"
 """
+    # ... rest of function unchanged
     est = estimate_tokens_for_text(prompt)
     log("\n[Agent 1] Prompt:", level="INFO")
     log(prompt, level="INFO")
@@ -611,11 +630,10 @@ Rules:
 
 Return JSON with a key "triples" as specified.
 
-{STRICT_JSON_DIRECTIVE}
-
 User question:
 \"\"\"{query}\"\"\"
 """
+    # ... rest of function unchanged
     est = estimate_tokens_for_text(prompt)
     log("\n[Agent 1b] Prompt:", level="INFO")
     log(prompt, level="INFO")
@@ -1305,103 +1323,85 @@ def run_graph_rag(query_original: str) -> Dict[str, Any]:
 
 # ----------------- Aggregator Agent (per subgoal; existing) -----------------
 AGG_SCHEMA = {
-  "type": "object",
-  "properties": {
-    "chosen": {"type": "string", "enum": ["naive", "graphrag", "mixed"]},
-    "final_answer": {"type": "string"},
-    "rationale": {"type": "string"},
-    "confidence": {"type": "number"},
-    "key_points": {"type": "array", "items": {"type": "string"}}
-  },
-  "required": ["chosen", "final_answer"]
+    "type": "object",
+    "properties": {
+        "decision": {"type": "string", "enum": ["choose_graphrag", "choose_naiverag", "merge"]},
+        "final_answer": {"type": "string"},
+        "rationale": {"type": "string"}
+    },
+    "required": ["decision", "final_answer"]
 }
 
-def aggregator_agent(query: str, naive_answer: str, graphrag_answer: str, lang: str) -> Dict[str, Any]:
+def aggregator_agent(query: str, graphrag_answer: str, naiverag_answer: str, graphrag_meta: Dict[str, Any], naiverag_meta: Dict[str, Any], user_lang: str) -> Dict[str, Any]:
+    g_meta = json.dumps(graphrag_meta, ensure_ascii=False, indent=2) if graphrag_meta else "{}"
+    n_meta = json.dumps(naiverag_meta, ensure_ascii=False, indent=2) if naiverag_meta else "{}"
     prompt = f"""
-You are the Aggregator. You receive:
-- The original user question.
-- Two candidate answers:
-  * Naive RAG answer (vector-search over chunks)
-  * GraphRAG answer (KG-assisted retrieval)
+You are the Aggregator Agent. Your task: produce the best possible final answer to the user's question.
 
-Goal:
-- Choose the best answer or combine them into a stronger final answer.
-- Prefer answers with explicit citations (UU, Pasal/Article numbers) and higher internal consistency.
-- If both are solid and compatible, you may merge key points.
-- If they conflict, select the more grounded/specific answer; briefly resolve the conflict if possible.
-- Be concise and accurate.
-- Respond in the same language as the user's question.
-
-Return JSON with:
-  - chosen: "naive" | "graphrag" | "mixed"
-  - final_answer: the final response text
-  - rationale: brief reasoning for your choice
-  - confidence: 0.0–1.0 (float)
-  - key_points: optional list of key bullets
-
-{STRICT_JSON_DIRECTIVE}
-
-Question:
+Inputs:
+- Question (language='{user_lang}'):
 \"\"\"{query}\"\"\"
 
-Naive RAG answer:
-\"\"\"{naive_answer}\"\"\"
+- GraphRAG answer:
+\"\"\"{_truncate(graphrag_answer, 12000)}\"\"\"
 
-GraphRAG answer:
-\"\"\"{graphrag_answer}\"\"\"
+- NaiveRAG answer:
+\"\"\"{_truncate(naiverag_answer, 12000)}\"\"\"
+
+- GraphRAG meta (for context only; do not invent facts beyond the answers):
+{g_meta}
+
+- NaiveRAG meta (for context only; do not invent facts beyond the answers):
+{n_meta}
+
+Guidelines:
+- Choose the better answer OR synthesize a concise, coherent answer that combines non-conflicting strengths of both.
+- Prefer specificity and legal grounding (e.g., citing UU number / Pasal / Article) if present in the answers.
+- Do not add information that does not appear in either answer.
+- Keep the final answer in the same language as the user's question.
+- If merging, ensure consistency and avoid contradictions.
+
+Return JSON:
+- decision: 'choose_graphrag' | 'choose_naiverag' | 'merge'
+- final_answer: the chosen or synthesized answer
+- rationale: short explanation (1-2 sentences)
 """
+    est = estimate_tokens_for_text(prompt)
     log("\n[Aggregator] Prompt:", level="INFO")
     log(prompt, level="INFO")
-    out = safe_generate_json(prompt, AGG_SCHEMA, temp=0.0) or {}
-    chosen = (out.get("chosen") or "").strip().lower()
+    log(f"[Aggregator] Prompt size: {len(prompt)} chars, est_tokens≈{est}", level="INFO")
+    out = safe_generate_json(prompt, AGG_SCHEMA, temp=AGG_TEMPERATURE) or {}
+    decision = (out.get("decision") or "").strip()
     final_answer = (out.get("final_answer") or "").strip()
     rationale = (out.get("rationale") or "").strip()
-    confidence = float(out.get("confidence") or 0.0)
-
-    if not final_answer or chosen not in ("naive", "graphrag", "mixed"):
-        log("[Aggregator] Fallback selection heuristic activated.", level="WARN")
-        def ref_score(txt: str) -> int:
-            if not isinstance(txt, str):
-                return 0
-            patterns = [
-                r"\b(Pasal|Ayat|UU|Undang[- ]?Undang|Peraturan|Bab|Bagian)\b",
-                r"\b(Article|Section|Chapter|Act|Law|Regulation)\b",
-                r"\bPasal\s+\d+",
-                r"\bArticle\s+\d+",
-            ]
-            s = 0
-            for pat in patterns:
-                m = re.findall(pat, txt, flags=re.IGNORECASE)
-                s += len(m)
-            s += len(re.findall(r"\[\d+\]", txt))
-            s += len(re.findall(r"\b\d{1,3}(\.\d+)?\b", txt)) // 4
-            return s
-
-        n_ok = isinstance(naive_answer, str) and len(naive_answer.strip()) > 0
-        g_ok = isinstance(graphrag_answer, str) and len(graphrag_answer.strip()) > 0
-
-        if g_ok and (ref_score(graphrag_answer) >= ref_score(naive_answer or "")):
-            chosen = "graphrag"
-            final_answer = graphrag_answer.strip()
-        elif n_ok:
-            chosen = "naive"
-            final_answer = naive_answer.strip()
+    
+    if decision not in ("choose_graphrag","choose_naiverag","merge") or not final_answer:
+        # Fallback heuristic: prefer answer with more legal cues; else GraphRAG
+        def score(a: str) -> int:
+            t = a.lower()
+            cues = 0
+            cues += len(re.findall(r"\bpasal\b", t))
+            cues += len(re.findall(r"\buu\b", t))
+            cues += len(re.findall(r"\barticle\b", t))
+            cues += len(re.findall(r"\bsection\b", t))
+            cues += len(re.findall(r"\bperaturan\b", t))
+            cues += len(re.findall(r"\b\d{4}\b", t))
+            return cues
+        sg = score(graphrag_answer)
+        sn = score(naiverag_answer)
+        if sn > sg and naiverag_answer.strip():
+            decision = "choose_naiverag"
+            final_answer = naiverag_answer.strip()
+            rationale = rationale or "Fallback: naive answer appears more specific."
         else:
-            chosen = "mixed"
-            final_answer = "Maaf, saya tidak menemukan jawaban berdasarkan konteks yang tersedia." if lang == "id" else "Sorry, I could not find an answer based on the available context."
-        rationale = rationale or "Selected based on citation density and completeness."
-        confidence = confidence or 0.55
+            decision = "choose_graphrag"
+            final_answer = graphrag_answer.strip() or naiverag_answer.strip()
+            rationale = rationale or "Fallback: GraphRAG chosen by default or better specificity."
+        log("[Aggregator] Fallback decision used due to invalid or empty aggregator output.", level="WARN")
+    
+    log(f"[Aggregator] Decision={decision} | Rationale: {rationale[:160]}", level="INFO")
+    return {"decision": decision, "final_answer": final_answer, "rationale": rationale}
 
-    log(f"[Aggregator] Decision: chosen={chosen}, confidence={confidence:.2f}", level="INFO")
-    log(f"[Aggregator] Rationale: {rationale}", level="INFO")
-
-    return {
-        "chosen": chosen,
-        "final_answer": final_answer,
-        "rationale": rationale,
-        "confidence": confidence,
-        "key_points": out.get("key_points") or []
-    }
 
 # ----------------- Agentic Multi (single query; existing) -----------------
 def agentic_multi(query_original: str, logger: Optional[FileLogger] = None, log_context_prefix: Optional[str] = None) -> Dict[str, Any]:
@@ -1469,23 +1469,38 @@ def agentic_multi(query_original: str, logger: Optional[FileLogger] = None, log_
 
         naive_answer = naive_result.get("answer", "") or ""
         graphrag_answer = graph_result.get("answer", "") or ""
+        
+        # Prepare metadata for aggregator
+        graphrag_meta = {
+            "triples": graph_result.get("triples", 0),
+            "chunks": graph_result.get("chunks", 0)
+        }
+        naiverag_meta = {
+            "candidates": naive_result.get("candidates", 0)
+        }
 
         # Aggregate
         t_ag = now_ms()
-        agg = aggregator_agent(query_original, naive_answer, graphrag_answer, user_lang)
+        agg = aggregator_agent(
+            query=query_original,
+            graphrag_answer=graphrag_answer,
+            naiverag_answer=naive_answer,
+            graphrag_meta=graphrag_meta,
+            naiverag_meta=naiverag_meta,
+            user_lang=user_lang
+        )
         t_agg = dur_ms(t_ag)
 
         final_answer = agg.get("final_answer", "") or ""
         decision = {
-            "chosen": agg.get("chosen"),
-            "confidence": float(agg.get("confidence") or 0.0),
+            "decision": agg.get("decision"),
             "rationale": agg.get("rationale") or ""
         }
 
         total_ms = dur_ms(t_all)
         log("\n=== Multi-Agent RAG summary ===", level="INFO")
         log(f"- Iterations used: 1 (Naive + GraphRAG + Aggregator)", level="INFO")
-        log(f"- Aggregator: chosen={decision['chosen']}, confidence={decision['confidence']:.2f}", level="INFO")
+        log(f"- Aggregator: decision={decision['decision']}", level="INFO")
         log(f"- Total runtime: {total_ms:.0f} ms", level="INFO")
         log("\n=== Final Answer ===", level="INFO")
         log(final_answer, level="INFO")
@@ -1505,6 +1520,7 @@ def agentic_multi(query_original: str, logger: Optional[FileLogger] = None, log_
         set_log_context(prev_ctx)
 
 # ----------------- Subgoal Generator Agent -----------------
+
 SUBGOAL_GEN_SCHEMA = {
     "type": "object",
     "properties": {
@@ -1514,10 +1530,10 @@ SUBGOAL_GEN_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "id": {"type": "string"},
-                    "text": {"type": "string"},
+                    "question": {"type": "string"},  # Changed from "text" to "question"
                     "rationale": {"type": "string"}
                 },
-                "required": ["text"]
+                "required": ["question"]  # Changed from ["text"] to ["question"]
             }
         }
     },
@@ -1525,49 +1541,61 @@ SUBGOAL_GEN_SCHEMA = {
 }
 
 def subgoal_generator_agent(query_original: str, lang: str, max_n: int = SUBGOAL_MAX_N) -> List[Dict[str, str]]:
+    """
+    Generate subgoals using the exact same prompt structure as agentic_rag.py (Script 1).
+    """
+    instruction = (
+        "Decompose the user's query into independent, parallelizable sub-questions only if it improves clarity or answerability. "
+        f"Return at most {max_n} subgoals. "
+        "If decomposition is unnecessary, return exactly one subgoal identical to the original query. "
+        "Write subgoals in the same language as the user's query."
+    )
+    
     prompt = f"""
-You are the Subgoal Generator agent.
+You are the Subgoal Generator.
 
-Task:
-- Decompose the user's question into up to {max_n} independent, minimal subgoals that can be answered in parallel.
-- If decomposition is unnecessary, provide a single subgoal equal to the original question.
-- Keep subgoals independent (avoid cross-dependencies).
-- Preserve key legal entities and references (e.g., UU, Pasal/Article).
-- Respond in the same language as the user's question.
+Instruction:
+{instruction}
 
-Output JSON:
-{{
-  "subgoals": [
-    {{"id": "sg1", "text": "...", "rationale": "..." }},
-    ...
-  ]
-}}
-
-{STRICT_JSON_DIRECTIVE}
-
-User question ({lang}):
+User query:
 \"\"\"{query_original}\"\"\"
+
+Output JSON schema:
+- subgoals: array of items with fields:
+  - id (string; optional; you may leave blank)
+  - question (string; REQUIRED; an independently answerable sub-question)
+  - rationale (string; optional; why this subgoal helps)
 """
+    
+    est = estimate_tokens_for_text(prompt)
     log("\n[SubgoalGenerator] Prompt:", level="INFO")
     log(prompt, level="INFO")
+    log(f"[SubgoalGenerator] Prompt size: {len(prompt)} chars, est_tokens≈{est}", level="INFO")
+    
+    # Use native JSON mode with schema (matching Script 1)
     out = safe_generate_json(prompt, SUBGOAL_GEN_SCHEMA, temp=0.0) or {}
     subs = out.get("subgoals") or []
-    # Normalize and enforce constraints
+    
+    # Normalize keys: Script 1 uses "question", but logs show we need "text"
+    # Let's match Script 1's internal handling exactly
     clean: List[Dict[str, str]] = []
     for i, s in enumerate(subs, 1):
         try:
-            txt = (s.get("text") or "").strip()
+            # Script 1 uses "question" field in schema but "text" internally
+            txt = (s.get("question") or s.get("text") or "").strip()
             if not txt:
                 continue
-            sid = (s.get("id") or f"sg{i}").strip()
+            sid = (s.get("id") or f"SG{i}").strip()
             rat = (s.get("rationale") or "").strip()
-            clean.append({"id": sid, "text": txt, "rationale": rat})
+            clean.append({"id": sid, "question": txt, "rationale": rat})
         except Exception:
             continue
         if len(clean) >= max_n:
             break
+    
     if not clean:
-        clean = [{"id": "sg1", "text": query_original.strip(), "rationale": "No decomposition needed."}]
+        clean = [{"id": "SG1", "question": query_original.strip(), "rationale": "Decomposition not needed; answer the original query directly."}]
+    
     log(f"[SubgoalGenerator] Produced {len(clean)} subgoal(s): {[x['id'] for x in clean]}", level="INFO")
     return clean
 
@@ -1604,94 +1632,60 @@ def final_aggregator_agent(
     subgoal_results: List[Dict[str, Any]],
     lang: str
 ) -> Dict[str, Any]:
-    # Build concise input with clamped answer snippets
-    lines = []
-    for sg, res in zip(subgoals, subgoal_results):
-        ans = (res.get("final_answer") or "").strip()
-        snippet = clamp(ans, SUBGOAL_ANSWER_SNIPPET_CLAMP)
-        chosen = (res.get("aggregator_decision", {}) or {}).get("chosen", "")
-        conf = float((res.get("aggregator_decision", {}) or {}).get("confidence", 0.0))
-        lines.append(
-            f"- id={sg.get('id')} | subgoal: {sg.get('text')}\n"
-            f"  chosen_pipeline={chosen} confidence={conf:.2f}\n"
-            f"  answer_snippet:\n{snippet}\n"
-        )
-    subgoals_block = "\n".join(lines)
+    """
+    Aggregate multiple subgoal answers into a single final answer to the original query.
+    Uses ONLY information present in the subanswers; does not invent new facts.
+    """
+    # Build pairs text from subgoal results
+    pairs_text_lines = []
+    for i, (sg, res) in enumerate(zip(subgoals, subgoal_results), start=1):
+        q = sg.get("question", "").strip()
+        a = res.get("final_answer", "").strip()
+        pairs_text_lines.append(f"[Subgoal {i}] Q: {q}\nA: {a}\n")
+    pairs_text = "\n".join(pairs_text_lines)
 
     prompt = f"""
-You are the Final Aggregator agent.
+You are Agent 3 (Final Aggregator).
+Task: Answer the original user query using ONLY the information contained in the provided subgoal answers.
+Do NOT introduce new facts that are not supported by the subanswers.
+Resolve overlaps and contradictions transparently; prefer statements supported by explicit legal references (e.g., UU, Pasal/Article).
+Write clearly and concisely in the same language as the user's query ("{lang}").
 
-You receive the original question and a set of subgoal answers produced independently.
-Your job:
-- Synthesize a single, coherent, concise answer that addresses the original question fully.
-- Deduplicate and harmonize citations (UU/Undang-Undang, Pasal/Article numbers).
-- Resolve conflicts by preferring specific, well-cited, internally consistent points.
-- Indicate coverage per subgoal (covered: true/false; brief notes if not covered).
-- Respond in {lang} (same language as user).
-
-Return JSON with:
-- final_answer (string)
-- rationale (short)
-- confidence (0.0–1.0)
-- citations (optional list of strings)
-- coverage_by_subgoal: [{{id, covered, notes}}]
-
-{STRICT_JSON_DIRECTIVE}
-
-Original question:
+Original user query:
 \"\"\"{query_original}\"\"\"
 
-Subgoal inputs:
-{subgoals_block}
+Subgoal question–answer pairs:
+\"\"\"{pairs_text}\"\"\"
+
+Now produce ONE final answer to the original query. If there are gaps or contradictions, explain briefly.
 """
+    
+    est_tokens = estimate_tokens_for_text(prompt)
     log("\n[FinalAggregator] Prompt:", level="INFO")
     log(prompt, level="INFO")
-    out = safe_generate_json(prompt, FINAL_AGG_SCHEMA, temp=0.0) or {}
-    final_answer = (out.get("final_answer") or "").strip()
-    rationale = (out.get("rationale") or "").strip()
-    confidence = float(out.get("confidence") or 0.0)
-    citations = out.get("citations") or []
-    coverage = out.get("coverage_by_subgoal") or []
+    log(f"[FinalAggregator] Prompt size: {len(prompt)} chars, est_tokens≈{est_tokens}", level="INFO")
 
-    # Fallback deterministic merge if needed
-    if not final_answer:
-        log("[FinalAggregator] Fallback merge activated.", level="WARN")
-        # Sort by confidence desc
-        ordered = sorted(
-            [
-                (
-                    float((r.get("aggregator_decision") or {}).get("confidence", 0.0)),
-                    r.get("final_answer") or "",
-                    sg["id"],
-                    sg["text"]
-                )
-                for sg, r in zip(subgoals, subgoal_results)
-            ],
-            key=lambda x: x[0],
-            reverse=True
-        )
-        merged_parts = []
-        for conf, ans, sid, stext in ordered:
-            if ans.strip():
-                merged_parts.append(ans.strip())
-        final_answer = "\n".join(merged_parts) if merged_parts else (
-            "Maaf, saya tidak menemukan jawaban berdasarkan konteks yang tersedia." if lang == "id" else
-            "Sorry, I could not find an answer based on the available context."
-        )
-        # Confidence heuristic: average of top 2 if present
-        confs = [x[0] for x in ordered if isinstance(x[0], (int,float))]
-        confidence = sum(confs[:2]) / max(1, len(confs[:2])) if confs else 0.45
-        rationale = rationale or "Merged subgoal answers based on confidence and completeness."
-        coverage = [{"id": sg["id"], "covered": bool((subgoal_results[i].get("final_answer") or "").strip()), "notes": ""} for i, sg in enumerate(subgoals)]
-
-    log(f"[FinalAggregator] Confidence={confidence:.2f}", level="INFO")
+    t0 = now_ms()
+    final_answer = safe_generate_text(prompt, max_tokens=FINAL_AGG_MAX_TOKENS, temperature=0.2)
+    took = dur_ms(t0)
+    log(f"[FinalAggregator] Final answer length={len(final_answer)} | {took:.0f} ms", level="INFO")
+    
+    # Return in format expected by supervisor
     return {
         "final_answer": final_answer,
-        "rationale": rationale,
-        "confidence": confidence,
-        "citations": citations,
-        "coverage_by_subgoal": coverage
+        "rationale": "Aggregated from subgoal answers",
+        "confidence": 0.8,  # Default confidence
+        "citations": [],
+        "coverage_by_subgoal": [
+            {
+                "id": sg["id"], 
+                "covered": bool((res.get("final_answer") or "").strip()), 
+                "notes": ""
+            } 
+            for sg, res in zip(subgoals, subgoal_results)
+        ]
     }
+
 
 # ----------------- Supervisor Orchestrator (new) -----------------
 def agentic_supervisor(query_original: str) -> Dict[str, Any]:
@@ -1725,21 +1719,19 @@ def agentic_supervisor(query_original: str) -> Dict[str, Any]:
         # Subgoal generation
         subs = subgoal_generator_agent(query_original, user_lang, max_n=SUBGOAL_MAX_N)
         if not subs:
-            subs = [{"id": "sg1", "text": query_original.strip(), "rationale": "No decomposition."}]
-        subs = subs[:SUBGOAL_MAX_N]
+            subs = [{"id": "SG1", "question": query_original.strip(), "rationale": "No decomposition."}]
         log(f"[Supervisor] Executing {len(subs)} subgoal(s).", level="INFO")
 
         sub_results: List[Dict[str, Any]] = []
 
         def _run_one(sg: Dict[str, str]) -> Tuple[str, Dict[str, Any]]:
-            # Per-thread log context
             set_log_context(f"sg={sg.get('id')}")
             try:
-                res = agentic_multi(sg.get("text",""), logger=_LOGGER, log_context_prefix=f"sg={sg.get('id')}")
+                res = agentic_multi(sg.get("question",""), logger=_LOGGER, log_context_prefix=f"sg={sg.get('id')}")
                 return sg["id"], res
             except Exception as e:
                 log(f"[Supervisor] Subgoal {sg.get('id')} failed: {e}", level="ERROR")
-                return sg["id"], {"final_answer": "", "aggregator_decision": {"chosen":"", "confidence":0.0, "rationale": str(e)}}
+                return sg["id"], {"final_answer": "", "aggregator_decision": {"decision":"", "rationale": str(e)}}
 
         if SUBGOALS_RUN_IN_PARALLEL and len(subs) > 1:
             max_workers = max(1, min(SUBGOALS_MAX_WORKERS, len(subs)))
@@ -1753,8 +1745,10 @@ def agentic_supervisor(query_original: str) -> Dict[str, Any]:
                     sid, res = fut.result()
                     results_map[sid] = res
             # Preserve original subgoal order
+            # Preserve original subgoal order
             for sg in subs:
-                sub_results.append(results_map.get(sg["id"], {"final_answer": "", "aggregator_decision": {"chosen":"", "confidence":0.0}}))
+                sub_results.append(results_map.get(sg["id"], {"final_answer": "", "aggregator_decision": {"decision":"", "rationale":""}}))
+
         else:
             log("[Supervisor] Sequential execution.", level="INFO")
             for sg in subs:
@@ -1780,7 +1774,7 @@ def agentic_supervisor(query_original: str) -> Dict[str, Any]:
         for sg, res in zip(subs, sub_results):
             summarized_sub_results.append({
                 "id": sg.get("id"),
-                "subgoal_text": sg.get("text"),
+                "subgoal_text": sg.get("question"),  # Changed from "text" to "question"
                 "final_answer": res.get("final_answer",""),
                 "aggregator_decision": res.get("aggregator_decision", {}),
                 "iterations": res.get("iterations", 1)

@@ -73,7 +73,7 @@ OUTPUT_LANG = "id"  # retained for compatibility; we auto-detect based on query
 
 # ----------------- Intermediate Questions (new) -----------------
 # Hardcoded maximum number of intermediate questions Agent I0 may produce (per requirement)
-IQ_MAX_STEPS = 5
+IQ_MAX_STEPS = 3
 
 # Aggregation removed by design (final answer is the last IQ's answer)
 
@@ -200,7 +200,7 @@ def _as_float_list(vec) -> List[float]:
 # Retry helpers for any external API call (e.g., rate limit, network)
 def _rand_wait_seconds() -> float:
     # Uniform 5–20 seconds with jitter
-    return random.uniform(5.0, 20.0)
+    return random.uniform(50.0, 120.0)
 
 def _api_call_with_retry(func, *args, **kwargs):
     """
@@ -416,69 +416,102 @@ def safe_generate_text(prompt: str, max_tokens: int, temperature: float = 0.2) -
     return f"(Model returned no text. finish_info={info})"
 
 # ----------------- Agent I0: Intermediate Question Generator -----------------
+# ----------------- Agent I0: Intermediate Question Generator -----------------
+# Updated to match Script 1's approach exactly
 IQ_PLAN_SCHEMA = {
     "type": "object",
     "properties": {
-        "intermediate_questions": {
+        "iqs": {
             "type": "array",
-            "items": {"type": "string"}
-        },
-        "rationale": {"type": "string"}
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "question": {"type": "string"},
+                    "rationale": {"type": "string"},
+                    "depends_on": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["question"]
+            }
+        }
     },
-    "required": ["intermediate_questions"]
+    "required": ["iqs"]
 }
 
 def agent_i0_generate_iqs(query: str, user_lang: str) -> Dict[str, Any]:
+    """
+    Generate up to IQ_MAX_STEPS sequential, dependent intermediate questions (IQs).
+    Fallback: one IQ identical to the original query if decomposition isn't needed.
+    """
+    instruction = (
+        "Plan a short sequence of dependent intermediate questions (IQs) to answer the user's query. "
+        "Make later IQs depend on earlier answers only if that helps. "
+        f"Return at most {IQ_MAX_STEPS} IQs. If decomposition isn't needed, return exactly one IQ identical to the original query. "
+        "Write IQs in the same language as the user's query."
+    )
+    
     prompt = f"""
-You are Agent I0 (Intermediate Question Planner).
-Goal: produce a minimal, sequential plan of dependent intermediate questions (IQs) that, when answered in order, solve the user's query.
-If decomposition is unnecessary, return exactly a single-item list containing the original query.
+You are the Intermediate Question Planner.
 
-Rules:
-- The questions are dependent and must be answered in sequence.
-- Keep each IQ concise and self-contained for its step.
-- Respect the maximum number of steps: {IQ_MAX_STEPS} (truncate if more are proposed).
-- Keep the questions in the same language as the user query ("{user_lang}").
-
-Return JSON:
-- "intermediate_questions": array of strings (1..{IQ_MAX_STEPS})
-- "rationale": optional brief explanation (for diagnostics)
+Instruction:
+{instruction}
 
 User query:
 \"\"\"{query}\"\"\"
+
+Output JSON schema:
+- iqs: array of items with fields:
+  - id (string; optional; you may leave blank)
+  - question (string; REQUIRED; the intermediate question)
+  - rationale (string; optional; why this IQ is needed)
+  - depends_on (array of prior IQ ids, optional)
 """
     est_tokens = estimate_tokens_for_text(prompt)
     log("\n[Agent I0] Prompt:")
     log(prompt)
     log(f"[Agent I0] Prompt size: {len(prompt)} chars, est_tokens≈{est_tokens}")
+    
     t0 = now_ms()
-    data = safe_generate_json(prompt, IQ_PLAN_SCHEMA, temp=0.0)
-    took = dur_ms(t0)
-
-    iqs_raw = data.get("intermediate_questions", []) if isinstance(data, dict) else []
-    if not isinstance(iqs_raw, list):
-        iqs_raw = []
-    cleaned: List[str] = []
+    out = safe_generate_json(prompt, IQ_PLAN_SCHEMA, temp=0.0) or {}
+    raw_iqs = out.get("iqs", []) or []
+    
+    # Cleanup, deduplicate, clamp (matching Script 1's logic)
+    def _normalize_question(q: str) -> str:
+        q = (q or "").strip().lower()
+        q = re.sub(r"\s+", " ", q)
+        return q
+    
+    cleaned: List[Dict[str, Any]] = []
     seen = set()
-    for q in iqs_raw:
-        if not isinstance(q, str):
+    for i, iq in enumerate(raw_iqs, 1):
+        q = (iq.get("question") or "").strip()
+        if not q:
             continue
-        q2 = q.strip()
-        if not q2 or q2 in seen:
+        key = _normalize_question(q)
+        if key in seen:
             continue
-        seen.add(q2)
-        cleaned.append(q2)
+        seen.add(key)
+        rid = (iq.get("id") or "").strip() or f"IQ{i}"
+        rationale = (iq.get("rationale") or "").strip()
+        deps = iq.get("depends_on") or []
+        cleaned.append({"id": rid, "question": q, "rationale": rationale, "depends_on": deps})
         if len(cleaned) >= IQ_MAX_STEPS:
             break
+    
     if not cleaned:
-        cleaned = [query.strip()]
-    data["intermediate_questions"] = cleaned
-    data["rationale"] = data.get("rationale") or ""
-    log(f"[Agent I0] Planned IQ count: {len(cleaned)} | {took:.0f} ms")
-    log(f"[Agent I0] IQ plan: {cleaned}")
-    return data
-
-# ----------------- Agent Q: Query Modifier (enrich next IQ from previous QA) -----------------
+        cleaned = [{"id": "IQ1", "question": query.strip(), "rationale": "Decomposition not needed; answer the original query directly.", "depends_on": []}]
+    
+    took = dur_ms(t0)
+    log(f"[Agent I0] Planned {len(cleaned)} IQ(s) | {took:.0f} ms")
+    for iq in cleaned:
+        log(f"  - {iq['id']}: {iq['question']} (rationale: {iq.get('rationale','')})")
+    
+    # Return in a format compatible with the rest of Script 2
+    return {
+        "intermediate_questions": [iq["question"] for iq in cleaned],
+        "iqs_detailed": cleaned,  # Keep detailed info for reference
+        "rationale": ""  # Not used in Script 1 style
+    }# ----------------- Agent Q: Query Modifier (enrich next IQ from previous QA) -----------------
 MODIFIED_IQ_SCHEMA = {
     "type": "object",
     "properties": {
@@ -741,7 +774,7 @@ def run_cypher_with_retry(cypher: str, params: Dict[str, Any]) -> List[Any]:
             last_e = e
             if attempts >= NEO4J_MAX_ATTEMPTS:
                 break
-            wait_s = _rand_wait_seconds()
+            wait_s = random.uniform(5.0, 20.0)
             log(f"[Neo4j] Failure | qid={qid} | attempt={attempts}/{NEO4J_MAX_ATTEMPTS} | {took:.0f} ms | error={e}. Retrying in {wait_s:.1f}s.", level="WARN")
             time.sleep(wait_s)
     raise RuntimeError(f"Neo4j query failed after {NEO4J_MAX_ATTEMPTS} attempts (qid={qid}): {last_e}")
@@ -1451,11 +1484,12 @@ def agentic_graph_rag_iq(query_original: str) -> Dict[str, Any]:
         user_lang = detect_user_language(query_original)
         log(f"[Language] Detected user language: {user_lang}")
 
-        # Agent I0: plan IQs
+        # Agent I0: plan IQs (now using Script 1's approach)
         t0 = now_ms()
         plan = agent_i0_generate_iqs(query_original, user_lang)
         planned_iqs: List[str] = plan.get("intermediate_questions", []) or [query_original.strip()]
         planned_iqs = planned_iqs[:IQ_MAX_STEPS]
+        iqs_detailed = plan.get("iqs_detailed", [])
         log(f"[Agent I0] Final IQ plan (used): {planned_iqs}")
         t0_ms = dur_ms(t0)
 
@@ -1555,12 +1589,14 @@ def agentic_graph_rag_iq(query_original: str) -> Dict[str, Any]:
             "iq_plan": planned_iqs,
             "iq_completed": completed_iqs,
             "qa_pairs": qa_pairs,
-            "per_step_results": per_step_results
+            "per_step_results": per_step_results,
+            "iqs_detailed": iqs_detailed  # Include detailed IQ info
         }
     finally:
         if _LOGGER is not None:
             _LOGGER.close()
             _LOGGER = None
+
 
 # ----------------- Main -----------------
 if __name__ == "__main__":

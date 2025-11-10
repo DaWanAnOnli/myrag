@@ -33,7 +33,7 @@ NEO4J_PASS = os.getenv("NEO4J_PASS", "password")
 
 # Neo4j retry/timeout controls (to prevent infinite loops on persistent errors)
 NEO4J_TX_TIMEOUT_S = float(os.getenv("NEO4J_TX_TIMEOUT_S", "60"))  # per-query transaction timeout (seconds)
-NEO4J_MAX_ATTEMPTS = int(os.getenv("NEO4J_MAX_ATTEMPTS", "10"))   # max attempts for run_cypher_with_retry
+NEO4J_MAX_ATTEMPTS = int(os.getenv("NEO4J_MAX_ATTEMPTS", "100000"))   # max attempts for run_cypher_with_retry
 NEO4J_MAX_CONCURRENCY = int(os.getenv("NEO4J_MAX_CONCURRENCY", "0"))  # 0=unlimited
 
 # Gemini models (can be overridden via env if desired)
@@ -70,7 +70,7 @@ OUTPUT_LANG = "id"  # retained for compatibility; we auto-detect based on query
 
 # ----------------- Agentic (new) -----------------
 # Hardcoded maximum number of subgoals Agent 0 may produce (per requirement)
-SUBGOAL_MAX_COUNT = 2
+SUBGOAL_MAX_COUNT = 3
 
 # Max number of subgoals processed concurrently (configurable via env)
 SUBGOAL_MAX_PARALLELISM = int(os.getenv("SUBGOAL_MAX_PARALLELISM", "2"))
@@ -421,36 +421,49 @@ def safe_generate_text(prompt: str, max_tokens: int, temperature: float = 0.2) -
 SUBGOAL_SCHEMA = {
     "type": "object",
     "properties": {
-        "decomposition_needed": {"type": "boolean"},
         "subgoals": {
             "type": "array",
-            "items": {"type": "string"}
-        },
-        "justification": {"type": "string"}
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "question": {"type": "string"},
+                    "rationale": {"type": "string"}
+                },
+                "required": ["question"]
+            }
+        }
     },
-    "required": ["decomposition_needed", "subgoals"]
+    "required": ["subgoals"]
 }
 
 def agent0_generate_subgoals(query: str, user_lang: str) -> Dict[str, Any]:
+    # NEW: set variables used in the exact prompt text
+    max_subgoals = SUBGOAL_MAX_COUNT
+    query_original = query
+
+    instruction = (
+        "Decompose the user's query into independent, parallelizable sub-questions only if it improves clarity or answerability. "
+        f"Return at most {max_subgoals} subgoals. "
+        "If decomposition is unnecessary, return exactly one subgoal identical to the original query. "
+        "Write subgoals in the same language as the user's query."
+    )
     prompt = f"""
-You are Agent 0 (Subgoal Generator).
-Goal: break the user's query into a small set of independent, parallelizable subgoals that can be answered separately with minimal overlap.
-If decomposition is unnecessary, return a single subgoal equal to the original query.
+You are the Subgoal Generator.
 
-Rules:
-- Output at most {SUBGOAL_MAX_COUNT} subgoals.
-- Subgoals must be concise, self-contained, and non-overlapping.
-- Keep subgoals in the same language as the user's query ("{user_lang}").
-- If the query is atomic, set "decomposition_needed" to false and return [original_query].
-
-Return JSON with keys:
-- "decomposition_needed": boolean
-- "subgoals": array of strings (1..{SUBGOAL_MAX_COUNT})
-- "justification": short explanation (1–2 sentences)
+Instruction:
+{instruction}
 
 User query:
-\"\"\"{query}\"\"\"
+\"\"\"{query_original}\"\"\"
+
+Output JSON schema:
+- subgoals: array of items with fields:
+  - id (string; optional; you may leave blank)
+  - question (string; REQUIRED; an independently answerable sub-question)
+  - rationale (string; optional; why this subgoal helps)
 """
+
     est_tokens = estimate_tokens_for_text(prompt)
     log("\n[Agent 0] Prompt:")
     log(prompt)
@@ -459,32 +472,42 @@ User query:
     data = safe_generate_json(prompt, SUBGOAL_SCHEMA, temp=0.0)
     took = dur_ms(t0)
 
-    # Sanitize results
+# Sanitize results
     subgoals_raw = data.get("subgoals", []) if isinstance(data, dict) else []
     if not isinstance(subgoals_raw, list):
         subgoals_raw = []
-    # Deduplicate, trim, enforce cap and language neutrality (we rely on instruction)
+
+    # Deduplicate, trim, enforce cap
     seen = set()
     cleaned: List[str] = []
-    for s in subgoals_raw:
-        if not isinstance(s, str):
+    for sg in subgoals_raw:
+        if isinstance(sg, dict):
+            q = (sg.get("question") or "").strip()
+        elif isinstance(sg, str):
+            q = sg.strip()
+        else:
             continue
-        s2 = s.strip()
-        if not s2:
+        
+        if not q:
             continue
-        if s2 in seen:
+        
+        # Normalize for deduplication
+        q_norm = q.lower()
+        if q_norm in seen:
             continue
-        seen.add(s2)
-        cleaned.append(s2)
+        
+        seen.add(q_norm)
+        cleaned.append(q)
+        
         if len(cleaned) >= SUBGOAL_MAX_COUNT:
             break
 
     # Fallback if empty
     if not cleaned:
         cleaned = [query.strip()]
-        data["decomposition_needed"] = False
+
     data["subgoals"] = cleaned
-    data["justification"] = data.get("justification") or ""
+
     log(f"[Agent 0] Decomposition needed? {data.get('decomposition_needed')} | subgoals={len(cleaned)} | {took:.0f} ms")
     log(f"[Agent 0] Subgoals: {cleaned}")
     return data

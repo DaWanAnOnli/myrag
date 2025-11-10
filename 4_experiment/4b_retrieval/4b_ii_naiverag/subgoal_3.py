@@ -41,7 +41,7 @@ ANSWER_MAX_TOKENS = int(os.getenv("ANSWER_MAX_TOKENS", "4096"))
 MAX_ITERS = 1  # We maintain single-pass for answerer per prompt
 
 # Subgoals + Aggregator
-MAX_SUBGOALS = int(os.getenv("MAX_SUBGOALS", "2"))  # hard cap on subgoals
+MAX_SUBGOALS = int(os.getenv("MAX_SUBGOALS", "3"))  # hard cap on subgoals
 SUBGOAL_TOP_K = int(os.getenv("SUBGOAL_TOP_K", str(TOP_K_CHUNKS)))  # top-k per subgoal retrieval
 SUBGOAL_MAX_WORKERS = int(os.getenv("SUBGOAL_MAX_WORKERS", "2"))  # parallelism for subgoal answering
 AGGREGATOR_MAX_TOKENS = int(os.getenv("AGGREGATOR_MAX_TOKENS", "4096"))
@@ -128,7 +128,7 @@ class RateLimiter:
 _LLM_RATE_LIMITER = RateLimiter(LLM_CALLS_PER_MINUTE)
 
 def _rand_wait_seconds() -> float:
-    return random.uniform(5.0, 20.0)
+    return random.uniform(50.0, 120.0)
 
 # --- Retry helpers split by API type ---
 def _llm_call_with_retry(func, *args, **kwargs):
@@ -148,7 +148,7 @@ def _embedding_call_with_retry(func, *args, **kwargs):
         try:
             return func(*args, **kwargs)
         except Exception as e:
-            wait_s = _rand_wait_seconds()
+            wait_s = random.uniform(5.0, 12.0)
             log(f"[Retry] Embedding call failed: {e}. Retrying in {wait_s:.1f}s.")
             time.sleep(wait_s)
 
@@ -173,7 +173,7 @@ def run_cypher_with_retry(cypher: str, params: Dict[str, Any]) -> List[Any]:
                 res = session.run(cypher, **params)
                 return list(res)
         except Exception as e:
-            wait_s = _rand_wait_seconds()
+            wait_s = random.uniform(50.0, 120.0)
             log(f"[Retry] Neo4j query failed: {e}. Retrying in {wait_s:.1f}s.")
             time.sleep(wait_s)
 
