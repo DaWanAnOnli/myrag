@@ -24,7 +24,7 @@ NEO4J_PASS = os.getenv("NEO4J_PASS", "password")
 
 # Neo4j retry/timeout controls (to prevent infinite loops on persistent errors)
 NEO4J_TX_TIMEOUT_S = float(os.getenv("NEO4J_TX_TIMEOUT_S", "60"))  # per-query transaction timeout (seconds)
-NEO4J_MAX_ATTEMPTS = int(os.getenv("NEO4J_MAX_ATTEMPTS", "10"))   # max attempts for run_cypher_with_retry
+NEO4J_MAX_ATTEMPTS = int(os.getenv("NEO4J_MAX_ATTEMPTS", "100000"))   # max attempts for run_cypher_with_retry
 
 # Gemini models (can be overridden via env if desired)
 GEN_MODEL = os.getenv("GEN_MODEL", "models/gemini-2.5-flash")
@@ -39,7 +39,7 @@ SKIP_FILES = {"all_langchain_documents.pkl"}
 # Independent hop-depth and top-k per step (each "n" is independent as requested)
 # Entity-centric path
 ENTITY_MATCH_TOP_K = 15                 # top similar KG entities per extracted query entity
-ENTITY_SUBGRAPH_HOPS = 5               # hop-depth for subgraph expansion from matched entities
+ENTITY_SUBGRAPH_HOPS = 4               # hop-depth for subgraph expansion from matched entities
 ENTITY_SUBGRAPH_PER_HOP_LIMIT = 2000   # per-hop expansion limit
 SUBGRAPH_TRIPLES_TOP_K = 30            # top triples selected from subgraph after triple-vs-triple similarity
 

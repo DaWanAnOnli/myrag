@@ -16,8 +16,8 @@ from collections import Counter
 
 # Relative paths from this script's location
 SCRIPT_DIR = Path(__file__).resolve().parent
-LOG_FOLDER = SCRIPT_DIR / "../../4b_retrieval/4b_iv_multi_agents/question_terminal_logs_multi_agent/approach_2_router_5_hops_1250"
-OUTPUT_FOLDER = SCRIPT_DIR / "llm_calls_analysis_results_approach_2_router_5_hops_1250"
+LOG_FOLDER = SCRIPT_DIR / "../../4b_retrieval/4b_iv_multi_agents/question_terminal_logs_multi_agent/no_15_approach_2_router_new"
+OUTPUT_FOLDER = SCRIPT_DIR / "llm_calls_analysis_results_approach_2_router"
 
 
 def extract_query_from_log(log_path: Path) -> str:
@@ -37,36 +37,36 @@ def extract_query_from_log(log_path: Path) -> str:
 def extract_router_decision(log_path: Path) -> Dict[str, any]:
     """Extract router decision from the log."""
     decision = {
-        'chosen': None,
+        'decision': None,  # Changed from 'chosen' to 'decision'
         'confidence': 0.0,
         'rationale': '',
-        'signals': []
+        'signals': [],
+        'fallback': False
     }
     
     try:
         with open(log_path, 'r', encoding='utf-8') as f:
             content = f.read()
             
-            # Extract decision
-            chosen_match = re.search(r'\[Router\] Decision: chosen=(\w+)', content)
-            if chosen_match:
-                decision['chosen'] = chosen_match.group(1)
+            # Extract decision - now looks for "Decision=graphrag" or "Decision=naiverag"
+            decision_match = re.search(r'\[Router\] Decision=(\w+)', content)
+            if decision_match:
+                decision['decision'] = decision_match.group(1)
             
-            # Extract confidence
-            conf_match = re.search(r'confidence=([\d.]+)', content)
-            if conf_match:
-                decision['confidence'] = float(conf_match.group(1))
+            # Also check for "Router choice:" format in summary
+            if not decision['decision']:
+                choice_match = re.search(r'Router choice:\s*(\w+)', content)
+                if choice_match:
+                    decision['decision'] = choice_match.group(1)
             
             # Extract rationale (may span multiple lines)
-            rat_match = re.search(r'- Rationale:\s*(.+?)(?:\n-|\n===|$)', content, re.DOTALL)
+            rat_match = re.search(r'rationale[=:]\s*(.+?)(?:\n\[|\n-|\n===|$)', content, re.DOTALL | re.IGNORECASE)
             if rat_match:
                 decision['rationale'] = rat_match.group(1).strip()
             
-            # Extract signals
-            sig_match = re.search(r'- Signals:\s*\[([^\]]+)\]', content)
-            if sig_match:
-                signals_str = sig_match.group(1)
-                decision['signals'] = [s.strip().strip("'\"") for s in signals_str.split(',')]
+            # Check for fallback indicator
+            if 'fallback heuristic' in content.lower() or 'Fallback' in content:
+                decision['fallback'] = True
     
     except Exception as e:
         print(f"Error extracting router decision from {log_path.name}: {e}")
@@ -84,13 +84,19 @@ def detect_pipeline_executed(log_path: Path) -> str:
             if "=== GraphRAG (single-pass) started ===" in content:
                 return "graphrag"
             elif "=== Naive RAG (Answerer-only) started ===" in content:
-                return "naive"
+                return "naiverag"  # Changed from "naive" to "naiverag"
+            
+            # Check for iteration markers from Script 1 style
+            if "--- GraphRAG Iteration" in content or "[G" in content:
+                return "graphrag"
+            elif "--- NaiveRAG Iteration" in content or "[N" in content:
+                return "naiverag"
             
             # Fallback: check for completion markers
             if "[G.Step" in content or "GraphRAG finished" in content:
                 return "graphrag"
             elif "[N.Step" in content or "Naive RAG finished" in content:
-                return "naive"
+                return "naiverag"
     
     except Exception as e:
         print(f"Error detecting pipeline from {log_path.name}: {e}")
@@ -117,11 +123,12 @@ def analyze_log_file(log_path: Path) -> Dict:
         'embed_calls': 0,
         'chunks_retrieved': 0,
         'triples_retrieved': 0,
-        'pipeline_executed': None,  # 'graphrag' or 'naive'
-        'router_chosen': None,
+        'pipeline_executed': None,  # 'graphrag' or 'naiverag'
+        'router_decision': None,  # Changed from 'router_chosen'
         'router_confidence': 0.0,
         'router_rationale': '',
         'router_signals': [],
+        'router_fallback': False,
         'mode': 'unknown'
     }
     
@@ -141,10 +148,11 @@ def analyze_log_file(log_path: Path) -> Dict:
             
             # Extract router decision
             router_dec = extract_router_decision(log_path)
-            result['router_chosen'] = router_dec['chosen']
+            result['router_decision'] = router_dec['decision']
             result['router_confidence'] = router_dec['confidence']
             result['router_rationale'] = router_dec['rationale']
             result['router_signals'] = router_dec['signals']
+            result['router_fallback'] = router_dec['fallback']
             
             # Count Router prompts (should be 1)
             router_matches = re.findall(r'\[Router\] Prompt:', content)
@@ -173,23 +181,23 @@ def analyze_log_file(log_path: Path) -> Dict:
             )
             
             # Count embedding calls
-            embed_matches = re.findall(r'\[Embed\]|Embedded', content)
+            embed_matches = re.findall(r'\[Embed\]|Embedded|embed_text', content)
             result['embed_calls'] = len(embed_matches)
             
             # Extract retrieval stats based on pipeline
             if result['pipeline_executed'] == 'graphrag':
-                chunks = re.search(r'Selected (\d+) chunks', content)
+                chunks = re.search(r'Selected (\d+) chunks|chunks_selected=(\d+)', content)
                 if chunks:
-                    result['chunks_retrieved'] = int(chunks.group(1))
+                    result['chunks_retrieved'] = int(chunks.group(1) or chunks.group(2))
                 
-                triples = re.search(r'Selected (\d+) triples', content)
+                triples = re.search(r'Selected (\d+) triples|triples_selected=(\d+)', content)
                 if triples:
-                    result['triples_retrieved'] = int(triples.group(1))
+                    result['triples_retrieved'] = int(triples.group(1) or triples.group(2))
             
-            elif result['pipeline_executed'] == 'naive':
-                chunks = re.search(r'Vector search returned (\d+) candidates', content)
+            elif result['pipeline_executed'] == 'naiverag':
+                chunks = re.search(r'Vector search returned (\d+) candidates|num_candidates[=:](\d+)', content)
                 if chunks:
-                    result['chunks_retrieved'] = int(chunks.group(1))
+                    result['chunks_retrieved'] = int(chunks.group(1) or chunks.group(2) if chunks.lastindex >= 2 else chunks.group(1))
             
     except Exception as e:
         print(f"Error analyzing {log_path.name}: {e}")
@@ -232,16 +240,17 @@ def create_router_summary(results: List[Dict]) -> Dict[str, any]:
         'total_queries': len(router_results),
         'decisions': {
             'graphrag': 0,
-            'naive': 0,
+            'naiverag': 0,
             'graphrag_fallback': 0,
-            'naive_fallback': 0,
+            'naiverag_fallback': 0,
             'unknown': 0
         },
         'pipeline_executed': {
             'graphrag': 0,
-            'naive': 0,
+            'naiverag': 0,
             'unknown': 0
         },
+        'fallback_count': 0,
         'confidence_stats': {
             'mean': 0.0,
             'median': 0.0,
@@ -251,7 +260,7 @@ def create_router_summary(results: List[Dict]) -> Dict[str, any]:
         },
         'by_decision': {
             'graphrag': {'count': 0, 'avg_confidence': 0.0, 'avg_llm_calls': 0.0, 'queries': []},
-            'naive': {'count': 0, 'avg_confidence': 0.0, 'avg_llm_calls': 0.0, 'queries': []}
+            'naiverag': {'count': 0, 'avg_confidence': 0.0, 'avg_llm_calls': 0.0, 'queries': []}
         },
         'common_signals': Counter()
     }
@@ -261,11 +270,15 @@ def create_router_summary(results: List[Dict]) -> Dict[str, any]:
     
     # Count decisions
     for r in router_results:
-        choice = r.get('router_chosen', 'unknown')
+        choice = r.get('router_decision', 'unknown')
         if choice in summary['decisions']:
             summary['decisions'][choice] += 1
         else:
             summary['decisions']['unknown'] += 1
+        
+        # Count fallbacks
+        if r.get('router_fallback', False):
+            summary['fallback_count'] += 1
         
         # Count actual pipeline executed
         pipeline = r.get('pipeline_executed', 'unknown')
@@ -286,7 +299,8 @@ def create_router_summary(results: List[Dict]) -> Dict[str, any]:
                 'confidence': r.get('router_confidence', 0.0),
                 'rationale': r.get('router_rationale', '')[:200],
                 'llm_calls': r.get('total_llm_calls', 0),
-                'signals': r.get('router_signals', [])
+                'signals': r.get('router_signals', []),
+                'fallback': r.get('router_fallback', False)
             })
     
     # Confidence statistics
@@ -302,7 +316,7 @@ def create_router_summary(results: List[Dict]) -> Dict[str, any]:
             summary['confidence_stats']['std_dev'] = statistics.stdev(confidences)
     
     # Average stats by decision type
-    for choice in ['graphrag', 'naive']:
+    for choice in ['graphrag', 'naiverag']:
         queries = summary['by_decision'][choice]['queries']
         if queries:
             summary['by_decision'][choice]['avg_confidence'] = sum(q['confidence'] for q in queries) / len(queries)
@@ -324,7 +338,7 @@ def save_results(results: List[Dict]):
     csv_fields = [
         'log_file', 'query', 'mode', 'pipeline_executed',
         'total_llm_calls', 'router_calls', 'agent1_calls', 'agent1b_calls', 'agent2_calls',
-        'router_chosen', 'router_confidence',
+        'router_decision', 'router_confidence', 'router_fallback',
         'embed_calls', 'chunks_retrieved', 'triples_retrieved'
     ]
     
@@ -357,15 +371,16 @@ def save_results(results: List[Dict]):
     router_path = output_folder / f"router_decisions_{timestamp}.json"
     router_data = []
     for r in results:
-        if r.get('router_chosen'):
+        if r.get('router_decision'):
             router_data.append({
                 'log_file': r['log_file'],
                 'query': r['query'],
-                'chosen': r['router_chosen'],
+                'decision': r['router_decision'],
                 'executed': r['pipeline_executed'],
                 'confidence': r['router_confidence'],
                 'rationale': r['router_rationale'],
-                'signals': r['router_signals']
+                'signals': r['router_signals'],
+                'fallback': r['router_fallback']
             })
     
     with open(router_path, 'w', encoding='utf-8') as f:
@@ -379,6 +394,7 @@ def save_results(results: List[Dict]):
         writer = csv.writer(f)
         writer.writerow(['Metric', 'Value'])
         writer.writerow(['Total Queries', router_summary['total_queries']])
+        writer.writerow(['Fallback Decisions', router_summary['fallback_count']])
         writer.writerow([''])
         writer.writerow(['Router Decisions:', ''])
         for decision, count in router_summary['decisions'].items():
@@ -398,8 +414,8 @@ def save_results(results: List[Dict]):
         writer.writerow([''])
         writer.writerow(['GraphRAG Avg Confidence', f"{router_summary['by_decision']['graphrag']['avg_confidence']:.4f}"])
         writer.writerow(['GraphRAG Avg LLM Calls', f"{router_summary['by_decision']['graphrag']['avg_llm_calls']:.2f}"])
-        writer.writerow(['Naive Avg Confidence', f"{router_summary['by_decision']['naive']['avg_confidence']:.4f}"])
-        writer.writerow(['Naive Avg LLM Calls', f"{router_summary['by_decision']['naive']['avg_llm_calls']:.2f}"])
+        writer.writerow(['NaiveRAG Avg Confidence', f"{router_summary['by_decision']['naiverag']['avg_confidence']:.4f}"])
+        writer.writerow(['NaiveRAG Avg LLM Calls', f"{router_summary['by_decision']['naiverag']['avg_llm_calls']:.2f}"])
     
     print(f"Router statistics CSV saved to: {router_stats_csv_path}")
     
@@ -415,6 +431,7 @@ def save_results(results: List[Dict]):
         f.write("SUMMARY STATISTICS\n")
         f.write("-" * 80 + "\n")
         f.write(f"Total queries analyzed: {router_summary['total_queries']}\n")
+        f.write(f"Fallback (heuristic) decisions: {router_summary['fallback_count']}\n")
         
         f.write("Router Decision Distribution:\n")
         for decision, count in router_summary['decisions'].items():
@@ -442,7 +459,7 @@ def save_results(results: List[Dict]):
         f.write("DETAILED DECISIONS BY TYPE\n")
         f.write("-" * 80 + "\n")
         
-        for decision_type in ['graphrag', 'naive']:
+        for decision_type in ['graphrag', 'naiverag']:
             decision_data = router_summary['by_decision'][decision_type]
             if decision_data['count'] > 0:
                 f.write(f"{decision_type.upper()} ({decision_data['count']} queries)\n")
@@ -451,24 +468,24 @@ def save_results(results: List[Dict]):
                 f.write("-" * 40 + "\n")
                 
                 for i, q in enumerate(decision_data['queries'][:10], 1):
-                    f.write(f"{i}. Confidence: {q['confidence']:.2f} | LLM Calls: {q['llm_calls']}\n")
+                    fallback_marker = " [FALLBACK]" if q.get('fallback', False) else ""
+                    f.write(f"{i}. Confidence: {q['confidence']:.2f} | LLM Calls: {q['llm_calls']}{fallback_marker}\n")
                     f.write(f"   Query: {q['query']}\n")
-                    f.write(f"   Signals: {', '.join(q['signals'])}\n")
+                    f.write(f"   Signals: {', '.join(q['signals']) if q['signals'] else 'N/A'}\n")
                     f.write(f"   Rationale: {q['rationale']}\n")
-                
-                f.write("\n")
         
         f.write(separator + "\n")
         f.write("INDIVIDUAL DECISIONS\n")
         f.write("-" * 80 + "\n")
         
         for i, r in enumerate(results, 1):
-            if r.get('router_chosen'):
+            if r.get('router_decision'):
+                fallback_marker = " [FALLBACK HEURISTIC]" if r.get('router_fallback', False) else ""
                 f.write(f"[{i}] {r['log_file']}\n")
                 f.write(f"Query: {r['query']}\n")
-                f.write(f"Router Chose: {r['router_chosen']} | Executed: {r['pipeline_executed']}\n")
+                f.write(f"Router Decided: {r['router_decision']} | Executed: {r['pipeline_executed']}{fallback_marker}\n")
                 f.write(f"Confidence: {r['router_confidence']:.2f} | LLM Calls: {r['total_llm_calls']}\n")
-                f.write(f"Signals: {', '.join(r['router_signals'])}\n")
+                f.write(f"Signals: {', '.join(r['router_signals']) if r['router_signals'] else 'N/A'}\n")
                 f.write(f"Rationale: {r['router_rationale']}\n")
                 f.write("-" * 80 + "\n")
     
@@ -511,7 +528,7 @@ def create_summary(results: List[Dict], router_summary: Dict) -> str:
     
     # Pipeline execution counts
     graphrag_executed = sum(1 for r in router_results if r.get('pipeline_executed') == 'graphrag')
-    naive_executed = sum(1 for r in router_results if r.get('pipeline_executed') == 'naive')
+    naiverag_executed = sum(1 for r in router_results if r.get('pipeline_executed') == 'naiverag')
     
     min_llm = min(r['total_llm_calls'] for r in results) if results else 0
     max_llm = max(r['total_llm_calls'] for r in results) if results else 0
@@ -554,7 +571,7 @@ def create_summary(results: List[Dict], router_summary: Dict) -> str:
 
 📊 Router Decision Distribution:
 """
-        for choice in ['graphrag', 'naive', 'graphrag_fallback', 'naive_fallback']:
+        for choice in ['graphrag', 'naiverag', 'graphrag_fallback', 'naiverag_fallback']:
             count = router_summary['decisions'][choice]
             if count > 0:
                 percentage = (count / router_summary['total_queries']) * 100
@@ -564,8 +581,10 @@ def create_summary(results: List[Dict], router_summary: Dict) -> str:
         router_section += f"""
 🔧 Pipeline Actually Executed:
 ├─ GraphRAG: {graphrag_executed} queries ({graphrag_executed/len(router_results)*100:.1f}%)
-├─ Naive RAG: {naive_executed} queries ({naive_executed/len(router_results)*100:.1f}%)
-└─ Avg LLM calls: GraphRAG={router_summary['by_decision']['graphrag']['avg_llm_calls']:.2f}, Naive={router_summary['by_decision']['naive']['avg_llm_calls']:.2f}
+├─ NaiveRAG: {naiverag_executed} queries ({naiverag_executed/len(router_results)*100:.1f}%)
+└─ Avg LLM calls: GraphRAG={router_summary['by_decision']['graphrag']['avg_llm_calls']:.2f}, NaiveRAG={router_summary['by_decision']['naiverag']['avg_llm_calls']:.2f}
+
+⚠️  Fallback Decisions: {router_summary['fallback_count']} queries used heuristic fallback
 
 📈 Confidence Statistics:
 ├─ Mean: {router_summary['confidence_stats']['mean']:.4f}
@@ -582,11 +601,15 @@ def create_summary(results: List[Dict], router_summary: Dict) -> str:
         router_section = ""
     
     pipeline_doc = """
-💡 Pipeline Pattern (Router-based):
+💡 Pipeline Pattern (Router-based - Aligned with Script 1):
    └─ For each query:
       1. Router agent analyzes query (1 LLM call - JSON)
-         - Chooses EITHER GraphRAG OR Naive RAG (not both)
-         - Considers: specificity, multi-hop needs, entity relationships
+         - Chooses EITHER GraphRAG OR NaiveRAG (not both)
+         - Uses same prompt/schema as Script 1 for consistency
+         - Decision values: "graphrag" or "naiverag"
+         - Considers: explicit citations, quote/define intent, multi-hop needs, 
+                     entity relationships, predicates, scope/exceptions
+         - Fallback: if LLM fails, heuristic based on regex patterns
       
       2a. IF Router chooses GraphRAG:
          - Agent 1: entity extraction (1 LLM call - JSON)
@@ -595,14 +618,15 @@ def create_summary(results: List[Dict], router_summary: Dict) -> str:
          - Agent 2: answer from graph context (1 LLM call - TEXT)
          - Total: 1 (router) + 3 (graphrag) = 4 LLM calls
       
-      2b. IF Router chooses Naive RAG:
+      2b. IF Router chooses NaiveRAG:
          - Direct vector search over chunks
          - Agent 1/1b: called but ignored (for logs only)
          - Agent 2: answer from chunk context (1 LLM call - TEXT)
-         - Total: 1 (router) + 1 (naive) = 2 LLM calls
+         - Total: 1 (router) + 1 (naiverag) = 2 LLM calls
    
    └─ Key advantage: Only one pipeline runs (cost-efficient)
    └─ Agent 1/1b in Naive RAG not counted per user request
+   └─ Router logic matches Script 1 exactly for consistent distribution
 """
     
     agent_breakdown = f"""
@@ -612,7 +636,7 @@ def create_summary(results: List[Dict], router_summary: Dict) -> str:
 │  ├─ Agent 1 (entity extraction): {total_agent1}
 │  ├─ Agent 1b (triple extraction): {total_agent1b}
 │  └─ Agent 2 (graph-based answerer): counted in total below
-├─ Naive RAG pipeline (when chosen):
+├─ NaiveRAG pipeline (when chosen):
 │  ├─ Agent 1/1b: present but ignored in count
 │  └─ Agent 2 (chunk-based answerer): counted in total below
 ├─ Agent 2 (total, both pipelines): {total_agent2}
@@ -628,58 +652,70 @@ def create_summary(results: List[Dict], router_summary: Dict) -> str:
     top_graphrag_section = """
 📌 TOP QUERIES WHERE ROUTER CHOSE GRAPHRAG:
 """
-    graphrag_queries = [r for r in router_results if r.get('router_chosen', '').startswith('graphrag')]
+    graphrag_queries = [r for r in router_results if r.get('router_decision', '').startswith('graphrag')]
     graphrag_sorted = sorted(graphrag_queries, key=lambda x: x.get('router_confidence', 0), reverse=True)
     for i, r in enumerate(graphrag_sorted[:5], 1):
         query_preview = r['query'][:60] + "..." if len(r['query']) > 60 else r['query']
-        top_graphrag_section += f"{i}. Confidence: {r['router_confidence']:.2f} | LLM Calls: {r['total_llm_calls']}\n"
+        fallback = " [FALLBACK]" if r.get('router_fallback', False) else ""
+        top_graphrag_section += f"{i}. Confidence: {r['router_confidence']:.2f} | LLM Calls: {r['total_llm_calls']}{fallback}\n"
         top_graphrag_section += f"   {query_preview}\n"
     
     if not graphrag_queries:
         top_graphrag_section += "   (No queries where GraphRAG was chosen)\n"
     
-    top_naive_section = """
-📌 TOP QUERIES WHERE ROUTER CHOSE NAIVE:
+    top_naiverag_section = """
+📌 TOP QUERIES WHERE ROUTER CHOSE NAIVERAG:
 """
-    naive_queries = [r for r in router_results if r.get('router_chosen', '').startswith('naive')]
-    naive_sorted = sorted(naive_queries, key=lambda x: x.get('router_confidence', 0), reverse=True)
-    for i, r in enumerate(naive_sorted[:5], 1):
+    naiverag_queries = [r for r in router_results if r.get('router_decision', '').startswith('naiverag')]
+    naiverag_sorted = sorted(naiverag_queries, key=lambda x: x.get('router_confidence', 0), reverse=True)
+    for i, r in enumerate(naiverag_sorted[:5], 1):
         query_preview = r['query'][:60] + "..." if len(r['query']) > 60 else r['query']
-        top_naive_section += f"{i}. Confidence: {r['router_confidence']:.2f} | LLM Calls: {r['total_llm_calls']}\n"
-        top_naive_section += f"   {query_preview}\n"
+        fallback = " [FALLBACK]" if r.get('router_fallback', False) else ""
+        top_naiverag_section += f"{i}. Confidence: {r['router_confidence']:.2f} | LLM Calls: {r['total_llm_calls']}{fallback}\n"
+        top_naiverag_section += f"   {query_preview}\n"
     
-    if not naive_queries:
-        top_naive_section += "   (No queries where Naive was chosen)\n"
+    if not naiverag_queries:
+        top_naiverag_section += "   (No queries where NaiveRAG was chosen)\n"
     
     comparison_doc = """
 📊 COMPARISON TO OTHER METHODS:
 └─ Router-based Multi-Agent characteristics:
    ├─ Router intelligently selects ONE pipeline (not both)
+   ├─ Router logic aligned with Script 1 for consistent decisions
    ├─ Lower cost than running both pipelines + aggregator
    ├─ GraphRAG: for multi-hop, relational, structural queries
-   ├─ Naive RAG: for direct, localized, single-article queries
-   ├─ LLM cost: 4 calls (GraphRAG) or 2 calls (Naive)
+   ├─ NaiveRAG: for direct, localized, single-article queries
+   ├─ LLM cost: 4 calls (GraphRAG) or 2 calls (NaiveRAG)
    ├─ No aggregation overhead (unlike multi-agent with aggregator)
+   ├─ Fallback heuristic ensures robustness
    └─ Best for: mixed workloads with varying complexity
 """
     
-    notes_doc = """
+    notes_doc = f"""
 📝 Notes:
    - Router pattern: 1 router call + 1 chosen pipeline
    - GraphRAG: 1 + 3 = 4 LLM calls total
-   - Naive RAG: 1 + 1 = 2 LLM calls total (Agent 1/1b ignored)
+   - NaiveRAG: 1 + 1 = 2 LLM calls total (Agent 1/1b ignored)
    - Agent 1/1b called in Naive RAG "for logs only" but not counted
    - Only ONE pipeline executes per query (cost-efficient)
-   - Router uses signals: entity count, predicate keywords, multi-reference
-   - Fallback handling: if chosen pipeline fails, try the other
-   - Router confidence indicates decision certainty
+   - Router uses exact same prompt/schema as Script 1
+   - Decision values: "graphrag" or "naiverag" (aligned with Script 1)
+   - Router signals: explicit_citations, request_quote_or_definition, 
+                     entity_count_estimate, multi_hop_intent, comparison_intent,
+                     exception_or_scope_intent, timeframe_or_effectivity
+   - Fallback handling: if LLM router fails, heuristic routing based on:
+     • explicit_citation regex patterns
+     • quote_define keywords
+     • multi_hop indicators
+     • entity count (capitalized words)
+   - Fallback decisions: {router_summary['fallback_count']} of {router_summary['total_queries']} queries
    - Common signals help understand routing logic
 """
     
     summary = (
         header + overall_section + averages_section + ranges_section + 
         router_section + pipeline_doc + agent_breakdown + retrieval_stats + 
-        top_graphrag_section + top_naive_section + 
+        top_graphrag_section + top_naiverag_section + 
         comparison_doc + notes_doc
     )
     

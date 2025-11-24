@@ -190,10 +190,12 @@ dataset
 ## 4b_retrieval logs
 ### 4b_i_lexidkg_graphrag
 4_experiment/4b_retrieval/4b_i_lexidkg_graphrag/question_terminal_logs
+4_experiment/4b_retrieval/4b_i_lexidkg_graphrag/old
 4_experiment/4b_retrieval/4b_i_lexidkg_graphrag/*.txt
 
 ### 4b_ii_naiverag
 4_experiment/4b_retrieval/4b_ii_naiverag/question_terminal_logs_naive_over_graph
+4_experiment/4b_retrieval/4b_ii_naiverag/old
 4_experiment/4b_retrieval/4b_ii_naiverag/*.txt
 
 ### 4b_iii_naivekg_graphrag
@@ -201,12 +203,15 @@ dataset
 4_experiment/4b_retrieval/4b_iii_naivekg_graphrag/*.txt
 
 4_experiment/4b_retrieval/4b_iv_multi_agents/question_terminal_logs_multi_agent
+4_experiment/4b_retrieval/4b_iv_multi_agents/old
 4_experiment/4b_retrieval/4b_iv_multi_agents/*.txt
 4_experiment/4b_retrieval/4b_iv_multi_agents/*.jsonl
 
 4_experiment/4c_results_and_analysis/get_durations/results
 4_experiment/4c_results_and_analysis/get_llm_calls/results
-
+4_experiment/4c_results_and_analysis/get_token_count
+4_experiment/4c_results_and_analysis/pipeline_specific_analysis/results
+4_experiment/4c_results_and_analysis/*.txt
 
 ## 4c_results_and_analysis
 4_experiment/4c_results_and_analysis/llm_judge_logs

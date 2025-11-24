@@ -45,7 +45,7 @@ CHUNK_TEXT_CLAMP = int(os.getenv("CHUNK_TEXT_CLAMP", "1000000"))   # max chars p
 ANSWER_MAX_TOKENS = int(os.getenv("ANSWER_MAX_TOKENS", "4096"))
 
 # Iterative Answer Judge/Modifier settings
-MAX_ANSWER_JUDGE_ITERATIONS = int(os.getenv("MAX_ANSWER_JUDGE_ITERATIONS", "4"))   # hard cap on loops
+MAX_ANSWER_JUDGE_ITERATIONS = int(os.getenv("MAX_ANSWER_JUDGE_ITERATIONS", "2"))   # hard cap on loops
 ANSWER_JUDGE_MAX_TOKENS = int(os.getenv("ANSWER_JUDGE_MAX_TOKENS", "4096"))
 QUERY_MODIFIER_MAX_TOKENS = int(os.getenv("QUERY_MODIFIER_MAX_TOKENS", "4096"))
 
@@ -176,7 +176,7 @@ def run_cypher_with_retry(cypher: str, params: Dict[str, Any]) -> List[Any]:
                 res = session.run(cypher, **params)
                 return list(res)
         except Exception as e:
-            wait_s = _rand_wait_seconds()
+            wait_s = random.uniform(5.0, 20.0)
             log(f"[Retry] Neo4j query failed: {e}. Retrying in {wait_s:.1f}s.")
             time.sleep(wait_s)
 

@@ -1039,59 +1039,55 @@ class NaiveRAGAgent:
 
 # ----------------- Query Decomposer Agent -----------------
 DECOMPOSER_SCHEMA = {
-  "type":"object",
-  "properties":{
-    "strategy":{"type":"string","enum":[
-        "split",
-        "primary_naive_with_support_from_graphrag",
-        "primary_graphrag_with_support_from_naive",
-        "both_full",
-        "single_naive",
-        "single_graphrag"
-    ]},
-    "subqueries_naive":{"type":"array","items":{"type":"string"}},
-    "subqueries_graphrag":{"type":"array","items":{"type":"string"}},
-    "combine_instructions":{"type":"string"},
-    "rationale":{"type":"string"},
-    "signals":{"type":"array","items":{"type":"string"}},
-    "confidence":{"type":"number"}
-  },
-  "required":["strategy","subqueries_naive","subqueries_graphrag"]
+    "type": "object",
+    "properties": {
+        "tasks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "pipeline": {"type": "string", "enum": ["graphrag", "naiverag"]},
+                    "query": {"type": "string"},
+                    "role": {"type": "string", "enum": ["primary", "support"]},
+                    "aspect": {"type": "string"}
+                },
+                "required": ["pipeline", "query"]
+            }
+        },
+        "strategy": {"type": "string"},
+        "notes": {"type": "string"}
+    },
+    "required": ["tasks"]
 }
 
 DECOMPOSER_GUIDANCE = """
-You are the Query Decomposer agent for legal Q&A over Indonesian laws (UU, Pasal, Ayat, etc.).
-You will decide how to route the user's question to two pipelines and optionally split it into sub-questions.
+You are a Query Decomposer Agent for a dual-pipeline RAG system:
 
 Pipelines:
-- Naive RAG (vector search over text chunks; Answerer-only)
-  Best for: localized answers likely in one paragraph/section; quoting/extracting a clause; definitions; specific Pasal/Ayat/UU references; dates, amounts, single-article scope, small focused summaries.
+- NaiveRAG: chunk-embedding vector search; excels at direct lookup of a specific passage, definitions, quotes, or single-hop answers when an explicit citation (UU number/year, Pasal/Article/Ayat/Section, PP/Perda/Permen, "No.") is present.
+- GraphRAG: entity/triple extraction and KG traversal; excels at multi-hop reasoning, relationships between entities (mewajibkan, melarang, mendelegasikan, mengubah, mencabut), scope/actor applicability (berlaku untuk siapa), comparisons (perbedaan), exceptions (pengecualian), temporal/effectivity (mulai berlaku), and cross-law interactions.
 
-- GraphRAG (entity/triple reasoning; single-pass Agents 1 & 2)
-  Best for: relational/multi-hop questions; combining multiple articles/UU; semantic predicates (mengubah, mencabut, mendelegasikan, berlaku_untuk, termuat_dalam); enumerations, comparisons, exceptions, scopes across entities.
+Decomposition actions:
+1) If different aspects of the query are better served by different pipelines, create separate tasks:
+   - Assign each aspect to the pipeline best suited for it (GraphRAG for relationships/multi-hop/scope/time; NaiveRAG for direct passage retrieval/definition).
+2) If the query is primarily suited to one pipeline, still consider creating one support task for the other pipeline to retrieve helpful context or precise citations/quotes.
+3) If the query can benefit similarly from both pipelines, send the original query to both as 'primary'.
 
-Choose one strategy:
-- "split": different aspects go to different pipelines (e.g., Naive to quote definitions; GraphRAG to assess relational scope).
-- "primary_naive_with_support_from_graphrag": send original query (or close) to Naive; craft a supporting relational subquery for GraphRAG.
-- "primary_graphrag_with_support_from_naive": send original query (or close) to GraphRAG; craft a supporting localized subquery for Naive (e.g., to fetch exact clause text).
-- "both_full": the original query is meaningfully answerable by both pipelines; send it (or near variants) to both.
-- "single_naive": clearly localized; only Naive needed.
-- "single_graphrag": clearly relational/multi-hop; only GraphRAG needed.
+Guidelines:
+- Preserve the user's language and intent; do not hallucinate facts.
+- Keep sub-queries concise but precise; add statute numbers, articles, or actor/scope hints if they are clearly implied.
+- Use roles:
+   - 'primary' for the main task(s) that should directly answer an aspect.
+   - 'support' for a task that provides useful reinforcing context (e.g., NaiveRAG fetching the exact article text while GraphRAG handles relationships).
+- Prefer at least one 'primary' task. You may include zero or more 'support' tasks.
+- Cap the total number of tasks to a reasonable number (e.g., 2–4) unless the user explicitly asks for multiple distinct aspects.
 
-Output strictly as JSON with:
-- strategy: one of the above
-- subqueries_naive: list of strings (empty allowed if none)
-- subqueries_graphrag: list of strings (empty allowed if none)
-- combine_instructions: optional guidance for the Aggregator on how to merge
-- rationale: short reason grounded in the hints
-- signals: short bullets of indicators (e.g., "explicit Pasal reference", "multi-article comparison", "mentions delegation")
-- confidence: 0..1
+Return JSON with:
+- tasks: array of {pipeline, query, role, aspect(optional)}
+- strategy: brief description of how you decomposed and why
+- notes: optional
+""".strip()
 
-Guidance for decomposition:
-- Keep subqueries minimal and literal; if sending the original question to a pipeline, include it verbatim in that pipeline's list.
-- For support queries, target the info that complements the primary (e.g., exact wording vs relationship/aggregation).
-- Avoid inventing facts; only split what is explicitly or strongly implied by the user question.
-"""
 
 def decompose_query(query: str) -> Dict[str, Any]:
     prompt = f"""
@@ -1105,114 +1101,159 @@ Question:
     log(prompt)
     log(f"[Decomposer] Prompt size: {len(prompt)} chars, est_tokens≈{est}")
 
-    out = safe_generate_json(prompt, DECOMPOSER_SCHEMA, temp=0.0) or {}
-    # Basic normalization
-    out.setdefault("subqueries_naive", [])
-    out.setdefault("subqueries_graphrag", [])
-    out.setdefault("strategy", "both_full")
-    out.setdefault("combine_instructions", "")
-    out.setdefault("rationale", "")
-    out.setdefault("signals", [])
-    out.setdefault("confidence", 0.5)
+    raw = safe_generate_json(prompt, DECOMPOSER_SCHEMA, temp=0.0) or {}
+    
+    # Parse tasks array into separate lists by pipeline
+    tasks = raw.get("tasks", [])
+    naive_subqs = []
+    graphrag_subqs = []
+    
+    for task in tasks:
+        pipeline = task.get("pipeline", "").lower()
+        q = task.get("query", "").strip()
+        role = task.get("role", "primary")
+        aspect = task.get("aspect", "")
+        
+        if not q:
+            continue
+            
+        task_info = {
+            "query": q,
+            "role": role,
+            "aspect": aspect
+        }
+        
+        if pipeline == "naiverag":
+            naive_subqs.append(q)
+            log(f"[Decomposer] NaiveRAG task: role={role}, aspect={aspect}, query={q[:80]}")
+        elif pipeline == "graphrag":
+            graphrag_subqs.append(q)
+            log(f"[Decomposer] GraphRAG task: role={role}, aspect={aspect}, query={q[:80]}")
+        else:
+            log(f"[Decomposer] WARNING: Unknown pipeline '{pipeline}' for query: {q[:80]}", level="WARN")
+    
+    # Build normalized output
+    out = {
+        "subqueries_naive": naive_subqs,
+        "subqueries_graphrag": graphrag_subqs,
+        "strategy": raw.get("strategy", "both_full"),
+        "combine_instructions": raw.get("notes", ""),
+        "rationale": raw.get("notes", ""),
+        "signals": [],
+        "confidence": 0.7 if tasks else 0.5,
+        "raw_tasks": tasks  # Keep original for debugging
+    }
 
     # Guardrails: if both lists empty, send original to both
     if not out["subqueries_naive"] and not out["subqueries_graphrag"]:
+        log("[Decomposer] No tasks generated; falling back to both_full", level="WARN")
         out["strategy"] = "both_full"
         out["subqueries_naive"] = [query]
         out["subqueries_graphrag"] = [query]
-        out["combine_instructions"] = (out.get("combine_instructions","") + " Use Naive for exact quotes; use GraphRAG for relationships.").strip()
+        out["combine_instructions"] = "Use Naive for exact quotes; use GraphRAG for relationships."
+        out["signals"].append("fallback_empty_tasks")
 
     log(f"[Decomposer] Strategy={out.get('strategy')} | naive_q={len(out['subqueries_naive'])} | graphrag_q={len(out['subqueries_graphrag'])} | confidence={out.get('confidence')}")
+    
     return out
+
 
 # ----------------- Aggregator Agent -----------------
 AGGREGATOR_SCHEMA = {
-  "type":"object",
-  "properties":{
-    "chosen":{"type":"string","enum":["naive","graphrag","mixed"]},
-    "final_answer":{"type":"string"},
-    "rationale":{"type":"string"},
-    "confidence":{"type":"number"},
-    "key_points":{"type":"array","items":{"type":"string"}},
-    "notes":{"type":"string"}
-  },
-  "required":["chosen","final_answer"]
+    "type": "object",
+    "properties": {
+        "decision": {"type": "string", "enum": ["choose_graphrag", "choose_naiverag", "merge"]},
+        "final_answer": {"type": "string"},
+        "rationale": {"type": "string"}
+    },
+    "required": ["decision", "final_answer"]
 }
 
-def aggregator_decide(query: str, naive_answer: str, graphrag_answer: str, lang: str, plan: Dict[str, Any]) -> Dict[str, Any]:
-    strategy = plan.get("strategy","")
-    combine_instructions = plan.get("combine_instructions","")
+def _citation_score(text: str) -> int:
+    if not text: return 0
+    patterns = [
+        r"\bUU\b", r"\bUndang[- ]?Undang\b", r"\bPasal\b", r"\bAyat\b",
+        r"\bArticle\b", r"\bSection\b", r"\bLaw\b", r"\bNo\.\b", r"\bPeraturan\b"
+    ]
+    score = 0
+    for pat in patterns:
+        score += len(re.findall(pat, text, flags=re.IGNORECASE))
+    score += len(re.findall(r"\b\d{4}\b", text))
+    score += len(re.findall(r"\b\d+\b", text)) // 5
+    return score
+
+def _format_task_block(title: str, tasks: List[Dict[str, Any]]) -> str:
+    lines = [title]
+    for i, t in enumerate(tasks, 1):
+        role = t.get("role","")
+        asp = t.get("aspect","")
+        q = t.get("query","")
+        ans = t.get("result",{}).get("final_answer","")
+        lines.append(f"[{i}] role={role} aspect={asp}\n- subquery: {q}\n- answer:\n{ans}\n")
+    return "\n".join(lines)
+
+def aggregate_answers(user_query: str, lang: str, g_tasks: List[Dict[str, Any]], n_tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    # Build readable blocks for the aggregator
+    g_block = _format_task_block("GraphRAG answers:", g_tasks) if g_tasks else "GraphRAG answers: (none)"
+    n_block = _format_task_block("NaiveRAG answers:", n_tasks) if n_tasks else "NaiveRAG answers: (none)"
+
     prompt = f"""
-You are the Aggregator agent. You will receive:
-- the original question,
-- the combined output from Naive RAG (Answerer-only, localized chunks),
-- the combined output from GraphRAG (triple/graph reasoning),
-- the decomposer's strategy and any combine_instructions.
+You are an Aggregator Agent.
+Task: Read the user's question and the answers produced by two pipelines (GraphRAG and NaiveRAG), possibly multiple sub-answers per pipeline.
+Choose the best answer or synthesize a concise merged answer that is clearer, more specific, and grounded in the provided content.
 
-Goal:
-- Produce the best possible final answer in the SAME language as the question ("{lang}").
-- If one pipeline clearly provides the most accurate, well-cited answer, you may choose it.
-- If both provide complementary insights (likely when strategy in ["split","both_full","primary_*_with_support_*"]), synthesize a concise, coherent answer that integrates both:
-  - Use Naive-derived content for precise clause wording/definitions.
-  - Use GraphRAG-derived content for relationships, scope, cross-article links, and enumerations.
-- Prefer explicit legal references (UU/Article/Pasal/Ayat) and internal consistency.
+Rules:
+- Respond in the same language as the user's question: "{lang}".
+- Prefer answers with specific statute references (UU/Article/Pasal) and clear, correct claims.
+- Do not introduce new facts beyond the provided sub-answers; you may rephrase and combine.
+- If the sub-answers conflict, prefer the one with explicit citations and coherent legal logic; if uncertainty remains, say so briefly.
 
-Decomposer plan (strategy): {strategy}
-Combine instructions:
-\"\"\"{combine_instructions}\"\"\"
+Return JSON with:
+- decision: one of ["choose_graphrag", "choose_naiverag", "merge"]
+- final_answer: the final answer text (if 'merge', provide the merged text)
+- rationale: brief reason for the decision
 
-Return strict JSON with keys:
-- chosen: "naive" | "graphrag" | "mixed"
-- final_answer: the final answer text (same language as the question)
-- rationale: brief reason for your choice
-- confidence: number in [0,1]
-- key_points: 3-8 bullets with essential points
-- notes: optional
+User question:
+\"\"\"{user_query}\"\"\"
 
-Question:
-\"\"\"{query}\"\"\"
+{g_block}
 
-Naive RAG (combined):
-\"\"\"{naive_answer}\"\"\"
-
-GraphRAG (combined):
-\"\"\"{graphrag_answer}\"\"\"
+{n_block}
 """
     est = estimate_tokens_for_text(prompt)
     log("\n[Aggregator] Prompt:")
     log(prompt)
     log(f"[Aggregator] Prompt size: {len(prompt)} chars, est_tokens≈{est}")
 
-    out = safe_generate_json(prompt, AGGREGATOR_SCHEMA, temp=0.2) or {}
+    out = safe_generate_json(prompt, AGGREGATOR_SCHEMA, temp=0.0) or {}
+    decision = (out.get("decision") or "").strip()
+    final_answer = (out.get("final_answer") or "").strip()
+    rationale = (out.get("rationale") or "").strip()
 
-    if not out.get("final_answer"):
-        # Fallback heuristic
-        log("[Aggregator] JSON missing or empty final_answer; falling back to heuristic.", level="WARN")
-        a = (naive_answer or "").strip()
-        b = (graphrag_answer or "").strip()
-        chosen = "naive"
-        final = a
-        # Prefer graphrag if it carries relational/structured clues or is substantially richer
-        if len(b) > len(a) and ("Pasal" in b or "UU" in b or "Article" in b or "Section" in b or "ayat" in b.lower()):
-            chosen = "graphrag"
-            final = b
-        elif not a and b:
-            chosen = "graphrag"; final = b
-        elif not b and a:
-            chosen = "naive"; final = a
-        elif a and b and a != b:
-            chosen = "mixed"
-            final = f"{b}\nTambahan/Additional context:\n{a}" if lang == "id" else f"{b}\nAdditional context:\n{a}"
-        out = {
-            "chosen": chosen,
-            "final_answer": final,
-            "rationale": "Heuristic selection due to JSON failure",
-            "confidence": 0.5,
-            "key_points": [],
-            "notes": ""
-        }
-    log(f"[Aggregator] Decision: chosen={out.get('chosen')} | confidence={out.get('confidence')}")
-    return out
+    if decision in ("choose_graphrag","choose_naiverag","merge") and final_answer:
+        log(f"[Aggregator] Decision={decision} | rationale={rationale[:160]}")
+        return {"decision": decision, "final_answer": final_answer, "rationale": rationale}
+
+    # Fallback heuristic
+    g_text = "\n".join([(t.get("result",{}) or {}).get("final_answer","") for t in g_tasks]) if g_tasks else ""
+    n_text = "\n".join([(t.get("result",{}) or {}).get("final_answer","") for t in n_tasks]) if n_tasks else ""
+    g_score = _citation_score(g_text)
+    n_score = _citation_score(n_text)
+    if g_score > n_score:
+        decision = "choose_graphrag"
+        final_answer = g_text or n_text
+        rationale = f"Fallback heuristic: GraphRAG had more concrete citations (g={g_score} > n={n_score})."
+    elif n_score > g_score:
+        decision = "choose_naiverag"
+        final_answer = n_text or g_text
+        rationale = f"Fallback heuristic: NaiveRAG had more concrete citations (n={n_score} > g={g_score})."
+    else:
+        decision = "merge"
+        final_answer = (g_text + "\n" + n_text).strip()
+        rationale = "Fallback heuristic: tie; merged both."
+    log(f"[Aggregator] Fallback decision={decision}")
+    return {"decision": decision, "final_answer": final_answer, "rationale": rationale}
+
 
 # ----------------- Helpers: run many subqueries per pipeline -----------------
 def run_pipeline_many(pipeline_name: str, agent_cls, subqueries: List[str]) -> Tuple[str, List[str]]:
@@ -1300,14 +1341,34 @@ def agentic_multi(query_original: str) -> Dict[str, Any]:
             graphrag_combined, _ = run_pipeline_many("GraphRAG", GraphRAGAgent, graphrag_subqs)
 
         # Aggregation
-        agg = aggregator_decide(query_original, naive_combined, graphrag_combined, lang, plan)
-        final_answer = (agg or {}).get("final_answer", "") or (graphrag_combined or naive_combined)
+        # Prepare tasks in the format aggregate_answers expects
+        g_tasks = []
+        n_tasks = []
+
+        if graphrag_subqs and graphrag_combined:
+            g_tasks.append({
+                "result": {"final_answer": graphrag_combined},
+                "role": "primary",
+                "aspect": "graph_retrieval",
+                "query": query_original
+            })
+
+        if naive_subqs and naive_combined:
+            n_tasks.append({
+                "result": {"final_answer": naive_combined},
+                "role": "primary",
+                "aspect": "vector_retrieval",
+                "query": query_original
+            })
+
+        agg = aggregate_answers(query_original, lang, g_tasks, n_tasks)
+        final_answer = agg.get("final_answer", "") or (graphrag_combined or naive_combined)
 
         total_ms = (time.time()-t_all)*1000
         log("\n=== Multi-Agent (Decomposer + Aggregator) summary ===")
         log(f"- Total runtime: {total_ms:.0f} ms")
         log(f"- Decomposer strategy: {plan.get('strategy')} (confidence={plan.get('confidence')})")
-        log(f"- Aggregator choice: {agg.get('chosen')} (confidence={agg.get('confidence')})")
+        log(f"- Aggregator decision: {agg.get('decision')} | rationale: {agg.get('rationale', '')[:100]}")
         log("\n=== Final Answer ===")
         log(final_answer)
         log(f"\nLogs saved to: {log_file}")
@@ -1317,11 +1378,8 @@ def agentic_multi(query_original: str) -> Dict[str, Any]:
             "naive_answer": naive_combined,
             "graphrag_answer": graphrag_combined,
             "aggregator_decision": {
-                "chosen": agg.get("chosen"),
-                "confidence": agg.get("confidence"),
-                "rationale": agg.get("rationale"),
-                "key_points": agg.get("key_points", []),
-                "notes": agg.get("notes", "")
+                "decision": agg.get("decision"),
+                "rationale": agg.get("rationale", "")
             },
             "decomposer_plan": {
                 "strategy": plan.get("strategy"),

@@ -234,7 +234,7 @@ def worker_main(worker_id: int,
 
     # Import after setting env so the module can read it
     try:
-        import subgoal_3 as rag
+        import naiverag as rag
     except Exception as e:
         log(f"[Worker {worker_id}] ERROR: Could not import agentic_rag.py: {e}")
         part_path.write_text("", encoding="utf-8")

@@ -70,7 +70,7 @@ OUTPUT_LANG = "id"  # retained for compatibility; we auto-detect based on query
 
 # ----------------- Agentic (new) -----------------
 # Hardcoded maximum number of subgoals Agent 0 may produce (per requirement)
-SUBGOAL_MAX_COUNT = 3
+SUBGOAL_MAX_COUNT = 5
 
 # Max number of subgoals processed concurrently (configurable via env)
 SUBGOAL_MAX_PARALLELISM = int(os.getenv("SUBGOAL_MAX_PARALLELISM", "2"))

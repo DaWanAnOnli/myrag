@@ -197,7 +197,7 @@ def worker_main(worker_id: int,
 
     # Import after setting env so the module can read it
     try:
-        import both_subgoal_18 as rag
+        import both_answer_judge_17 as rag
     except Exception as e:
         log(f"[Worker {worker_id}] ERROR: Could not import multi_agent.py: {e}")
         part_path.write_text("", encoding="utf-8")
@@ -245,7 +245,7 @@ def worker_main(worker_id: int,
                     aggregator_decision = {}
                     error_msg = None
                     try:
-                        result = rag.agentic_supervisor(question)
+                        result = rag.agentic_multi_iterative(question)
                         final_answer = (result or {}).get("final_answer", "") or ""
                         naive_answer = (result or {}).get("naive_answer", "") or ""
                         graphrag_answer = (result or {}).get("graphrag_answer", "") or ""

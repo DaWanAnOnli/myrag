@@ -73,7 +73,7 @@ OUTPUT_LANG = "id"  # retained for compatibility; we auto-detect based on query
 
 # ----------------- Intermediate Questions (new) -----------------
 # Hardcoded maximum number of intermediate questions Agent I0 may produce (per requirement)
-IQ_MAX_STEPS = 3
+IQ_MAX_STEPS = 5
 
 # Aggregation removed by design (final answer is the last IQ's answer)
 

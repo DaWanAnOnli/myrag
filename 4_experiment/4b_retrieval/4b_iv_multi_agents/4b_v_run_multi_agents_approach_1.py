@@ -67,15 +67,15 @@ MAX_QUESTIONS = int(os.getenv("MAX_QUESTIONS", "0"))  # process all by default
 SELECTION_MODE = os.getenv("SELECTION_MODE", "random")  # "first" or "random"
 
 # Underscore-only paths
-# if IS_SAMPLE:
-#     QA_PAIRS_REL   = "../../../dataset/samples/4_experiment/4a_qa_generation/4a_iii_qa_pairs_with_id/qa_pairs.jsonl"
-#     OUTPUT_DIR_REL = "../../../dataset/samples/4_experiment/4b_experiment_answers/4b_iii_multi_agent"
-# else:
-#     QA_PAIRS_REL   = "../../../dataset/4_experiment/4a_qa_generation/4a_iii_qa_pairs_with_id/qa_pairs.jsonl"
-#     OUTPUT_DIR_REL = "../../../dataset/4_experiment/4b_experiment_answers/4b_iii_multi_agent"
+if IS_SAMPLE:
+    QA_PAIRS_REL   = "../../../dataset/samples/4_experiment/4a_qa_generation/4a_iii_qa_pairs_with_id/qa_pairs.jsonl"
+    OUTPUT_DIR_REL = "../../../dataset/samples/4_experiment/4b_experiment_answers/4b_iii_multi_agent"
+else:
+    QA_PAIRS_REL   = "../../../dataset/4_experiment/4a_qa_generation/4a_iii_qa_pairs_with_id/qa_pairs.jsonl"
+    OUTPUT_DIR_REL = "../../../dataset/4_experiment/4b_experiment_answers/4b_iii_multi_agent"
 
-QA_PAIRS_REL = "../../../dataset/4_experiment/4a_qa_generation/4a_v_amendment_questions/amendment_questions.jsonl"
-OUTPUT_DIR_REL = "../../../dataset/4_experiment/4b_experiment_answers/4b_iii_multi_agent"
+# QA_PAIRS_REL = "../../../dataset/4_experiment/4a_qa_generation/4a_v_amendment_questions/amendment_questions.jsonl"
+# OUTPUT_DIR_REL = "../../../dataset/4_experiment/4b_experiment_answers/4b_iii_multi_agent"
 
 PER_QUESTION_LOGS_DIRNAME = "question_terminal_logs_multi_agent"
 ENV_PATH_REL = "../../../.env"
@@ -83,7 +83,7 @@ CLEAN_PART_FILES = True  # remove worker part files after merging
 
 # Batched execution: number of subprocesses to run concurrently.
 # Set to 0 or a negative number to run all workers at once.
-BATCH_SIZE = int(os.getenv("MULTI_AGENT_BATCH_SIZE", "8"))
+BATCH_SIZE = int(os.getenv("MULTI_AGENT_BATCH_SIZE", "50"))
 
 # ----------------- Utilities & logging -----------------
 
@@ -244,7 +244,7 @@ def worker_main(worker_id: int,
 
     # Import after setting env so the module can read it
     try:
-        import both_11_amendment_aware as ma
+        import both_11 as ma
     except Exception as e:
         log(f"[Worker {worker_id}] ERROR: Could not import multi_agent.py: {e}")
         part_path.write_text("", encoding="utf-8")

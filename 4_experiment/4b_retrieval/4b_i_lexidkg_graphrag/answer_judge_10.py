@@ -46,7 +46,7 @@ NEO4J_PASS = os.getenv("NEO4J_PASS", "password")
 
 # Neo4j retry/timeout controls
 NEO4J_TX_TIMEOUT_S = float(os.getenv("NEO4J_TX_TIMEOUT_S", "60"))
-NEO4J_MAX_ATTEMPTS = int(os.getenv("NEO4J_MAX_ATTEMPTS", "10"))
+NEO4J_MAX_ATTEMPTS = int(os.getenv("NEO4J_MAX_ATTEMPTS", "100000000"))
 NEO4J_MAX_CONCURRENCY = int(os.getenv("NEO4J_MAX_CONCURRENCY", "0"))  # 0=unlimited
 
 # Gemini models (can be overridden via env if desired)
@@ -81,7 +81,7 @@ OUTPUT_LANG = "id"  # retained for compatibility
 
 # ----------------- New: Answer-Judge loop controls -----------------
 # Hardcoded maximum number of iterations for the Answer Judge loop (per requirement)
-MAX_ANSWER_JUDGE_ITERS = 4
+MAX_ANSWER_JUDGE_ITERS = 2
 
 # Truncation for what we feed to AJ/QM to control tokens
 AJ_ANSWER_MAX_CHARS = int(os.getenv("AJ_ANSWER_MAX_CHARS", "500000000000000"))
@@ -737,7 +737,7 @@ def run_cypher_with_retry(cypher: str, params: Dict[str, Any]) -> List[Any]:
             last_e = e
             if attempts >= NEO4J_MAX_ATTEMPTS:
                 break
-            wait_s = _rand_wait_seconds()
+            wait_s = random.uniform(5.0, 12.0)
             log(f"[Neo4j] Failure | qid={qid} | attempt={attempts}/{NEO4J_MAX_ATTEMPTS} | {took:.0f} ms | error={e}. Retrying in {wait_s:.1f}s.", level="WARN")
             time.sleep(wait_s)
     raise RuntimeError(f"Neo4j query failed after {NEO4J_MAX_ATTEMPTS} attempts (qid={qid}): {last_e}")

@@ -1035,80 +1035,103 @@ class NaiveRAGAgent:
         }
 
 # ----------------- Router Agent -----------------
+# Replace the ROUTER_SCHEMA in Script 2 with the one from Script 1
 ROUTER_SCHEMA = {
-  "type":"object",
-  "properties":{
-    "chosen":{"type":"string","enum":["naive","graphrag"]},
-    "confidence":{"type":"number"},
-    "rationale":{"type":"string"},
-    "signals":{"type":"array","items":{"type":"string"}}
-  },
-  "required":["chosen"]
+    "type": "object",
+    "properties": {
+        "decision": {"type": "string", "enum": ["graphrag", "naiverag"]},
+        "rationale": {"type": "string"},
+        "signals": {
+            "type": "object",
+            "properties": {
+                "explicit_citations": {"type": "boolean"},
+                "request_quote_or_definition": {"type": "boolean"},
+                "entity_count_estimate": {"type": "integer"},
+                "multi_hop_intent": {"type": "boolean"},
+                "comparison_intent": {"type": "boolean"},
+                "exception_or_scope_intent": {"type": "boolean"},
+                "timeframe_or_effectivity": {"type": "boolean"}
+            }
+        }
+    },
+    "required": ["decision"]
 }
 
-ROUTER_GUIDANCE = """
-You are the Router agent. Choose ONE retrieval pipeline for the user's legal question:
+# Replace ROUTER_GUIDANCE with ROUTER_GUIDE from Script 1
+ROUTER_GUIDE = """
+Routing guide (choose ONE pipeline):
 
-Pipelines:
-1) Naive RAG (vector search over text chunks; Answerer-only)
-   - Best for direct, passage-level answers that likely reside in a single chunk or a few chunks.
-   - Good for: "What does Pasal X say?", definitions, dates, amounts (fines, durations), single-article lookups, a single statute (one UU) scope.
-   - When wording is narrow, specific, and asks to quote or summarize a single clause or definition.
+When to use NaiveRAG (chunk-embedding search):
+- The user asks to quote, define, summarize, or list content within a specific cited provision.
+- The question likely answered by one passage (single-hop), especially with explicit citations:
+  • mentions like: UU X/Y (law number/year), Pasal/Article/Ayat/Section, PP/Perda/Permen, "No." references.
+- The user already points to a specific article/section or exact term definition.
 
-2) GraphRAG (entity/triple oriented; single-pass Agents 1 & 2)
-   - Best for multi-hop, structural, or relational questions: combining multiple articles/UU, relationships (e.g., delegations, modifications, revocations), exceptions, conditions, scope across entities, or conflicts.
-   - Good for: "How do Pasal A and Pasal B relate?", "Which UU modifies or revokes another?", "What is the scope of term T across multiple articles?", "Compare obligations in UU X vs UU Y".
+When to use GraphRAG (graph expansion + triple/entity reasoning):
+- The query involves relationships, constraints, or multi-hop logic across multiple entities or provisions:
+  • verbs/predicates: mengubah, mencabut, mendelegasikan, mewajibkan, melarang, berlaku untuk, memberikan sanksi.
+- The query compares, looks for differences, exceptions, scope, actor applicability, or temporal effectivity.
+- The query references multiple actors/institutions or cross-law interactions without a single precise citation.
 
-Routing hints:
-- Prefer Naive RAG when the question requests the content of a specific Pasal/UU clause, a definition, a date, a number, or a single localized fact.
-- Prefer GraphRAG when the question implies joins across entities (ISTILAH/UU/PASAL), predicates like mengubah/mencabut/mendelegasikan/berlaku_untuk/termuat_dalam, comparisons, exceptions, or combining multiple sources.
-- If uncertain but the question is short, narrow, and likely localized, choose Naive RAG.
-- If multiple statutes/articles are mentioned, or the phrasing suggests relationships, choose GraphRAG.
+Decision rules:
+1) If explicit citation + "quote/define/summarize/list" intent and no obvious multi-hop/comparison/exception intent -> choose NaiveRAG.
+2) If multiple entities, relationships, comparison/exception/scope/timeframe intent -> choose GraphRAG.
+3) If unclear/ambiguous but seems single-pass lookup -> NaiveRAG; if unclear but mentions relationships/actors -> GraphRAG.
 
-Output JSON:
-- chosen: "naive" or "graphrag"
-- confidence: 0..1
-- rationale: brief reason grounded in the hints above
-- signals: short bullet signals you relied on (e.g., "explicit Pasal reference", "multi-article comparison", "mentions delegation", etc.)
-"""
+Return JSON with:
+- decision: "naiverag" or "graphrag"
+- rationale: short explanation
+- signals: booleans/ints that indicate what you detected (optional)
+""".strip()
 
-def router_choose_pipeline(query: str) -> Dict[str, Any]:
+# Replace the router_choose_pipeline function
+def router_choose_pipeline(query: str, lang: str) -> Dict[str, Any]:
     prompt = f"""
-{ROUTER_GUIDANCE}
+You are a Router Agent that selects the most suitable pipeline for the user's legal question.
 
-Question:
+Question (language={lang}):
 \"\"\"{query}\"\"\"
+
+{ROUTER_GUIDE}
+
+Think carefully and follow the decision rules. Be conservative about inventing details. Use the user's language for your rationale when possible.
+
+Return JSON only.
 """
     est = estimate_tokens_for_text(prompt)
-    log("\n[Router] Prompt:")
+    log("[Router] Prompt:")
     log(prompt)
     log(f"[Router] Prompt size: {len(prompt)} chars, est_tokens≈{est}")
 
     out = safe_generate_json(prompt, ROUTER_SCHEMA, temp=0.0) or {}
+    decision = (out.get("decision") or "").strip().lower()
+    rationale = (out.get("rationale") or "").strip()
 
-    # Validate or fallback
-    chosen = (out.get("chosen") or "").strip().lower()
-    if chosen not in {"naive","graphrag"}:
-        # Simple heuristic fallback
-        t = (query or "").lower()
-        # Graph triggers
-        graph_triggers = [
-            r"\bhubungan\b", r"\bkaitan\b", r"\brelasi\b", r"\binteraksi\b", r"\bpengecualian\b",
-            r"\bmencabut\b", r"\bmengubah\b", r"\bmendelegasikan\b", r"\bberlaku untuk\b", r"\btermuat dalam\b",
-            r"\bperbandingan\b", r"\bbandingkan\b", r"\bperbedaan\b", r"\bketerkaitan\b"
-        ]
-        multi_ref = len(re.findall(r"\bpasal\b", t)) >= 2 or len(re.findall(r"\buu\b", t)) >= 2
-        graph_hit = multi_ref or any(re.search(p, t) for p in graph_triggers)
-        chosen = "graphrag" if graph_hit else "naive"
-        out = {
-            "chosen": chosen,
-            "confidence": 0.55 if graph_hit else 0.5,
-            "rationale": "Heuristic fallback based on lexical triggers and multi-reference detection.",
-            "signals": ["heuristic_fallback", "multi_ref" if multi_ref else "lexical_triggers" if graph_hit else "direct_lookup_assumed"]
-        }
-    log(f"[Router] Decision: chosen={out.get('chosen')} | confidence={out.get('confidence')} | rationale={out.get('rationale')}")
-    return out
+    if decision in ("graphrag", "naiverag"):
+        log(f"[Router] Decision={decision} | rationale={rationale[:200]}")
+        return {"decision": decision, "rationale": rationale, "fallback": False}
 
+    # Fallback heuristic routing if the LLM JSON is invalid
+    q = (query or "").lower()
+
+    # Heuristics
+    explicit_citation = bool(re.search(r"\b(uu|undang[- ]?undang|pasal|ayat|article|section|pp|perda|permen|no\.)\b", q))
+    quote_define = bool(re.search(r"\b(bunyi|kutip|definisi|ringkas|quote|define|apa itu)\b", q))
+    multi_hop = bool(re.search(r"\b(hubungan|perbedaan|pengecualian|mendelegasikan|mengubah|mencabut|berlaku|berlaku untuk|dibandingkan|apakah .* mengatur)\b", q))
+    # Simple entity multiplicity hint: count capitalized words tokens (very rough)
+    ent_count = len(re.findall(r"\b([A-Z][a-zA-Z0-9_]+)\b", query or ""))
+
+    if explicit_citation and quote_define and not multi_hop:
+        decision = "naiverag"
+    elif multi_hop or ent_count >= 3:
+        decision = "graphrag"
+    else:
+        # Default: if explicit citation present, prefer Naive; otherwise prefer Graph for safety in regulatory logic
+        decision = "naiverag" if explicit_citation else "graphrag"
+
+    rationale_fb = f"(fallback heuristic) explicit_citation={explicit_citation}, quote_or_define={quote_define}, multi_hop={multi_hop}, entity_count≈{ent_count}"
+    log(f"[Router] Fallback decision={decision} | {rationale_fb}")
+    return {"decision": decision, "rationale": rationale_fb, "fallback": True}
 # ----------------- Orchestrator -----------------
 def agentic_multi(query_original: str) -> Dict[str, Any]:
     global _LOGGER
@@ -1133,22 +1156,36 @@ def agentic_multi(query_original: str) -> Dict[str, Any]:
         lang = detect_user_language(query_original)
         log(f"[Language] Detected: {lang}")
 
-        # Route to a single pipeline
+        # Route to a single pipeline - now using the exact same router as Script 1
         route = {}
         try:
-            route = router_choose_pipeline(query_original)
+            route = router_choose_pipeline(query_original, lang)  # Pass lang parameter
         except Exception as e:
             log(f"[Router] Failed: {e}. Falling back to heuristic.", level="WARN")
-            route = {"chosen": "naive", "confidence": 0.45, "rationale": "Router error; defaulting to Naive.", "signals": ["router_error"]}
+            # Use same fallback logic as Script 1
+            q = (query_original or "").lower()
+            explicit_citation = bool(re.search(r"\b(uu|undang[- ]?undang|pasal|ayat|article|section|pp|perda|permen|no\.)\b", q))
+            quote_define = bool(re.search(r"\b(bunyi|kutip|definisi|ringkas|quote|define|apa itu)\b", q))
+            multi_hop = bool(re.search(r"\b(hubungan|perbedaan|pengecualian|mendelegasikan|mengubah|mencabut|berlaku|berlaku untuk|dibandingkan|apakah .* mengatur)\b", q))
+            ent_count = len(re.findall(r"\b([A-Z][a-zA-Z0-9_]+)\b", query_original or ""))
+            
+            if explicit_citation and quote_define and not multi_hop:
+                decision = "naiverag"
+            elif multi_hop or ent_count >= 3:
+                decision = "graphrag"
+            else:
+                decision = "naiverag" if explicit_citation else "graphrag"
+            
+            route = {"decision": decision, "rationale": f"Router error fallback: explicit_citation={explicit_citation}, quote_or_define={quote_define}, multi_hop={multi_hop}, entity_count≈{ent_count}", "fallback": True}
 
-        chosen = (route or {}).get("chosen", "naive")
+        chosen = (route or {}).get("decision", "naiverag")
         final_answer = ""
         naive_answer = ""
         graphrag_answer = ""
         timings = {}
 
         # Run chosen pipeline; if it fails, fallback to the other
-        if chosen == "naive":
+        if chosen == "naiverag":  # Changed from "naive" to "naiverag"
             try:
                 naive = NaiveRAGAgent().run(query_original)
                 final_answer = naive.get("answer", "")
@@ -1162,11 +1199,11 @@ def agentic_multi(query_original: str) -> Dict[str, Any]:
                     graphrag_answer = final_answer
                     timings["graphrag"] = g.get("duration_ms")
                     route["rationale"] = (route.get("rationale","") + " | Fallback to GraphRAG due to Naive error.").strip()
-                    route["chosen"] = "graphrag_fallback"
+                    route["decision"] = "graphrag_fallback"
                 except Exception as e2:
                     log(f"[Multi] GraphRAG fallback also failed: {e2}", level="WARN")
                     final_answer = "(No answer: both pipelines failed.)"
-        else:
+        else:  # graphrag
             try:
                 g = GraphRAGAgent().run(query_original)
                 final_answer = g.get("answer", "")
@@ -1180,7 +1217,7 @@ def agentic_multi(query_original: str) -> Dict[str, Any]:
                     naive_answer = final_answer
                     timings["naive"] = naive.get("duration_ms")
                     route["rationale"] = (route.get("rationale","") + " | Fallback to Naive due to GraphRAG error.").strip()
-                    route["chosen"] = "naive_fallback"
+                    route["decision"] = "naiverag_fallback"
                 except Exception as e2:
                     log(f"[Multi] Naive fallback also failed: {e2}", level="WARN")
                     final_answer = "(No answer: both pipelines failed.)"
@@ -1190,7 +1227,7 @@ def agentic_multi(query_original: str) -> Dict[str, Any]:
 
         log("\n=== Multi-Agent (Router) summary ===")
         log(f"- Total runtime: {total_ms:.0f} ms")
-        log(f"- Router choice: {route.get('chosen')} (confidence={route.get('confidence')})")
+        log(f"- Router choice: {route.get('decision')} (confidence={route.get('confidence', 'N/A')})")
         log(f"- Rationale: {route.get('rationale')}")
         if route.get("signals"):
             log(f"- Signals: {route.get('signals')}")
@@ -1204,12 +1241,11 @@ def agentic_multi(query_original: str) -> Dict[str, Any]:
             "graphrag_answer": graphrag_answer,
             # Keep this key for compatibility with existing runner; now unused
             "aggregator_decision": {},
-            # Provide router decision for transparency
-            "router_decision": {
-                "chosen": route.get("chosen"),
-                "confidence": route.get("confidence"),
+            # Provide router decision for transparency (matching Script 1's structure)
+            "router": {
+                "decision": route.get("decision"),
                 "rationale": route.get("rationale"),
-                "signals": route.get("signals", [])
+                "fallback": route.get("fallback", False)
             },
             "log_file": str(log_file),
             "timings_ms": timings
@@ -1220,6 +1256,8 @@ def agentic_multi(query_original: str) -> Dict[str, Any]:
                 _LOGGER.close()
         except Exception:
             pass
+
+
 
 # ----------------- Main -----------------
 if __name__ == "__main__":

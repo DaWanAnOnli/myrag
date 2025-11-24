@@ -15,6 +15,9 @@ Update (max attempts + failure handling):
 - After 5 failed attempts for a question, logs detailed diagnostics including the question id and the exact issue,
   then continues with the next question.
 - In the CSV, sets score = -1 and reason = "N/A" for all expected labels of the failed question.
+
+Update (timeout handling):
+- Adds 60-second timeout for API requests. If request exceeds timeout, it's retried.
 """
 
 import os
@@ -27,6 +30,7 @@ import re
 import glob
 import logging
 import argparse
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, Optional, Tuple, List
@@ -67,7 +71,7 @@ elif is_sample == "false":
 else:
     raise(ValueError(f"Wrong configuration of IS_SAMPLE in .env file: {is_sample}"))
 
-MODEL_NAME = "gemini-2.5-flash-lite"
+MODEL_NAME = "gemini-2.5-flash"
 TEMPERATURE = 0.0
 TOP_P = 0.0
 TOP_K = 1
@@ -76,7 +80,10 @@ TOP_K = 1
 RPM = 13
 
 # Maximum attempts per question when response is invalid (labels/scores/JSON/exception)
-MAX_ATTEMPTS = 100
+MAX_ATTEMPTS = 10
+
+# Timeout for API requests in seconds
+REQUEST_TIMEOUT = 30
 
 # I/O paths (relative to this script)
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -97,20 +104,14 @@ LOG_DIR = (SCRIPT_DIR / "llm_judge_logs").resolve()
 
 # Preferred label ordering for known models (extras will be appended)
 PREFERRED_LABEL_ORDER = [
-    "approach_1_both_6_answer_judge",
-    "approach_1_both_7_answer_judge",
-    "approach_1_both_8_answer_judge",
-    "approach_1_both_9_answer_judge",
-    "approach_1_both_10_answer_judge"
+    "approach_1_both_answer",
+    "approach_2_answer_judge_answer",
 ]
 
 # Map JSONL keys to friendly, stable labels (optional explicit mapping)
 MODEL_KEY_TO_LABEL = {
-    "approach_1_both_6_answer_judge_answer": "approach_1_both_6_answer_judge",
-    "approach_1_both_7_answer_judge_answer": "approach_1_both_7_answer_judge",
-    "approach_1_both_8_answer_judge_answer": "approach_1_both_8_answer_judge",
-    "approach_1_both_9_answer_judge_answer": "approach_1_both_9_answer_judge",
-    "approach_1_both_10_answer_judge_answer": "approach_1_both_10_answer_judge",
+    "approach_1_both_answer": "approach_1_both_answer",
+    "approach_2_answer_judge_answer": "approach_2_answer_judge_answer",
 }
 
 
@@ -195,6 +196,46 @@ class RateLimiter:
                 logger.debug(f"RateLimiter: sleeping {sleep_for:.3f}s to respect RPM.")
             time.sleep(sleep_for)
         self._last_request_started_at = time.perf_counter()
+
+
+class TimeoutError(Exception):
+    """Custom exception for request timeouts"""
+    pass
+
+
+def call_with_timeout(func, args=(), kwargs=None, timeout_seconds=60):
+    """
+    Execute a function with a timeout. If the function doesn't complete within
+    timeout_seconds, raise TimeoutError.
+    
+    Returns: The result of func(*args, **kwargs) if successful
+    Raises: TimeoutError if timeout is exceeded, or the original exception if func fails
+    """
+    if kwargs is None:
+        kwargs = {}
+    
+    result = [None]
+    exception = [None]
+    
+    def target():
+        try:
+            result[0] = func(*args, **kwargs)
+        except Exception as e:
+            exception[0] = e
+    
+    thread = threading.Thread(target=target)
+    thread.daemon = True
+    thread.start()
+    thread.join(timeout=timeout_seconds)
+    
+    if thread.is_alive():
+        # Thread is still running - timeout occurred
+        raise TimeoutError(f"Request exceeded {timeout_seconds}s timeout")
+    
+    if exception[0] is not None:
+        raise exception[0]
+    
+    return result[0]
 
 
 def configure_logging(run_ts: str, log_path_override: Optional[Path] = None) -> Tuple[logging.Logger, Path]:
@@ -355,7 +396,8 @@ def call_llm_with_retry(model: genai.GenerativeModel,
                         total: int,
                         expected_labels: List[str],
                         qid: Any,
-                        max_attempts: int = MAX_ATTEMPTS) -> Tuple[Optional[Dict[str, Any]], float, int, Optional[Dict[str, Any]]]:
+                        max_attempts: int = MAX_ATTEMPTS,
+                        timeout_seconds: int = REQUEST_TIMEOUT) -> Tuple[Optional[Dict[str, Any]], float, int, Optional[Dict[str, Any]]]:
     """
     Returns:
         parsed_json (or None if failed after max attempts),
@@ -375,14 +417,31 @@ def call_llm_with_retry(model: genai.GenerativeModel,
         t0 = time.perf_counter()
         try:
             logger.info(f"[Q{q_index+1}/{total} | id={qid}] Attempt {attempts}: sending request...")
-            response = model.generate_content(
-                prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=TEMPERATURE,
-                    top_p=TOP_P,
-                    top_k=TOP_K,
-                ),
-            )
+            
+            # Wrap the API call with timeout
+            def make_request():
+                return model.generate_content(
+                    prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=TEMPERATURE,
+                        top_p=TOP_P,
+                        top_k=TOP_K,
+                    ),
+                )
+            
+            try:
+                response = call_with_timeout(make_request, timeout_seconds=timeout_seconds)
+            except TimeoutError as te:
+                last_duration = time.perf_counter() - t0
+                logger.warning(f"[Q{q_index+1} | id={qid}] Attempt {attempts}: Request timeout after {timeout_seconds}s. Retrying...")
+                logger.info(f"[Q{q_index+1} | id={qid}] Attempt {attempts} duration: {last_duration:.3f}s - TIMEOUT")
+                last_error_info = {
+                    "type": "timeout",
+                    "message": f"Request exceeded {timeout_seconds}s timeout",
+                }
+                time.sleep(random.uniform(2.0, 5.0))
+                continue
+            
             last_duration = time.perf_counter() - t0
 
             text = getattr(response, "text", None)
@@ -568,6 +627,10 @@ def evaluate_dataset(items: List[Dict[str, Any]],
                         f"[Q{idx+1}] id={qid} JSON parse failed after {attempts} attempt(s). "
                         f"LastResponseExcerpt='{error_info.get('raw_text_excerpt')}'"
                     )
+                elif etype == "timeout":
+                    logger.error(
+                        f"[Q{idx+1}] id={qid} Timeout after {attempts} attempt(s): {error_info.get('message')}"
+                    )
                 elif etype == "exception":
                     logger.error(
                         f"[Q{idx+1}] id={qid} Exception after {attempts} attempt(s): {error_info.get('exception')}"
@@ -722,11 +785,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--api-key-envvar", type=str, default="GOOGLE_API_KEY",
                    help="Environment variable name holding the API key.")
     p.add_argument("--rpm", type=int, default=None, help="Override requests-per-minute limit.")
+    p.add_argument("--timeout", type=int, default=REQUEST_TIMEOUT, help="Timeout for API requests in seconds.")
     return p.parse_args()
 
 
 def main():
-    global RPM  # allow override via CLI
+    global RPM, REQUEST_TIMEOUT  # allow override via CLI
     args = parse_args()
 
     run_ts = args.run_ts or now_timestamp()
@@ -741,11 +805,16 @@ def main():
 
     logger, log_path = configure_logging(run_ts, log_path_override)
     logger.info("LLM Judge run started.")
-    logger.info(f"Model: {MODEL_NAME} | RPM limit: {RPM} | Max attempts per question: {MAX_ATTEMPTS}")
-
+    
     if args.rpm:
         RPM = args.rpm
         logger.info(f"RPM overridden via CLI to: {RPM}")
+    
+    if args.timeout:
+        REQUEST_TIMEOUT = args.timeout
+        logger.info(f"Request timeout set to: {REQUEST_TIMEOUT}s")
+    
+    logger.info(f"Model: {MODEL_NAME} | RPM limit: {RPM} | Max attempts per question: {MAX_ATTEMPTS} | Timeout: {REQUEST_TIMEOUT}s")
 
     # Input path
     if args.input_file:

@@ -67,7 +67,7 @@ LLM_CALLS_PER_MINUTE = int(os.getenv("LLM_CALLS_PER_MINUTE", "13"))
 EMBEDDING_CALLS_PER_MINUTE = int(os.getenv("EMBEDDING_CALLS_PER_MINUTE", "0"))  # 0 disables embedding throttling
 
 # ---------- Agentic iterative controller (hardcoded max iterations) ----------
-AGENTIC_MAX_ITERS = 4  # Hardcoded per requirement
+AGENTIC_MAX_ITERS = 2  # Hardcoded per requirement
 
 # ----------------- Initialize SDKs -----------------
 genai.configure(api_key=GOOGLE_API_KEY)

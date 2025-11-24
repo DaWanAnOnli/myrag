@@ -243,7 +243,7 @@ def worker_main(worker_id: int,
 
     # Import after setting env so the module can also read env if it does.
     try:
-        import iq_6 as rag
+        import answer_judge_10 as rag
     except Exception as e:
         log(f"[Worker {worker_id}] ERROR: Could not import lexidkg_graphrag_agentic.py: {e}")
         # Still write an empty part file so parent can proceed
@@ -289,7 +289,7 @@ def worker_main(worker_id: int,
                     generated_answer = ""
                     error_msg = None
                     try:
-                        result = rag.agentic_graph_rag_iq(question)
+                        result = rag.agentic_graph_rag_answer_judge(question)
                         generated_answer = (result or {}).get("final_answer", "")
                         if not isinstance(generated_answer, str):
                             generated_answer = json.dumps(generated_answer, ensure_ascii=False)

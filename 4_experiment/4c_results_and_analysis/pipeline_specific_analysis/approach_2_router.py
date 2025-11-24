@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+"""
+Router Decision Analysis Script - Approach 2
+Extracts router decisions from multi-agent RAG log files (Approach 2),
+maps to LLM judge scores, and generates comprehensive analysis reports.
+"""
+
+import os
+import re
+import csv
+from pathlib import Path
+from collections import defaultdict
+from typing import Dict, List, Tuple, Optional
+
+# ============ CONFIGURATION ============
+# Path to the CSV file with LLM judge results
+CSV_FILE = Path("../../../dataset/4_experiment/4c_experiment_results/new/Individual base multi-agent - approach_2_router.csv")
+
+# Layer 1 folder containing the layer 2 experiment folders
+LAYER1_FOLDER = Path("../../4b_retrieval/4b_iv_multi_agents/question_terminal_logs_multi_agent/no_15_approach_2_router")
+
+
+# Mapping of folder name to CSV column name
+FOLDER_TO_COLUMN = {
+    "no_15_approach_2_router_new": "approach_2_router_answer score",
+}
+
+# Output directory for results
+OUTPUT_DIR = Path("results_15_router")
+
+# Valid router decisions (including fallback variants)
+VALID_ROUTER_DECISIONS = {
+    "graphrag", "naiverag", 
+    "graphrag_fallback", "naiverag_fallback",
+    "naive", "graph"  # possible aliases
+}
+
+
+# ============ HELPER FUNCTIONS ============
+def extract_question_id_from_filename(filename: str) -> int:
+    """
+    Extract question ID from log filename.
+    Example: q0909_wid8_id908_20250927-102245_According...
+    Returns: 908
+    """
+    match = re.search(r'_id(\d+)_', filename)
+    if match:
+        return int(match.group(1))
+    return -1
+
+
+def normalize_decision(decision: str) -> str:
+    """
+    Normalize router decision to standard form.
+    """
+    decision = decision.lower().strip()
+    
+    # Map aliases
+    if decision in ("naive", "naiverag"):
+        return "naiverag"
+    if decision in ("graph", "graphrag"):
+        return "graphrag"
+    if decision in ("naive_fallback", "naiverag_fallback"):
+        return "naiverag_fallback"
+    if decision in ("graph_fallback", "graphrag_fallback"):
+        return "graphrag_fallback"
+    
+    return decision
+
+
+def extract_router_decision_from_log(log_path: Path) -> str:
+    """
+    Extract the router decision from a multi-agent RAG log file (Approach 2).
+    
+    Returns one of: "graphrag", "naiverag", "graphrag_fallback", "naiverag_fallback", or "unknown"
+    """
+    try:
+        with open(log_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Method 1: Look for "[Router] Decision=<decision>"
+        match = re.search(r'\[Router\]\s+Decision\s*=\s*(\w+)', content, re.IGNORECASE)
+        if match:
+            decision = normalize_decision(match.group(1))
+            if decision in VALID_ROUTER_DECISIONS:
+                return decision
+        
+        # Method 2: Look for "- Router choice: <decision>"
+        match = re.search(r'-\s+Router\s+choice:\s*(\w+)', content, re.IGNORECASE)
+        if match:
+            decision = normalize_decision(match.group(1))
+            if decision in VALID_ROUTER_DECISIONS:
+                return decision
+        
+        # Method 3: Look for decision in route dictionary assignment
+        # route["decision"] = "naiverag_fallback" or similar
+        match = re.search(r'route\["decision"\]\s*=\s*["\'](\w+)["\']', content, re.IGNORECASE)
+        if match:
+            decision = normalize_decision(match.group(1))
+            if decision in VALID_ROUTER_DECISIONS:
+                return decision
+        
+        # Method 4: Look for "[Multi] Naive RAG" or "[Multi] GraphRAG"
+        if re.search(r'\[Multi\].*Naive\s+RAG', content, re.IGNORECASE):
+            # Check if it's a fallback
+            if re.search(r'Falling\s+back\s+to\s+Naive', content, re.IGNORECASE):
+                return "naiverag_fallback"
+            return "naiverag"
+        
+        if re.search(r'\[Multi\].*GraphRAG', content, re.IGNORECASE):
+            # Check if it's a fallback
+            if re.search(r'Falling\s+back\s+to\s+GraphRAG', content, re.IGNORECASE):
+                return "graphrag_fallback"
+            return "graphrag"
+        
+        # Method 5: Look for "=== GraphRAG" or "=== Naive RAG" started messages
+        if re.search(r'===\s+GraphRAG.*started\s+===', content, re.IGNORECASE):
+            return "graphrag"
+        
+        if re.search(r'===\s+Naive\s+RAG.*started\s+===', content, re.IGNORECASE):
+            return "naiverag"
+        
+        # Method 6: Look in router JSON output
+        router_match = re.search(
+            r'"router":\s*\{[^}]*"decision":\s*"(\w+)"',
+            content,
+            re.IGNORECASE
+        )
+        if router_match:
+            decision = normalize_decision(router_match.group(1))
+            if decision in VALID_ROUTER_DECISIONS:
+                return decision
+            
+    except Exception as e:
+        print(f"Error reading {log_path}: {e}")
+    
+    return "unknown"
+
+
+def load_scores_from_csv(csv_path: Path) -> Dict[str, Dict[int, int]]:
+    """
+    Load scores from CSV file.
+    Returns: {column_name: {question_id: score}}
+    """
+    scores = {}
+    
+    try:
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            
+            # Initialize score dictionaries for each column
+            for col_name in FOLDER_TO_COLUMN.values():
+                scores[col_name] = {}
+            
+            row_count = 0
+            for row in reader:
+                row_count += 1
+                try:
+                    q_id = int(row['id'])
+                    for col_name in FOLDER_TO_COLUMN.values():
+                        try:
+                            score_str = row[col_name].strip()
+                            score = int(score_str)
+                            scores[col_name][q_id] = score
+                        except (ValueError, KeyError) as e:
+                            scores[col_name][q_id] = -1  # Missing or invalid score
+                except (ValueError, KeyError) as e:
+                    print(f"Warning: Error processing row {row_count}: {e}")
+                    continue
+            
+            print(f"Loaded {row_count} rows from CSV")
+    except Exception as e:
+        print(f"Error loading CSV file: {e}")
+        raise
+    
+    return scores
+
+
+def process_experiment_folder(folder_path: Path, column_name: str, 
+                              scores: Dict[int, int]) -> List[Tuple[int, str, int]]:
+    """
+    Process all log files in an experiment folder.
+    Returns: List of (question_id, router_decision, score) tuples
+    """
+    results = []
+    failed_extractions = []
+    
+    # Find all .txt log files
+    log_files = list(folder_path.glob("*.txt"))
+    print(f"  Found {len(log_files)} log files in {folder_path.name}")
+    
+    # For debugging: show a few sample log entries
+    if log_files:
+        sample_file = log_files[0]
+        print(f"\n  DEBUG: Checking sample file {sample_file.name}")
+        try:
+            with open(sample_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+                # Show router-related log lines
+                router_lines = [line for line in content.split('\n') if 'router' in line.lower() or 'multi' in line.lower()]
+                if router_lines:
+                    print("  Sample router/multi log lines:")
+                    for line in router_lines[:10]:
+                        print(f"    {line[:200]}")
+                else:
+                    print("  WARNING: No router/multi lines found in sample file!")
+        except Exception as e:
+            print(f"  DEBUG ERROR: {e}")
+        print()
+    
+    for log_file in log_files:
+        # Extract question ID from filename
+        q_id = extract_question_id_from_filename(log_file.name)
+        if q_id == -1:
+            print(f"  Warning: Could not extract ID from {log_file.name}")
+            continue
+        
+        # Extract router decision
+        decision = extract_router_decision_from_log(log_file)
+        if decision == "unknown":
+            failed_extractions.append((q_id, log_file.name))
+        
+        # Get score from CSV
+        score = scores.get(q_id, -1)
+        if score == -1:
+            print(f"  Warning: No score found for question ID {q_id}")
+        
+        results.append((q_id, decision, score))
+    
+    if failed_extractions:
+        print(f"  WARNING: Failed to extract router decision from {len(failed_extractions)} files")
+        for q_id, fname in failed_extractions[:5]:
+            print(f"    - Question {q_id}: {fname}")
+        if len(failed_extractions) > 5:
+            print(f"    ... and {len(failed_extractions) - 5} more")
+        
+        # Show content snippet for debugging the first failed file
+        if failed_extractions:
+            q_id, fname = failed_extractions[0]
+            print(f"  Showing first failed file for debugging:")
+            print(f"    Question {q_id}: {fname}")
+            try:
+                log_path = folder_path / fname
+                with open(log_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    router_lines = [line for line in content.split('\n') 
+                                  if any(kw in line.lower() for kw in ['router', 'multi', 'naive', 'graph'])][:15]
+                    if router_lines:
+                        print("    Relevant lines from this file:")
+                        for line in router_lines:
+                            print(f"      {line[:200]}")
+            except Exception as e:
+                print(f"    Could not read file for debugging: {e}")
+    
+    return results
+
+
+def analyze_results(results: List[Tuple[int, str, int]], experiment_name: str) -> str:
+    """
+    Analyze the results and generate a comprehensive report.
+    Returns: Analysis text
+    """
+    lines = []
+    lines.append("=" * 100)
+    lines.append(f"ROUTER DECISION ANALYSIS REPORT - APPROACH 2: {experiment_name}")
+    lines.append("=" * 100)
+    lines.append("")
+    
+    # Basic statistics
+    lines.append(f"Total questions processed: {len(results)}")
+    lines.append("")
+    
+    # Overall score distribution
+    lines.append("OVERALL SCORE DISTRIBUTION:")
+    lines.append("-" * 50)
+    score_counts = defaultdict(int)
+    for _, _, score in results:
+        if score >= 0:
+            score_counts[score] += 1
+    
+    total_scored = sum(score_counts.values())
+    for score in sorted(score_counts.keys()):
+        count = score_counts[score]
+        pct = (count / total_scored * 100) if total_scored > 0 else 0
+        lines.append(f"  Score {score}: {count:4d} questions ({pct:5.2f}%)")
+    
+    if total_scored > 0:
+        avg_score = sum(score * count for score, count in score_counts.items()) / total_scored
+        lines.append(f"  Average score: {avg_score:.3f}")
+    lines.append("")
+    
+    # Group by router decision
+    by_decision = defaultdict(list)
+    for q_id, decision, score in results:
+        by_decision[decision].append((q_id, score))
+    
+    # ========== ROUTER DECISION DISTRIBUTION ==========
+    lines.append("ROUTER DECISION DISTRIBUTION:")
+    lines.append("=" * 100)
+    
+    decision_sorted = sorted(by_decision.items(), key=lambda x: len(x[1]), reverse=True)
+    for decision, items in decision_sorted:
+        count = len(items)
+        pct = (count / len(results) * 100) if len(results) > 0 else 0
+        lines.append(f"\nRouter Decision: {decision.upper()}")
+        lines.append(f"  Count: {count:4d} questions ({pct:5.2f}%)")
+        
+        # Score distribution for this router decision
+        dec_score_counts = defaultdict(int)
+        for _, score in items:
+            if score >= 0:
+                dec_score_counts[score] += 1
+        
+        total_dec_scored = sum(dec_score_counts.values())
+        if total_dec_scored > 0:
+            lines.append("  Score breakdown:")
+            for score in sorted(dec_score_counts.keys()):
+                cnt = dec_score_counts[score]
+                pct_s = (cnt / total_dec_scored * 100)
+                lines.append(f"    Score {score}: {cnt:4d} ({pct_s:5.2f}%)")
+            
+            avg = sum(score * cnt for score, cnt in dec_score_counts.items()) / total_dec_scored
+            lines.append(f"  Average score: {avg:.3f}")
+            
+            # Success rate (score >= 1)
+            success = sum(cnt for score, cnt in dec_score_counts.items() if score >= 1)
+            success_rate = (success / total_dec_scored * 100)
+            lines.append(f"  Success rate (score >= 1): {success_rate:.2f}% ({success}/{total_dec_scored})")
+            
+            # Perfect score rate (score == 2)
+            perfect = dec_score_counts.get(2, 0)
+            perfect_rate = (perfect / total_dec_scored * 100)
+            lines.append(f"  Perfect score rate (score == 2): {perfect_rate:.2f}% ({perfect}/{total_dec_scored})")
+    
+    lines.append("")
+    
+    # ========== COMPARATIVE ANALYSIS ==========
+    lines.append("COMPARATIVE ANALYSIS:")
+    lines.append("=" * 100)
+    
+    # Compare router decisions
+    lines.append("\nRouter decisions ranked by average score:")
+    lines.append("-" * 50)
+    decision_avgs = []
+    for decision, items in by_decision.items():
+        scores = [score for _, score in items if score >= 0]
+        if scores:
+            avg = sum(scores) / len(scores)
+            decision_avgs.append((decision, avg, len(scores)))
+    
+    decision_avgs.sort(key=lambda x: x[1], reverse=True)
+    for i, (decision, avg, n) in enumerate(decision_avgs, 1):
+        lines.append(f"  {i}. {decision.upper()}")
+        lines.append(f"     Avg score: {avg:.3f} (n={n})")
+    
+    # Success rates comparison
+    lines.append("\nRouter decisions ranked by success rate (score >= 1):")
+    lines.append("-" * 50)
+    decision_success = []
+    for decision, items in by_decision.items():
+        scores = [score for _, score in items if score >= 0]
+        if scores:
+            success = sum(1 for s in scores if s >= 1)
+            rate = success / len(scores)
+            decision_success.append((decision, rate, success, len(scores)))
+    
+    decision_success.sort(key=lambda x: x[1], reverse=True)
+    for i, (decision, rate, succ, total) in enumerate(decision_success, 1):
+        lines.append(f"  {i}. {decision.upper()}")
+        lines.append(f"     Success rate: {rate*100:.1f}% ({succ}/{total})")
+    
+    # Perfect score rates comparison
+    lines.append("\nRouter decisions ranked by perfect score rate (score == 2):")
+    lines.append("-" * 50)
+    decision_perfect = []
+    for decision, items in by_decision.items():
+        scores = [score for _, score in items if score >= 0]
+        if scores:
+            perfect = sum(1 for s in scores if s == 2)
+            rate = perfect / len(scores)
+            decision_perfect.append((decision, rate, perfect, len(scores)))
+    
+    decision_perfect.sort(key=lambda x: x[1], reverse=True)
+    for i, (decision, rate, perf, total) in enumerate(decision_perfect, 1):
+        lines.append(f"  {i}. {decision.upper()}")
+        lines.append(f"     Perfect score rate: {rate*100:.1f}% ({perf}/{total})")
+    
+    # ========== BASE DECISIONS COMPARISON (ignoring fallback) ==========
+    lines.append("\n")
+    lines.append("BASE DECISIONS COMPARISON (GraphRAG vs NaiveRAG, including fallbacks):")
+    lines.append("=" * 100)
+    
+    # Group decisions into base categories
+    graphrag_items = []
+    naiverag_items = []
+    
+    for decision, items in by_decision.items():
+        if 'graph' in decision.lower():
+            graphrag_items.extend(items)
+        elif 'naive' in decision.lower():
+            naiverag_items.extend(items)
+    
+    base_comparison = [
+        ("GraphRAG (all)", graphrag_items),
+        ("NaiveRAG (all)", naiverag_items)
+    ]
+    
+    for base_name, items in base_comparison:
+        if not items:
+            continue
+        
+        scores = [score for _, score in items if score >= 0]
+        if scores:
+            lines.append(f"\n{base_name}:")
+            lines.append(f"  Total questions: {len(scores)}")
+            
+            score_dist = defaultdict(int)
+            for s in scores:
+                score_dist[s] += 1
+            
+            for score in sorted(score_dist.keys()):
+                cnt = score_dist[score]
+                pct = (cnt / len(scores) * 100)
+                lines.append(f"  Score {score}: {cnt:4d} ({pct:5.2f}%)")
+            
+            avg = sum(scores) / len(scores)
+            success = sum(1 for s in scores if s >= 1)
+            perfect = sum(1 for s in scores if s == 2)
+            
+            lines.append(f"  Average score: {avg:.3f}")
+            lines.append(f"  Success rate (score >= 1): {(success/len(scores)*100):.2f}% ({success}/{len(scores)})")
+            lines.append(f"  Perfect score rate (score == 2): {(perfect/len(scores)*100):.2f}% ({perfect}/{len(scores)})")
+    
+    # ========== KEY INSIGHTS ==========
+    lines.append("\n")
+    lines.append("KEY INSIGHTS:")
+    lines.append("=" * 100)
+    
+    if decision_avgs:
+        best_dec = decision_avgs[0]
+        lines.append(f"\n1. Best Router Decision (by average score):")
+        lines.append(f"   {best_dec[0].upper()}")
+        lines.append(f"   Average score: {best_dec[1]:.3f} across {best_dec[2]} questions")
+    
+    if decision_success:
+        best_success = decision_success[0]
+        lines.append(f"\n2. Best Router Decision (by success rate):")
+        lines.append(f"   {best_success[0].upper()}")
+        lines.append(f"   Success rate: {best_success[1]*100:.1f}% ({best_success[2]}/{best_success[3]} questions)")
+    
+    if decision_perfect:
+        best_perfect = decision_perfect[0]
+        lines.append(f"\n3. Best Router Decision (by perfect score rate):")
+        lines.append(f"   {best_perfect[0].upper()}")
+        lines.append(f"   Perfect score rate: {best_perfect[1]*100:.1f}% ({best_perfect[2]}/{best_perfect[3]} questions)")
+    
+    # Fallback analysis
+    lines.append("\n4. Fallback Analysis:")
+    fallback_count = sum(len(items) for decision, items in by_decision.items() if 'fallback' in decision.lower())
+    total_count = len(results)
+    if fallback_count > 0:
+        lines.append(f"   Total fallback cases: {fallback_count} ({(fallback_count/total_count*100):.2f}%)")
+        lines.append(f"   Primary pipeline success rate: {((total_count-fallback_count)/total_count*100):.2f}%")
+    else:
+        lines.append(f"   No fallback cases detected (100% primary pipeline success)")
+    
+    # Distribution comparison table
+    if len(by_decision) >= 2:
+        lines.append("\n5. Score Distribution Comparison Table:")
+        lines.append("   " + "-" * 80)
+        lines.append(f"   {'Decision':<20} {'Score=0':<15} {'Score=1':<15} {'Score=2':<15} {'Avg':<10}")
+        lines.append("   " + "-" * 80)
+        
+        for decision in sorted(by_decision.keys()):
+            items = by_decision[decision]
+            scores = [score for _, score in items if score >= 0]
+            if scores:
+                s0 = sum(1 for s in scores if s == 0)
+                s1 = sum(1 for s in scores if s == 1)
+                s2 = sum(1 for s in scores if s == 2)
+                avg = sum(scores) / len(scores)
+                
+                s0_pct = (s0 / len(scores) * 100)
+                s1_pct = (s1 / len(scores) * 100)
+                s2_pct = (s2 / len(scores) * 100)
+                
+                lines.append(f"   {decision.upper():<20} "
+                           f"{s0:4d} ({s0_pct:4.1f}%)  "
+                           f"{s1:4d} ({s1_pct:4.1f}%)  "
+                           f"{s2:4d} ({s2_pct:4.1f}%)  "
+                           f"{avg:.3f}")
+        lines.append("   " + "-" * 80)
+    
+    lines.append("")
+    lines.append("=" * 100)
+    
+    return "\n".join(lines)
+
+
+def main():
+    print("Starting Router Decision analysis (Approach 2)...")
+    print(f"CSV file: {CSV_FILE}")
+    print(f"Layer 1 folder: {LAYER1_FOLDER}")
+    print(f"Output directory: {OUTPUT_DIR}")
+    print()
+    
+    # Create output directory
+    OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
+    
+    # Load scores from CSV
+    print("Loading scores from CSV...")
+    all_scores = load_scores_from_csv(CSV_FILE)
+    print(f"Loaded scores for {len(all_scores)} experiments")
+    print()
+    
+    # Process each experiment folder
+    for folder_name, column_name in FOLDER_TO_COLUMN.items():
+        print(f"Processing experiment: {folder_name}")
+        print(f"  CSV column: {column_name}")
+        
+        folder_path = LAYER1_FOLDER / folder_name
+        if not folder_path.exists():
+            print(f"  ERROR: Folder not found: {folder_path}")
+            print()
+            continue
+        
+        # Get scores for this experiment
+        scores = all_scores[column_name]
+        
+        # Process log files
+        results = process_experiment_folder(folder_path, column_name, scores)
+        print(f"  Processed {len(results)} questions successfully")
+        
+        # Save results to CSV
+        results_file = OUTPUT_DIR / f"{folder_name}_router_results.csv"
+        with open(results_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['question_id', 'router_decision', 'llm_judge_score'])
+            for q_id, decision, score in sorted(results):
+                writer.writerow([q_id, decision, score])
+        print(f"  Saved results to: {results_file}")
+        
+        # Generate and save analysis
+        analysis = analyze_results(results, folder_name)
+        analysis_file = OUTPUT_DIR / f"{folder_name}_router_analysis.txt"
+        with open(analysis_file, 'w', encoding='utf-8') as f:
+            f.write(analysis)
+        print(f"  Saved analysis to: {analysis_file}")
+        
+        # Also print analysis to console
+        print()
+        print(analysis)
+        print()
+    
+    print("Router Decision analysis (Approach 2) complete!")
+
+
+if __name__ == "__main__":
+    main()
