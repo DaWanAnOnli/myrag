@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 # multi_agent.py
-# Combined RAG orchestrator with agentic supervisor:
+# Combined RAG orchestrator:
 # - Runs GraphRAG (single-pass, Agents 1 & 2) and Naive RAG (Answerer-only)
 # - Aggregator agent synthesizes the final answer from both approaches
-# - Adds a Subgoal Generator agent and a Final Aggregator agent
-# - Supervisor orchestrator decomposes the query into up to N subgoals,
-#   runs the existing multi-pipeline per subgoal (in parallel), then aggregates results
-# - Comprehensive logging with timestamps, PID, TID, subgoal context; rate limiting is thread-safe
+# - Comprehensive logging with timestamps, PID, Neo4j attempt logging, durations, and retries
+# - Self-contained: does not import from existing scripts
 
-import os, sys, time, json, math, pickle, re, random, threading
+import os, sys, time, json, math, pickle, re, random
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional, Set
 from threading import Lock
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
 import google.generativeai as genai
@@ -32,7 +29,7 @@ NEO4J_PASS = os.getenv("NEO4J_PASS", "password")
 
 # Neo4j retry/timeout
 NEO4J_TX_TIMEOUT_S = float(os.getenv("NEO4J_TX_TIMEOUT_S", "60"))
-NEO4J_MAX_ATTEMPTS = int(os.getenv("NEO4J_MAX_ATTEMPTS", "100000"))
+NEO4J_MAX_ATTEMPTS = int(os.getenv("NEO4J_MAX_ATTEMPTS", "10"))
 
 # Models
 GEN_MODEL   = os.getenv("GEN_MODEL", "models/gemini-2.5-flash")
@@ -64,38 +61,12 @@ MAX_ITERS = 1  # single pass
 LLM_CALLS_PER_MINUTE = int(os.getenv("LLM_CALLS_PER_MINUTE", "13"))
 EMBEDDING_CALLS_PER_MINUTE = int(os.getenv("EMBEDDING_CALLS_PER_MINUTE", "0"))  # 0 disables embedding throttling
 
-# ---------- Agentic Supervisor parameters ----------
-SUBGOAL_MAX_N = int(os.getenv("SUBGOAL_MAX_N", "5"))
-SUBGOALS_RUN_IN_PARALLEL = os.getenv("SUBGOALS_RUN_IN_PARALLEL", "true").lower() in ("1","true","yes","y")
-SUBGOALS_MAX_WORKERS = int(os.getenv("SUBGOALS_MAX_WORKERS", str(SUBGOAL_MAX_N)))
-SUBGOAL_ANSWER_SNIPPET_CLAMP = int(os.getenv("SUBGOAL_ANSWER_SNIPPET_CLAMP", "2000"))
-FINAL_AGG_MAX_TOKENS = int(os.getenv("FINAL_AGG_MAX_TOKENS", str(GR_ANSWER_MAX_TOKENS)))
-
-# ---------- JSON-output (text-mode) parameters ----------
-JSON_MAX_TOKENS = int(os.getenv("JSON_MAX_TOKENS", "4096"))
-JSON_PARSER_STRICTNESS = os.getenv("JSON_PARSER_STRICTNESS", "relaxed").lower()  # "relaxed" or "strict"
-LOG_JSON_RAW_PREVIEW_CHARS = int(os.getenv("LOG_JSON_RAW_PREVIEW_CHARS", "200"))
-
 # ----------------- Initialize SDKs -----------------
 genai.configure(api_key=GOOGLE_API_KEY)
 gen_model = genai.GenerativeModel(GEN_MODEL)
 driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
 
-# ----------------- Config (add this constant) -----------------
-AGG_TEMPERATURE = 0.0  # Aggregator temperature
-
-# ----------------- Utilities (add this helper function) -----------------
-def _truncate(text: str, max_chars: int) -> str:
-    """Truncate text to max_chars, adding ellipsis if truncated."""
-    if not isinstance(text, str):
-        return ""
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars] + "..."
-
 # ----------------- Logger -----------------
-_THREAD_LOCAL = threading.local()
-
 def _now_ts() -> str:
     t = time.time()
     base = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
@@ -108,28 +79,14 @@ def _pid() -> int:
     except Exception:
         return -1
 
-def _tid() -> int:
-    try:
-        return threading.get_ident()
-    except Exception:
-        return -1
-
-def set_log_context(prefix: Optional[str]):
-    setattr(_THREAD_LOCAL, "prefix", prefix or "")
-
-def _get_log_context() -> str:
-    s = getattr(_THREAD_LOCAL, "prefix", "")
-    return f" [{s}]" if s else ""
-
 def _prefix(level: str = "INFO") -> str:
-    return f"[{_now_ts()}] [{level}] [pid={_pid()} tid={_tid()}]{_get_log_context()}"
+    return f"[{_now_ts()}] [{level}] [pid={_pid()}]"
 
 class FileLogger:
     def __init__(self, file_path: Path, also_console: bool = True):
         self.file_path = file_path
         self.also_console = also_console
         self._fh = open(file_path, "w", encoding="utf-8")
-        self._lock = Lock()
 
     def log(self, msg: Any = ""):
         if not isinstance(msg, str):
@@ -137,20 +94,18 @@ class FileLogger:
                 msg = json.dumps(msg, ensure_ascii=False, default=str)
             except Exception:
                 msg = str(msg)
+        # Prefix each line for readability
         lines = (msg or "").splitlines() or [""]
         prefixed = [f"{_prefix()} {line}" for line in lines]
         out = "\n".join(prefixed) + "\n"
-        with self._lock:
-            self._fh.write(out)
-            self._fh.flush()
-            if self.also_console:
-                print(out, end="", flush=True)
+        self._fh.write(out)
+        self._fh.flush()
+        if self.also_console:
+            print(out, end="", flush=True)
 
     def close(self):
         try:
-            with self._lock:
-                self._fh.flush()
-                self._fh.close()
+            self._fh.flush(); self._fh.close()
         except Exception:
             pass
 
@@ -159,9 +114,11 @@ _LOGGER: Optional[FileLogger] = None
 def log(msg: Any = "", level: str = "INFO"):
     global _LOGGER
     if _LOGGER is None:
+        # Fallback to console if logger not initialized yet
         lines = (str(msg) if isinstance(msg, str) else json.dumps(msg, ensure_ascii=False, default=str)).splitlines() or [""]
         print("\n".join(f"{_prefix(level)} {line}" for line in lines), flush=True)
         return
+    # Inject level
     if isinstance(msg, str):
         lines = msg.splitlines() or [""]
         for line in lines:
@@ -188,6 +145,13 @@ def _norm_id(x) -> str:
 def estimate_tokens_for_text(text: str) -> int:
     return max(1, int(len(text) / 4))
 
+def _truncate(s: str, max_chars: int) -> str:
+    if not isinstance(s, str):
+        return ""
+    if len(s) <= max_chars:
+        return s
+    return s[: max_chars - 20] + " ...[truncated]"
+
 def _as_float_list(vec) -> List[float]:
     if vec is None:
         return []
@@ -212,27 +176,25 @@ def cos_sim(a: List[float], b: List[float]) -> float:
         return 0.0
     return dot / (na * nb)
 
-# --- Rate limiting and retries (thread-safe) ---
+# --- Rate limiting and retries ---
 class RateLimiter:
     def __init__(self, calls_per_minute: int, name: str = "LLM"):
         self.calls_per_minute = max(0, int(calls_per_minute))
         self.name = name
         self.window = deque()
         self.window_seconds = 60.0
-        self._lock = Lock()
 
     def wait_for_slot(self):
         if self.calls_per_minute <= 0:
             return
         while True:
-            with self._lock:
-                now = time.monotonic()
-                while self.window and (now - self.window[0]) >= self.window_seconds:
-                    self.window.popleft()
-                if len(self.window) < self.calls_per_minute:
-                    self.window.append(now)
-                    return
-                sleep_time = self.window_seconds - (now - self.window[0])
+            now = time.monotonic()
+            while self.window and (now - self.window[0]) >= self.window_seconds:
+                self.window.popleft()
+            if len(self.window) < self.calls_per_minute:
+                self.window.append(now)
+                return
+            sleep_time = self.window_seconds - (now - self.window[0])
             if sleep_time > 0:
                 log(f"[RateLimit:{self.name}] Sleeping {sleep_time:.2f}s to respect {self.name}_CALLS_PER_MINUTE={self.calls_per_minute}", level="INFO")
                 time.sleep(sleep_time)
@@ -253,6 +215,7 @@ def _api_call_with_retry(func, *args, **kwargs):
             else:
                 _LLM_RATE_LIMITER.wait_for_slot()
         except Exception:
+            # If limiter misbehaves, just proceed
             pass
         try:
             return func(*args, **kwargs)
@@ -298,17 +261,7 @@ def detect_user_language(text: str) -> str:
     if score_en > score_id: return "en"
     return "en"
 
-# ----------------- Safe LLM helpers (text-only + strict JSON prompts) -----------------
-
-STRICT_JSON_DIRECTIVE = (
-    "Return ONLY a single valid JSON object as the entire response.\n"
-    "- No markdown, no code fences, no explanations, no surrounding text.\n"
-    "- Use double quotes for all keys and string values.\n"
-    "- Do not include trailing commas or comments.\n"
-    "- If a value is unknown, use an empty string, empty array, 0/0.0, false, or null as appropriate.\n"
-    "- Ensure the JSON is parseable by json.loads in Python."
-)
-
+# ----------------- Safe LLM helpers -----------------
 def get_finish_info(resp) -> Dict[str, Any]:
     info = {}
     try:
@@ -347,6 +300,28 @@ def extract_text_from_response(resp) -> Optional[str]:
         pass
     return None
 
+def safe_generate_json(prompt: str, schema: Dict[str, Any], temp: float = 0.0) -> Dict[str, Any]:
+    cfg = GenerationConfig(
+        temperature=temp,
+        response_mime_type="application/json",
+        response_schema=schema,
+    )
+    t0 = now_ms()
+    resp = _api_call_with_retry(gen_model.generate_content, prompt, generation_config=cfg)
+    log(f"[LLM JSON] call completed in {dur_ms(t0):.0f} ms", level="DEBUG")
+    try:
+        if isinstance(resp.text, str) and resp.text.strip():
+            return json.loads(resp.text)
+    except Exception:
+        pass
+    try:
+        raw = resp.candidates[0].content.parts[0].text
+        return json.loads(raw)
+    except Exception as e:
+        info = get_finish_info(resp)
+        log(f"[LLM JSON parse warning] No JSON content returned. Diagnostics: {info}. Error: {e}", level="WARN")
+        return {}
+
 def safe_generate_text(prompt: str, max_tokens: int, temperature: float = 0.2) -> str:
     cfg = GenerationConfig(temperature=temperature, max_output_tokens=max_tokens)
     t0 = now_ms()
@@ -359,276 +334,6 @@ def safe_generate_text(prompt: str, max_tokens: int, temperature: float = 0.2) -
     info = get_finish_info(resp)
     log(f"[LLM text warning] No text returned. Diagnostics: {info}. Took={took:.0f} ms", level="WARN")
     return f"(Model returned no text. finish_info={info})"
-
-# ---- JSON parsing helpers (from normal text) ----
-def _strip_code_fences(s: str) -> str:
-    fence = re.search(r"```(?:json)?\s*(.*?)```", s, flags=re.IGNORECASE | re.DOTALL)
-    if fence:
-        return fence.group(1).strip()
-    return s.strip()
-
-def _extract_balanced_json_object(s: str) -> Optional[str]:
-    start = s.find("{")
-    if start == -1:
-        return None
-    i = start
-    depth = 0
-    in_str = False
-    esc = False
-    while i < len(s):
-        ch = s[i]
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-        else:
-            if ch == '"':
-                in_str = True
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    return s[start:i+1]
-        i += 1
-    return None
-
-def _cleanup_relaxed_json_text(s: str) -> str:
-    s = re.sub(r",\s*(\})", r"\1", s)
-    s = re.sub(r",\s*(\])", r"\1", s)
-    return s
-
-def try_parse_json_from_text(raw_text: str) -> Dict[str, Any]:
-    if not isinstance(raw_text, str):
-        return {}
-    candidate = _strip_code_fences(raw_text)
-    try:
-        return json.loads(candidate)
-    except Exception:
-        pass
-    balanced = _extract_balanced_json_object(candidate)
-    if balanced:
-        try:
-            return json.loads(balanced)
-        except Exception:
-            if JSON_PARSER_STRICTNESS != "strict":
-                try:
-                    return json.loads(_cleanup_relaxed_json_text(balanced))
-                except Exception:
-                    pass
-    f = candidate.find("{"); l = candidate.rfind("}")
-    if 0 <= f < l:
-        snippet = candidate[f:l+1]
-        try:
-            return json.loads(snippet)
-        except Exception:
-            if JSON_PARSER_STRICTNESS != "strict":
-                try:
-                    return json.loads(_cleanup_relaxed_json_text(snippet))
-                except Exception:
-                    pass
-    if candidate != raw_text:
-        try:
-            return json.loads(raw_text)
-        except Exception:
-            if JSON_PARSER_STRICTNESS != "strict":
-                try:
-                    return json.loads(_cleanup_relaxed_json_text(raw_text))
-                except Exception:
-                    pass
-    return {}
-
-def _default_for_type(t: Any):
-    if t == "string":
-        return ""
-    if t == "number":
-        return 0.0
-    if t == "integer":
-        return 0
-    if t == "boolean":
-        return False
-    if t == "array":
-        return []
-    if t == "object":
-        return {}
-    return None
-
-def _ensure_required_fields(obj: Dict[str, Any], schema: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    if not isinstance(obj, dict) or not isinstance(schema, dict):
-        return obj if isinstance(obj, dict) else {}
-    sch_type = schema.get("type")
-    props = schema.get("properties", {})
-    required = schema.get("required", [])
-    if sch_type == "object" and isinstance(props, dict):
-        for k in required:
-            if k not in obj:
-                prop = props.get(k, {})
-                d = _default_for_type(prop.get("type"))
-                obj[k] = d
-        for k, prop in props.items():
-            if k in obj:
-                if prop.get("type") == "array" and not isinstance(obj[k], list):
-                    obj[k] = [] if obj[k] is None else [obj[k]]
-                if prop.get("type") == "object" and not isinstance(obj[k], dict):
-                    try:
-                        if isinstance(obj[k], str):
-                            maybe = json.loads(obj[k])
-                            if isinstance(maybe, dict):
-                                obj[k] = maybe
-                            else:
-                                obj[k] = {}
-                        else:
-                            obj[k] = {}
-                    except Exception:
-                        obj[k] = {}
-    return obj
-
-def safe_generate_json(prompt: str, schema: Dict[str, Any], temp: float = 0.0, max_tokens: int = 8192) -> Dict[str, Any]:
-    """
-    Native JSON mode generation using response_mime_type and response_schema.
-    """
-    cfg = GenerationConfig(
-        temperature=temp, 
-        response_mime_type="application/json", 
-        response_schema=schema,
-        max_output_tokens=max_tokens
-    )
-    t0 = now_ms()
-    resp = _api_call_with_retry(gen_model.generate_content, prompt, generation_config=cfg)
-    took = dur_ms(t0)
-    try:
-        if isinstance(resp.text, str) and resp.text.strip():
-            parsed = json.loads(resp.text)
-            log(f"[LLM JSON] Native mode completed in {took:.0f} ms", level="DEBUG")
-            return parsed
-    except Exception:
-        pass
-    try:
-        raw = resp.candidates[0].content.parts[0].text
-        parsed = json.loads(raw)
-        log(f"[LLM JSON] Native mode completed in {took:.0f} ms", level="DEBUG")
-        return parsed
-    except Exception as e:
-        info = get_finish_info(resp)
-        log(f"[LLM JSON warning] Native mode failed to parse. Diagnostics: {info}. Error: {e}", level="WARN")
-        return {}
-
-# ----------------- New timeout helpers (for Aggregator and others) -----------------
-
-class LLMTimeoutError(Exception):
-    """Raised when an LLM call exceeds the allowed timeout."""
-    pass
-
-def _call_with_timeout(func, timeout_seconds: int, *args, **kwargs):
-    """
-    Run func(*args, **kwargs) in a separate thread and enforce a hard timeout.
-    Returns the function result or raises LLMTimeoutError if timed out.
-    """
-    result = [None]
-    exc = [None]
-
-    def target():
-        try:
-            result[0] = func(*args, **kwargs)
-        except Exception as e:
-            exc[0] = e
-
-    t = threading.Thread(target=target, daemon=True)
-    t.start()
-    t.join(timeout_seconds)
-
-    if t.is_alive():
-        raise LLMTimeoutError(f"LLM call exceeded {timeout_seconds} seconds")
-
-    if exc[0] is not None:
-        raise exc[0]
-
-    return result[0]
-
-def safe_generate_json_with_timeout(
-    prompt: str,
-    schema: Dict[str, Any],
-    temp: float = 0.0,
-    timeout_seconds: int = 100,
-    max_timeouts: int = 3,
-) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    """
-    JSON generation with:
-    - client-side timeout (timeout_seconds)
-    - limited timeout retries (max_timeouts)
-    - uses Gemini JSON mode (response_mime_type='application/json')
-    """
-    cfg = GenerationConfig(
-        temperature=temp,
-        response_mime_type="application/json",
-        response_schema=schema,
-    )
-
-    timeout_count = 0
-    last_err: Dict[str, Any] = {}
-
-    while True:
-        try:
-            t0 = now_ms()
-            resp = _call_with_timeout(
-                _api_call_with_retry,
-                timeout_seconds,
-                gen_model.generate_content,
-                prompt,
-                generation_config=cfg,
-            )
-            took = dur_ms(t0)
-            log(f"[LLM JSON (timeout)] call completed in {took:.0f} ms", level="DEBUG")
-
-            try:
-                if isinstance(getattr(resp, "text", None), str) and resp.text.strip():
-                    return json.loads(resp.text), {}
-            except Exception as e:
-                log(f"[LLM JSON parse warning] Failed to parse resp.text as JSON: {e}", level="WARN")
-
-            try:
-                cand0 = (resp.candidates or [None])[0]
-                if cand0 and getattr(cand0, "content", None):
-                    parts = getattr(cand0.content, "parts", None) or []
-                    for p in parts:
-                        t = getattr(p, "text", None)
-                        if isinstance(t, str) and t.strip():
-                            try:
-                                return json.loads(t), {}
-                            except Exception:
-                                continue
-            except Exception as e:
-                log(f"[LLM JSON parse warning] Failed to parse candidates as JSON: {e}", level="WARN")
-
-            info = get_finish_info(resp)
-            log(f"[LLM JSON parse warning] No valid JSON content returned. Diagnostics: {info}", level="WARN")
-            last_err = {"type": "parse_error", "info": info}
-            return {}, last_err
-
-        except LLMTimeoutError as te:
-            timeout_count += 1
-            last_err = {
-                "type": "timeout",
-                "message": str(te),
-                "timeout_count": timeout_count,
-            }
-            log(f"[LLM JSON (timeout)] Timeout {timeout_count}/{max_timeouts}: {te}", level="WARN")
-            if timeout_count > max_timeouts:
-                log("[LLM JSON (timeout)] Exceeded maximum timeouts; aborting and using fallback.", level="ERROR")
-                return {}, last_err
-            time.sleep(random.uniform(2.0, 5.0))
-            continue
-
-        except Exception as e:
-            last_err = {
-                "type": "exception",
-                "exception": repr(e),
-            }
-            log(f"[LLM JSON (timeout)] Exception during call: {e}", level="WARN")
-            return {}, last_err
 
 # ----------------- Agent 1 / 1b Schemas (GraphRAG) -----------------
 LEGAL_ENTITY_TYPES = [
@@ -710,7 +415,7 @@ User question:
     out = safe_generate_json(prompt, QUERY_SCHEMA, temp=0.0)
     if "entities" not in out: out["entities"] = []
     if "predicates" not in out: out["predicates"] = []
-    log(f"[Agent 1] entities={[e.get('text') for e in out.get('entities', [])]}, predicates={out.get('predicates', [])}", level="INFO")
+    log(f"[Agent 1] entities={[e.get('text') for e in out['entities']]}, predicates={out['predicates']}", level="INFO")
     return out
 
 def agent1b_extract_query_triples(query: str) -> List[Dict[str, Any]]:
@@ -735,6 +440,7 @@ User question:
     log(f"[Agent 1b] Prompt size: {len(prompt)} chars, est_tokens≈{est}", level="INFO")
     out = safe_generate_json(prompt, QUERY_TRIPLES_SCHEMA, temp=0.0) or {}
     triples = out.get("triples", [])
+    triples = []
     clean: List[Dict[str, Any]] = []
     for t in triples or []:
         try:
@@ -1416,7 +1122,8 @@ def run_graph_rag(query_original: str) -> Dict[str, Any]:
 
     return {"answer": answer, "triples": len(merged_triples), "chunks": len(chunks_ranked)}
 
-# ----------------- Aggregator Agent (per subgoal; now Script-1 style with timeout) -----------------
+# ----------------- Aggregator Agent -----------------
+# ----------------- Aggregator Agent -----------------
 AGG_SCHEMA = {
     "type": "object",
     "properties": {
@@ -1429,15 +1136,15 @@ AGG_SCHEMA = {
 
 def aggregator_agent(
     query: str,
+    naive_answer: str,
     graphrag_answer: str,
-    naiverag_answer: str,
-    graphrag_meta: Dict[str, Any],
-    naiverag_meta: Dict[str, Any],
-    user_lang: str,
+    lang: str,
+    graphrag_meta: Optional[Dict[str, Any]] = None,
+    naiverag_meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Aggregator agent using Gemini JSON mode with timeout/retries,
-    adapted from Script 1's aggregator_agent.
+    Aggregator agent identical in behavior/prompt/schema to Script 1,
+    but adapted to Script 2's call site (naive vs GraphRAG naming).
     """
     g_meta = json.dumps(graphrag_meta or {}, ensure_ascii=False, indent=2)
     n_meta = json.dumps(naiverag_meta or {}, ensure_ascii=False, indent=2)
@@ -1446,14 +1153,14 @@ def aggregator_agent(
 You are the Aggregator Agent. Your task: produce the best possible final answer to the user's question.
 
 Inputs:
-- Question (language='{user_lang}'):
+- Question (language='{lang}'):
 \"\"\"{query}\"\"\"
 
 - GraphRAG answer:
 \"\"\"{_truncate(graphrag_answer, 12000)}\"\"\"
 
 - NaiveRAG answer:
-\"\"\"{_truncate(naiverag_answer, 12000)}\"\"\"
+\"\"\"{_truncate(naive_answer, 12000)}\"\"\"
 
 - GraphRAG meta (for context only; do not invent facts beyond the answers):
 {g_meta}
@@ -1478,25 +1185,13 @@ Return JSON:
     log(prompt, level="INFO")
     log(f"[Aggregator] Prompt size: {len(prompt)} chars, est_tokens≈{est}", level="INFO")
 
-    out, agg_err = safe_generate_json_with_timeout(
-        prompt,
-        AGG_SCHEMA,
-        temp=AGG_TEMPERATURE,
-        timeout_seconds=120,
-        max_timeouts=3,
-    )
-
-    if agg_err and agg_err.get("type") == "timeout":
-        log(f"[Aggregator] Using fallback due to repeated timeouts: {agg_err}", level="WARN")
-    elif agg_err:
-        log(f"[Aggregator] JSON generation error: {agg_err}", level="WARN")
-
-    out = out or {}
+    out = safe_generate_json(prompt, AGG_SCHEMA, temp=0.2) or {}
     decision = (out.get("decision") or "").strip()
     final_answer = (out.get("final_answer") or "").strip()
     rationale = (out.get("rationale") or "").strip()
 
-    if decision not in ("choose_graphrag","choose_naiverag","merge") or not final_answer:
+    # Fallback heuristic: same as Script 1
+    if decision not in ("choose_graphrag", "choose_naiverag", "merge") or not final_answer:
         def score(a: str) -> int:
             t = (a or "").lower()
             cues = 0
@@ -1507,20 +1202,25 @@ Return JSON:
             cues += len(re.findall(r"\bperaturan\b", t))
             cues += len(re.findall(r"\b\d{4}\b", t))
             return cues
+
         sg = score(graphrag_answer)
-        sn = score(naiverag_answer)
-        if sn > sg and (naiverag_answer or "").strip():
+        sn = score(naive_answer)
+
+        if sn > sg and (naive_answer or "").strip():
             decision = "choose_naiverag"
-            final_answer = (naiverag_answer or "").strip()
+            final_answer = (naive_answer or "").strip()
             rationale = rationale or "Fallback: naive answer appears more specific."
         else:
             decision = "choose_graphrag"
-            final_answer = (graphrag_answer or "").strip() or (naiverag_answer or "").strip()
+            final_answer = (graphrag_answer or "").strip() or (naive_answer or "").strip()
             rationale = rationale or "Fallback: GraphRAG chosen by default or better specificity."
+
         log("[Aggregator] Fallback decision used due to invalid or empty aggregator output.", level="WARN")
 
     log(f"[Aggregator] Decision={decision} | Rationale: {rationale[:160]}", level="INFO")
 
+    # For backward compatibility with Script 2's expectations, we also
+    # derive a rough 'confidence' and 'chosen' label from Script-1-style decision.
     if decision == "choose_graphrag":
         chosen = "graphrag"
     elif decision == "choose_naiverag":
@@ -1528,44 +1228,31 @@ Return JSON:
     else:
         chosen = "mixed"
 
+    # Simple heuristic confidence (not in Script 1, but used by Script 2 summary)
     confidence = 0.7 if decision in ("choose_graphrag", "choose_naiverag") else 0.6
 
     return {
         "decision": decision,
         "final_answer": final_answer,
         "rationale": rationale,
+        # extra fields for Script 2's summary:
         "chosen": chosen,
         "confidence": confidence,
     }
 
-# ----------------- Agentic Multi (single query; existing) -----------------
-def agentic_multi(query_original: str, logger: Optional[FileLogger] = None, log_context_prefix: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Runs NaiveRAG + GraphRAG + aggregator for a single query.
-    """
-    global _LOGGER
-    prev_logger = _LOGGER
-    prev_ctx = getattr(_THREAD_LOCAL, "prefix", "")
-    created_local_logger = False
 
+# ----------------- Orchestrator -----------------
+def agentic_multi(query_original: str) -> Dict[str, Any]:
+    global _LOGGER
     ts_name = make_timestamp_name()
-    if logger is not None:
-        _LOGGER = logger
-        if log_context_prefix:
-            set_log_context(log_context_prefix)
-    else:
-        log_file = Path.cwd() / f"{ts_name}.txt"
-        _LOGGER = FileLogger(log_file, also_console=True)
-        created_local_logger = True
+    log_file = Path.cwd() / f"{ts_name}.txt"
+    _LOGGER = FileLogger(log_file, also_console=True)
 
     t_all = now_ms()
     try:
         log("=== Multi-Agent RAG run started ===", level="INFO")
-        log(f"Process info: pid={_pid()} tid={_tid()}{_get_log_context()}", level="INFO")
-        if logger is not None:
-            log(f"Shared Log file: {logger.file_path}", level="INFO")
-        else:
-            log(f"Log file: {Path.cwd() / f'{ts_name}.txt'}", level="INFO")
+        log(f"Process info: pid={_pid()}", level="INFO")
+        log(f"Log file: {log_file}", level="INFO")
         log(f"Original Query: {query_original}", level="INFO")
         log(f"Parameters:", level="INFO")
         log(f"  GraphRAG: ENTITY_MATCH_TOP_K={GR_ENTITY_MATCH_TOP_K}, ENTITY_SUBGRAPH_HOPS={GR_ENTITY_SUBGRAPH_HOPS}, "
@@ -1580,6 +1267,7 @@ def agentic_multi(query_original: str, logger: Optional[FileLogger] = None, log_
         user_lang = detect_user_language(query_original)
         log(f"[Language] Detected user language: {user_lang}", level="INFO")
 
+        # Run Naive RAG
         naive_result: Dict[str, Any] = {}
         try:
             t_nv = now_ms()
@@ -1589,6 +1277,7 @@ def agentic_multi(query_original: str, logger: Optional[FileLogger] = None, log_
             log(f"[NaiveRAG] Error: {e}", level="ERROR")
             naive_result = {"answer": ""}
 
+        # Run GraphRAG
         graph_result: Dict[str, Any] = {}
         try:
             t_gr = now_ms()
@@ -1600,314 +1289,58 @@ def agentic_multi(query_original: str, logger: Optional[FileLogger] = None, log_
 
         naive_answer = naive_result.get("answer", "") or ""
         graphrag_answer = graph_result.get("answer", "") or ""
-        
+
+        # Build minimal meta objects to pass into the Script-1-style aggregator
         graphrag_meta = {
-            "triples": graph_result.get("triples", 0),
-            "chunks": graph_result.get("chunks", 0)
+            "triples": graph_result.get("triples"),
+            "chunks": graph_result.get("chunks"),
+            "context_hint": "Graph triples + chunks",
         }
         naiverag_meta = {
-            "candidates": naive_result.get("candidates", 0)
+            "candidates": naive_result.get("candidates"),
+            "context_hint": "Top chunk content",
         }
 
+        # Aggregate (Script-1-style aggregator)
         t_ag = now_ms()
         agg = aggregator_agent(
-            query=query_original,
+            query_original,
+            naive_answer=naive_answer,
             graphrag_answer=graphrag_answer,
-            naiverag_answer=naive_answer,
+            lang=user_lang,
             graphrag_meta=graphrag_meta,
             naiverag_meta=naiverag_meta,
-            user_lang=user_lang
         )
         t_agg = dur_ms(t_ag)
 
         final_answer = agg.get("final_answer", "") or ""
         decision = {
-            "decision": agg.get("decision"),
-            "rationale": agg.get("rationale") or "",
+            "chosen": agg.get("chosen"),
             "confidence": float(agg.get("confidence") or 0.0),
-            "chosen": agg.get("chosen", "")
+            "rationale": agg.get("rationale") or ""
         }
 
+        # Summary
         total_ms = dur_ms(t_all)
         log("\n=== Multi-Agent RAG summary ===", level="INFO")
         log(f"- Iterations used: 1 (Naive + GraphRAG + Aggregator)", level="INFO")
-        log(f"- Aggregator: decision={decision['decision']} chosen={decision['chosen']} conf={decision['confidence']:.2f}", level="INFO")
+        log(f"- Aggregator: chosen={decision['chosen']}, confidence={decision['confidence']:.2f}", level="INFO")
         log(f"- Total runtime: {total_ms:.0f} ms", level="INFO")
         log("\n=== Final Answer ===", level="INFO")
         log(final_answer, level="INFO")
+        log(f"\nLogs saved to: {log_file}", level="INFO")
 
         return {
             "final_answer": final_answer,
             "naive_answer": naive_answer,
             "graphrag_answer": graphrag_answer,
             "aggregator_decision": decision,
+            "log_file": str(log_file),
             "iterations": 1
-        }
-    finally:
-        if created_local_logger and _LOGGER is not None:
-            _LOGGER.close()
-        _LOGGER = prev_logger
-        set_log_context(prev_ctx)
-
-# ----------------- Subgoal Generator Agent -----------------
-
-SUBGOAL_GEN_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "subgoals": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string"},
-                    "question": {"type": "string"},
-                    "rationale": {"type": "string"}
-                },
-                "required": ["question"]
-            }
-        }
-    },
-    "required": ["subgoals"]
-}
-
-def subgoal_generator_agent(query_original: str, lang: str, max_n: int = SUBGOAL_MAX_N) -> List[Dict[str, str]]:
-    instruction = (
-        "Decompose the user's query into independent, parallelizable sub-questions only if it improves clarity or answerability. "
-        f"Return at most {max_n} subgoals. "
-        "If decomposition is unnecessary, return exactly one subgoal identical to the original query. "
-        "Write subgoals in the same language as the user's query."
-    )
-    
-    prompt = f"""
-You are the Subgoal Generator.
-
-Instruction:
-{instruction}
-
-User query:
-\"\"\"{query_original}\"\"\"
-
-Output JSON schema:
-- subgoals: array of items with fields:
-  - id (string; optional; you may leave blank)
-  - question (string; REQUIRED; an independently answerable sub-question)
-  - rationale (string; optional; why this subgoal helps)
-"""
-    
-    est = estimate_tokens_for_text(prompt)
-    log("\n[SubgoalGenerator] Prompt:", level="INFO")
-    log(prompt, level="INFO")
-    log(f"[SubgoalGenerator] Prompt size: {len(prompt)} chars, est_tokens≈{est}", level="INFO")
-    
-    out = safe_generate_json(prompt, SUBGOAL_GEN_SCHEMA, temp=0.0) or {}
-    subs = out.get("subgoals") or []
-    
-    clean: List[Dict[str, str]] = []
-    for i, s in enumerate(subs, 1):
-        try:
-            txt = (s.get("question") or s.get("text") or "").strip()
-            if not txt:
-                continue
-            sid = (s.get("id") or f"SG{i}").strip()
-            rat = (s.get("rationale") or "").strip()
-            clean.append({"id": sid, "question": txt, "rationale": rat})
-        except Exception:
-            continue
-        if len(clean) >= max_n:
-            break
-    
-    if not clean:
-        clean = [{"id": "SG1", "question": query_original.strip(), "rationale": "Decomposition not needed; answer the original query directly."}]
-    
-    log(f"[SubgoalGenerator] Produced {len(clean)} subgoal(s): {[x['id'] for x in clean]}", level="INFO")
-    return clean
-
-# ----------------- Final Aggregator Agent (across subgoals) -----------------
-FINAL_AGG_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "final_answer": {"type": "string"},
-        "rationale": {"type": "string"},
-        "confidence": {"type": "number"},
-        "citations": {
-            "type": "array",
-            "items": {"type": "string"}
-        },
-        "coverage_by_subgoal": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string"},
-                    "covered": {"type": "boolean"},
-                    "notes": {"type": "string"}
-                },
-                "required": ["id", "covered"]
-            }
-        }
-    },
-    "required": ["final_answer"]
-}
-
-def final_aggregator_agent(
-    query_original: str,
-    subgoals: List[Dict[str, str]],
-    subgoal_results: List[Dict[str, Any]],
-    lang: str
-) -> Dict[str, Any]:
-    pairs_text_lines = []
-    for i, (sg, res) in enumerate(zip(subgoals, subgoal_results), start=1):
-        q = sg.get("question", "").strip()
-        a = res.get("final_answer", "").strip()
-        pairs_text_lines.append(f"[Subgoal {i}] Q: {q}\nA: {a}\n")
-    pairs_text = "\n".join(pairs_text_lines)
-
-    prompt = f"""
-You are Agent 3 (Final Aggregator).
-Task: Answer the original user query using ONLY the information contained in the provided subgoal answers.
-Do NOT introduce new facts that are not supported by the subanswers.
-Resolve overlaps and contradictions transparently; prefer statements supported by explicit legal references (e.g., UU, Pasal/Article).
-Write clearly and concisely in the same language as the user's query ("{lang}").
-
-Original user query:
-\"\"\"{query_original}\"\"\"
-
-Subgoal question–answer pairs:
-\"\"\"{pairs_text}\"\"\"
-
-Now produce ONE final answer to the original query. If there are gaps or contradictions, explain briefly.
-"""
-    
-    est_tokens = estimate_tokens_for_text(prompt)
-    log("\n[FinalAggregator] Prompt:", level="INFO")
-    log(prompt, level="INFO")
-    log(f"[FinalAggregator] Prompt size: {len(prompt)} chars, est_tokens≈{est_tokens}", level="INFO")
-
-    t0 = now_ms()
-    final_answer = safe_generate_text(prompt, max_tokens=FINAL_AGG_MAX_TOKENS, temperature=0.2)
-    took = dur_ms(t0)
-    log(f"[FinalAggregator] Final answer length={len(final_answer)} | {took:.0f} ms", level="INFO")
-    
-    return {
-        "final_answer": final_answer,
-        "rationale": "Aggregated from subgoal answers",
-        "confidence": 0.8,
-        "citations": [],
-        "coverage_by_subgoal": [
-            {
-                "id": sg["id"], 
-                "covered": bool((res.get("final_answer") or "").strip()), 
-                "notes": ""
-            } 
-            for sg, res in zip(subgoals, subgoal_results)
-        ]
-    }
-
-# ----------------- Supervisor Orchestrator (new) -----------------
-def agentic_supervisor(query_original: str) -> Dict[str, Any]:
-    """
-    Top-level orchestrator:
-    - Generates up to N subgoals
-    - Runs agentic_multi per subgoal (parallel if enabled)
-    - Aggregates into final answer
-    """
-    global _LOGGER
-    ts_name = make_timestamp_name()
-    root_log = Path.cwd() / f"{ts_name}-supervisor.txt"
-    _LOGGER = FileLogger(root_log, also_console=True)
-    set_log_context("supervisor")
-
-    t_all = now_ms()
-    try:
-        log("=== Agentic Supervisor run started ===", level="INFO")
-        log(f"Process info: pid={_pid()} tid={_tid()}{_get_log_context()}", level="INFO")
-        log(f"Log file: {root_log}", level="INFO")
-        log(f"Original Query: {query_original}", level="INFO")
-        log(f"Parameters:", level="INFO")
-        log(f"  Subgoals: SUBGOAL_MAX_N={SUBGOAL_MAX_N}, RUN_IN_PARALLEL={SUBGOALS_RUN_IN_PARALLEL}, MAX_WORKERS={SUBGOALS_MAX_WORKERS}", level="INFO")
-        log(f"  Snippet clamp: SUBGOAL_ANSWER_SNIPPET_CLAMP={SUBGOAL_ANSWER_SNIPPET_CLAMP}, FINAL_AGG_MAX_TOKENS={FINAL_AGG_MAX_TOKENS}", level="INFO")
-        log(f"  LLM limits: LLM_CALLS_PER_MINUTE={LLM_CALLS_PER_MINUTE}, EMBEDDING_CALLS_PER_MINUTE={EMBEDDING_CALLS_PER_MINUTE}", level="INFO")
-        log(f"  Neo4j: NEO4J_MAX_ATTEMPTS={NEO4J_MAX_ATTEMPTS}, NEO4J_TX_TIMEOUT_S={NEO4J_TX_TIMEOUT_S:.1f}", level="INFO")
-
-        user_lang = detect_user_language(query_original)
-        log(f"[Language] Detected user language: {user_lang}", level="INFO")
-
-        subs = subgoal_generator_agent(query_original, user_lang, max_n=SUBGOAL_MAX_N)
-        if not subs:
-            subs = [{"id": "SG1", "question": query_original.strip(), "rationale": "No decomposition."}]
-        log(f"[Supervisor] Executing {len(subs)} subgoal(s).", level="INFO")
-
-        sub_results: List[Dict[str, Any]] = []
-
-        def _run_one(sg: Dict[str, str]) -> Tuple[str, Dict[str, Any]]:
-            set_log_context(f"sg={sg.get('id')}")
-            try:
-                res = agentic_multi(sg.get("question",""), logger=_LOGGER, log_context_prefix=f"sg={sg.get('id')}")
-                return sg["id"], res
-            except Exception as e:
-                log(f"[Supervisor] Subgoal {sg.get('id')} failed: {e}", level="ERROR")
-                return sg["id"], {"final_answer": "", "aggregator_decision": {"decision":"", "rationale": str(e)}}
-
-        if SUBGOALS_RUN_IN_PARALLEL and len(subs) > 1:
-            max_workers = max(1, min(SUBGOALS_MAX_WORKERS, len(subs)))
-            log(f"[Supervisor] Parallel execution with max_workers={max_workers}", level="INFO")
-            futures = {}
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                for sg in subs:
-                    futures[ex.submit(_run_one, sg)] = sg["id"]
-                results_map: Dict[str, Dict[str, Any]] = {}
-                for fut in as_completed(futures):
-                    sid, res = fut.result()
-                    results_map[sid] = res
-            for sg in subs:
-                sub_results.append(results_map.get(sg["id"], {"final_answer": "", "aggregator_decision": {"decision":"", "rationale":""}}))
-        else:
-            log("[Supervisor] Sequential execution.", level="INFO")
-            for sg in subs:
-                _, res = _run_one(sg)
-                sub_results.append(res)
-
-        t_agg = now_ms()
-        final_agg = final_aggregator_agent(query_original, subs, sub_results, user_lang)
-        took_agg = dur_ms(t_agg)
-        log(f"[Supervisor] Final aggregation completed in {took_agg:.0f} ms", level="INFO")
-
-        total_ms = dur_ms(t_all)
-        log("\n=== Supervisor summary ===", level="INFO")
-        log(f"- Subgoals executed: {len(subs)}", level="INFO")
-        log(f"- Total runtime: {total_ms:.0f} ms", level="INFO")
-        log("\n=== Final Answer (Supervisor) ===", level="INFO")
-        log(final_agg.get("final_answer",""), level="INFO")
-        log(f"\nLogs saved to: {root_log}", level="INFO")
-
-        summarized_sub_results: List[Dict[str, Any]] = []
-        for sg, res in zip(subs, sub_results):
-            summarized_sub_results.append({
-                "id": sg.get("id"),
-                "subgoal_text": sg.get("question"),
-                "final_answer": res.get("final_answer",""),
-                "aggregator_decision": res.get("aggregator_decision", {}),
-                "iterations": res.get("iterations", 1)
-            })
-
-        return {
-            "final_answer": final_agg.get("final_answer",""),
-            "subgoals": subs,
-            "subgoal_results": summarized_sub_results,
-            "overall_decision": {
-                "confidence": final_agg.get("confidence", 0.0),
-                "rationale": final_agg.get("rationale",""),
-                "citations": final_agg.get("citations", []),
-                "coverage_by_subgoal": final_agg.get("coverage_by_subgoal", [])
-            },
-            "log_file": str(root_log),
-            "iterations": len(subs)
         }
     finally:
         if _LOGGER is not None:
             _LOGGER.close()
-        _LOGGER = None
-        set_log_context("")
 
 # ----------------- Main -----------------
 if __name__ == "__main__":
@@ -1916,7 +1349,8 @@ if __name__ == "__main__":
         if not user_query:
             print("Empty query. Exiting.")
         else:
-            result = agentic_supervisor(user_query)
+            result = agentic_multi(user_query)
+            # Print only the final answer to stdout (logs contain details)
             print("\n----- Final Answer -----")
             print(result.get("final_answer", ""))
     finally:

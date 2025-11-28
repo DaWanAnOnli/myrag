@@ -1,7 +1,7 @@
 from pathlib import Path
 
 dir_path = Path("../../../dataset/4_experiment/4b_experiment_answers/4b_iii_multi_agent").resolve()
-out = dir_path / "multi_agent_answers_11111111-111111_approach_2_5_iq_new.jsonl"
+out = dir_path / "multi_agent_answers_11111111-111111_approach_2_both_5_answer_judge_newest_1.jsonl"
 
 # Pick only files starting with the prefix; exclude the output file itself
 files = sorted(p for p in dir_path.glob("multi_agent_answers_*") if p.name != "multi_agent_answers_.jsonl")

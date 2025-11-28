@@ -10,7 +10,7 @@
 # - Self-contained: does not import from existing scripts
 # - UPDATED: All LLM calls use normal text generation; JSON is enforced via prompting and parsed locally.
 
-import os, sys, time, json, math, pickle, re, random, difflib, statistics
+import os, sys, time, json, math, pickle, re, random, difflib, statistics, threading
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional, Set, Union
 from threading import Lock
@@ -206,6 +206,13 @@ def clamp(s: Optional[str], n: int) -> str:
     t = (s or "").strip()
     return t[:n]
 
+def _truncate(s: str, max_chars: int) -> str:
+    if not isinstance(s, str):
+        return ""
+    if len(s) <= max_chars:
+        return s
+    return s[: max_chars - 20] + " ...[truncated]"
+
 def safe_mean(nums: List[float]) -> float:
     try:
         return float(statistics.mean(nums)) if nums else 0.0
@@ -299,7 +306,7 @@ def detect_user_language(text: str) -> str:
 
 # ----------------- Safe LLM helpers -----------------
 
-# All LLM calls return text. For JSON, we enforce "JSON-only" via prompt and parse locally.
+# All LLM calls return text. For JSON, we enforce "JSON-only" via prompting and parsed locally.
 
 JSON_ONLY_PREAMBLE = """You are to produce ONLY a single valid JSON object as output.
 - Do not include any prose, explanations, or markdown.
@@ -539,49 +546,178 @@ def _validate_and_default_json(obj: Any, schema: Dict[str, Any]) -> Dict[str, An
             out[key] = [val] if val is not None else []
         elif t == "object" and not isinstance(val, dict):
             out[key] = {}
-
-        # Enum coercion: ensure value belongs if enum specified
-        enum_vals = prop_schema.get("enum")
-        if enum_vals and out.get(key) not in enum_vals:
-            # Leave as-is; downstream code has its own fallback heuristics
-            pass
+        # Enum coercion left to downstream logic
 
     return out
 
-def safe_generate_json(task_prompt: str, schema: Dict[str, Any], temp: float = 0.0, max_tokens: int = 1536) -> Dict[str, Any]:
+def safe_generate_json(prompt: str, schema: Dict[str, Any], temp: float = 0.0) -> Dict[str, Any]:
     """
-    Generate JSON by:
-    - Prepending a JSON-only instruction preamble and schema summary
-    - Calling text generation
-    - Extracting and cleaning a JSON object from the raw text
-    - Validating and filling defaults against the given schema
+    Script-2 style JSON generation:
+    - Use Gemini's native JSON mode with response_mime_type="application/json"
+    - Provide response_schema to let the model conform to the expected shape
+    - Do minimal parsing: try resp.text first, then candidate content
+    - No manual prompt preambles, no custom JSON extraction/validation layers
     """
-    full_prompt = _build_json_prompt(task_prompt, schema)
-    est = estimate_tokens_for_text(full_prompt)
-    log("[LLM JSON/Text-mode] Prompt (JSON-only preamble applied)", level="INFO")
-    log(f"[LLM JSON/Text-mode] Prompt size: {len(full_prompt)} chars, est_tokens≈{est}", level="INFO")
-
+    cfg = GenerationConfig(
+        temperature=temp,
+        response_mime_type="application/json",
+        response_schema=schema,
+    )
     t0 = now_ms()
-    cfg = GenerationConfig(temperature=temp, max_output_tokens=max_tokens)
-    resp = _api_call_with_retry(gen_model.generate_content, full_prompt, generation_config=cfg)
+    resp = _api_call_with_retry(gen_model.generate_content, prompt, generation_config=cfg)
     took = dur_ms(t0)
-    text = extract_text_from_response(resp) or ""
-    log(f"[LLM JSON/Text-mode] call completed in {took:.0f} ms, raw_len={len(text)}", level="DEBUG")
+    log(f"[LLM JSON] call completed in {took:.0f} ms", level="DEBUG")
 
-    json_text = _extract_and_clean_json_text(text)
-    if json_text is None:
-        info = get_finish_info(resp)
-        log(f"[LLM JSON parse warning] Could not extract JSON from text. Diagnostics: {info}", level="WARN")
-        return {}
-
+    # Try the simplest path first
     try:
-        parsed = json.loads(json_text)
+        if isinstance(getattr(resp, "text", None), str) and resp.text.strip():
+            return json.loads(resp.text)
     except Exception as e:
-        log(f"[LLM JSON parse warning] json.loads failed after cleanup: {e}", level="WARN")
-        return {}
+        log(f"[LLM JSON parse warning] Failed to parse resp.text as JSON: {e}", level="WARN")
 
-    final_obj = _validate_and_default_json(parsed, schema)
-    return final_obj
+    # Fallback: inspect first candidate part
+    try:
+        cand0 = (resp.candidates or [None])[0]
+        if cand0 and getattr(cand0, "content", None):
+            parts = getattr(cand0.content, "parts", None) or []
+            for p in parts:
+                t = getattr(p, "text", None)
+                if isinstance(t, str) and t.strip():
+                    try:
+                        return json.loads(t)
+                    except Exception:
+                        continue
+    except Exception as e:
+        log(f"[LLM JSON parse warning] Failed to parse candidates as JSON: {e}", level="WARN")
+
+    info = get_finish_info(resp)
+    log(f"[LLM JSON parse warning] No valid JSON content returned. Diagnostics: {info}", level="WARN")
+    return {}
+
+# ----------------- New timeout helpers (for Aggregator and Answer Judge only) -----------------
+
+class LLMTimeoutError(Exception):
+    """Raised when an LLM call exceeds the allowed timeout."""
+    pass
+
+def _call_with_timeout(func, timeout_seconds: int, *args, **kwargs):
+    """
+    Run func(*args, **kwargs) in a separate thread and enforce a hard timeout.
+    Returns the function result or raises LLMTimeoutError if timed out.
+    """
+    result = [None]
+    exc = [None]
+
+    def target():
+        try:
+            result[0] = func(*args, **kwargs)
+        except Exception as e:
+            exc[0] = e
+
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(timeout_seconds)
+
+    if t.is_alive():
+        # Thread is still running -> timeout
+        raise LLMTimeoutError(f"LLM call exceeded {timeout_seconds} seconds")
+
+    if exc[0] is not None:
+        raise exc[0]
+
+    return result[0]
+
+def safe_generate_json_with_timeout(
+    prompt: str,
+    schema: Dict[str, Any],
+    temp: float = 0.0,
+    timeout_seconds: int = 100,
+    max_timeouts: int = 3,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    JSON generation with:
+    - client-side timeout (timeout_seconds)
+    - limited timeout retries (max_timeouts)
+    - uses Gemini JSON mode (response_mime_type='application/json')
+
+    Returns:
+        (parsed_json_dict, last_error_info)
+        - parsed_json_dict may be {} if parsing failed
+        - last_error_info is {} on success, or details on last failure
+    """
+    cfg = GenerationConfig(
+        temperature=temp,
+        response_mime_type="application/json",
+        response_schema=schema,
+    )
+
+    timeout_count = 0
+    last_err: Dict[str, Any] = {}
+
+    while True:
+        try:
+            t0 = now_ms()
+            # Wrap the entire LLM call (including retries) with a hard timeout
+            resp = _call_with_timeout(
+                _api_call_with_retry,
+                timeout_seconds,
+                gen_model.generate_content,
+                prompt,
+                generation_config=cfg,
+            )
+            took = dur_ms(t0)
+            log(f"[LLM JSON (timeout)] call completed in {took:.0f} ms", level="DEBUG")
+
+            # Try direct resp.text
+            try:
+                if isinstance(getattr(resp, "text", None), str) and resp.text.strip():
+                    return json.loads(resp.text), {}
+            except Exception as e:
+                log(f"[LLM JSON parse warning] Failed to parse resp.text as JSON: {e}", level="WARN")
+
+            # Fallback: inspect first candidate part
+            try:
+                cand0 = (resp.candidates or [None])[0]
+                if cand0 and getattr(cand0, "content", None):
+                    parts = getattr(cand0.content, "parts", None) or []
+                    for p in parts:
+                        t = getattr(p, "text", None)
+                        if isinstance(t, str) and t.strip():
+                            try:
+                                return json.loads(t), {}
+                            except Exception:
+                                continue
+            except Exception as e:
+                log(f"[LLM JSON parse warning] Failed to parse candidates as JSON: {e}", level="WARN")
+
+            info = get_finish_info(resp)
+            log(f"[LLM JSON parse warning] No valid JSON content returned. Diagnostics: {info}", level="WARN")
+            last_err = {"type": "parse_error", "info": info}
+            return {}, last_err
+
+        except LLMTimeoutError as te:
+            timeout_count += 1
+            last_err = {
+                "type": "timeout",
+                "message": str(te),
+                "timeout_count": timeout_count,
+            }
+            log(f"[LLM JSON (timeout)] Timeout {timeout_count}/{max_timeouts}: {te}", level="WARN")
+            if timeout_count > max_timeouts:
+                log("[LLM JSON (timeout)] Exceeded maximum timeouts; aborting and using fallback.", level="ERROR")
+                return {}, last_err
+            # brief backoff before retry
+            time.sleep(random.uniform(2.0, 5.0))
+            continue
+
+        except Exception as e:
+            # Non-timeout error; let caller's fallback handle
+            last_err = {
+                "type": "exception",
+                "exception": repr(e),
+            }
+            log(f"[LLM JSON (timeout)] Exception during call: {e}", level="WARN")
+            return {}, last_err
 
 # ----------------- Agent 1 / 1b Schemas (GraphRAG) -----------------
 LEGAL_ENTITY_TYPES = [
@@ -765,7 +901,7 @@ def run_cypher_with_retry(cypher: str, params: Dict[str, Any]) -> List[Any]:
             last_e = e
             if attempts >= NEO4J_MAX_ATTEMPTS:
                 break
-            wait_s = random.uniform(5.0, 15.0)
+            wait_s = random.uniform(1.0, 4.0)
             log(f"[Neo4j] Failure | qid={qid} | attempt={attempts}/{NEO4J_MAX_ATTEMPTS} | {took:.0f} ms | error={e}. Retrying in {wait_s:.1f}s.", level="WARN")
             time.sleep(wait_s)
     raise RuntimeError(f"Neo4j query failed after {NEO4J_MAX_ATTEMPTS} attempts (qid={qid}): {last_e}")
@@ -1423,99 +1559,137 @@ def run_graph_rag(query_original: str) -> Dict[str, Any]:
 
 # ----------------- Aggregator Agent -----------------
 AGG_SCHEMA = {
-  "type": "object",
-  "properties": {
-    "chosen": {"type": "string", "enum": ["naive", "graphrag", "mixed"]},
-    "final_answer": {"type": "string"},
-    "rationale": {"type": "string"},
-    "confidence": {"type": "number"},
-    "key_points": {"type": "array", "items": {"type": "string"}}
-  },
-  "required": ["chosen", "final_answer"]
+    "type": "object",
+    "properties": {
+        "decision": {"type": "string", "enum": ["choose_graphrag", "choose_naiverag", "merge"]},
+        "final_answer": {"type": "string"},
+        "rationale": {"type": "string"}
+    },
+    "required": ["decision", "final_answer"]
 }
 
-def aggregator_agent(query: str, naive_answer: str, graphrag_answer: str, lang: str) -> Dict[str, Any]:
+def aggregator_agent(
+    query: str,
+    naive_answer: str,
+    graphrag_answer: str,
+    lang: str,
+    graphrag_meta: Optional[Dict[str, Any]] = None,
+    naiverag_meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Aggregator agent identical in behavior/prompt/schema to Script 1,
+    but adapted to Script 2's call site (naive vs GraphRAG naming).
+
+    Modified: uses safe_generate_json_with_timeout with a 2-minute timeout
+    and up to 3 timeout retries. On repeated timeouts, falls back to the
+    existing heuristic block below.
+    """
+    g_meta = json.dumps(graphrag_meta or {}, ensure_ascii=False, indent=2)
+    n_meta = json.dumps(naiverag_meta or {}, ensure_ascii=False, indent=2)
+
     prompt = f"""
-You are the Aggregator. You receive:
-- The original user question.
-- Two candidate answers:
-  * Naive RAG answer (vector-search over chunks)
-  * GraphRAG answer (KG-assisted retrieval)
+You are the Aggregator Agent. Your task: produce the best possible final answer to the user's question.
 
-Goal:
-- Choose the best answer or combine them into a stronger final answer.
-- Prefer answers with explicit citations (UU, Pasal/Article numbers) and higher internal consistency.
-- If both are solid and compatible, you may merge key points.
-- If they conflict, select the more grounded/specific answer; briefly resolve the conflict if possible.
-- Be concise and accurate.
-- Respond in the same language as the user's question.
-
-Return JSON with:
-  - chosen: "naive" | "graphrag" | "mixed"
-  - final_answer: the final response text
-  - rationale: brief reasoning for your choice
-  - confidence: 0.0–1.0 (float)
-  - key_points: optional list of key bullets
-
-Question:
+Inputs:
+- Question (language='{lang}'):
 \"\"\"{query}\"\"\"
 
-Naive RAG answer:
-\"\"\"{naive_answer}\"\"\"
+- GraphRAG answer:
+\"\"\"{_truncate(graphrag_answer, 12000)}\"\"\"
 
-GraphRAG answer:
-\"\"\"{graphrag_answer}\"\"\"
+- NaiveRAG answer:
+\"\"\"{_truncate(naive_answer, 12000)}\"\"\"
+
+- GraphRAG meta (for context only; do not invent facts beyond the answers):
+{g_meta}
+
+- NaiveRAG meta (for context only; do not invent facts beyond the answers):
+{n_meta}
+
+Guidelines:
+- Choose the better answer OR synthesize a concise, coherent answer that combines non-conflicting strengths of both.
+- Prefer specificity and legal grounding (e.g., citing UU number / Pasal / Article) if present in the answers.
+- Do not add information that does not appear in either answer.
+- Keep the final answer in the same language as the user's question.
+- If merging, ensure consistency and avoid contradictions.
+
+Return JSON:
+- decision: 'choose_graphrag' | 'choose_naiverag' | 'merge'
+- final_answer: the chosen or synthesized answer
+- rationale: short explanation (1-2 sentences)
 """
+    est = estimate_tokens_for_text(prompt)
     log("\n[Aggregator] Prompt:", level="INFO")
     log(prompt, level="INFO")
-    out = safe_generate_json(prompt, AGG_SCHEMA, temp=0.0) or {}
-    chosen = (out.get("chosen") or "").strip().lower()
+    log(f"[Aggregator] Prompt size: {len(prompt)} chars, est_tokens≈{est}", level="INFO")
+
+    # New: call with timeout + limited retries
+    out, agg_err = safe_generate_json_with_timeout(
+        prompt,
+        AGG_SCHEMA,
+        temp=0.2,
+        timeout_seconds=120,
+        max_timeouts=3,
+    )
+
+    if agg_err and agg_err.get("type") == "timeout":
+        log(f"[Aggregator] Using fallback due to repeated timeouts: {agg_err}", level="WARN")
+    elif agg_err:
+        log(f"[Aggregator] JSON generation error: {agg_err}", level="WARN")
+
+    out = out or {}
+    decision = (out.get("decision") or "").strip()
     final_answer = (out.get("final_answer") or "").strip()
     rationale = (out.get("rationale") or "").strip()
-    confidence = float(out.get("confidence") or 0.0)
 
-    if not final_answer or chosen not in ("naive", "graphrag", "mixed"):
-        log("[Aggregator] Fallback selection heuristic activated.", level="WARN")
-        def ref_score(txt: str) -> int:
-            if not isinstance(txt, str):
-                return 0
-            patterns = [
-                r"\b(Pasal|Ayat|UU|Undang[- ]?Undang|Peraturan|Bab|Bagian)\b",
-                r"\b(Article|Section|Chapter|Act|Law|Regulation)\b",
-                r"\bPasal\s+\d+",
-                r"\bArticle\s+\d+",
-            ]
-            s = 0
-            for pat in patterns:
-                s += len(re.findall(pat, txt, flags=re.IGNORECASE))
-            s += len(re.findall(r"\[\d+\]", txt))
-            s += len(re.findall(r"\b\d{1,3}(\.\d+)?\b", txt)) // 4
-            return s
+    # Fallback heuristic: same as Script 1
+    if decision not in ("choose_graphrag", "choose_naiverag", "merge") or not final_answer:
+        def score(a: str) -> int:
+            t = (a or "").lower()
+            cues = 0
+            cues += len(re.findall(r"\bpasal\b", t))
+            cues += len(re.findall(r"\buu\b", t))
+            cues += len(re.findall(r"\barticle\b", t))
+            cues += len(re.findall(r"\bsection\b", t))
+            cues += len(re.findall(r"\bperaturan\b", t))
+            cues += len(re.findall(r"\b\d{4}\b", t))
+            return cues
 
-        n_ok = isinstance(naive_answer, str) and len(naive_answer.strip()) > 0
-        g_ok = isinstance(graphrag_answer, str) and len(graphrag_answer.strip()) > 0
+        sg = score(graphrag_answer)
+        sn = score(naive_answer)
 
-        if g_ok and (ref_score(graphrag_answer) >= ref_score(naive_answer or "")):
-            chosen = "graphrag"
-            final_answer = graphrag_answer.strip()
-        elif n_ok:
-            chosen = "naive"
-            final_answer = naive_answer.strip()
+        if sn > sg and (naive_answer or "").strip():
+            decision = "choose_naiverag"
+            final_answer = (naive_answer or "").strip()
+            rationale = rationale or "Fallback: naive answer appears more specific."
         else:
-            chosen = "mixed"
-            final_answer = "Maaf, saya tidak menemukan jawaban berdasarkan konteks yang tersedia." if lang == "id" else "Sorry, I could not find an answer based on the available context."
-        rationale = rationale or "Selected based on citation density and completeness."
-        confidence = confidence or 0.55
+            decision = "choose_graphrag"
+            final_answer = (graphrag_answer or "").strip() or (naive_answer or "").strip()
+            rationale = rationale or "Fallback: GraphRAG chosen by default or better specificity."
 
-    log(f"[Aggregator] Decision: chosen={chosen}, confidence={confidence:.2f}", level="INFO")
-    log(f"[Aggregator] Rationale: {rationale}", level="INFO")
+        log("[Aggregator] Fallback decision used due to invalid or empty aggregator output.", level="WARN")
+
+    log(f"[Aggregator] Decision={decision} | Rationale: {rationale[:160]}", level="INFO")
+
+    # For backward compatibility with Script 2's expectations, we also
+    # derive a rough 'confidence' and 'chosen' label from Script-1-style decision.
+    if decision == "choose_graphrag":
+        chosen = "graphrag"
+    elif decision == "choose_naiverag":
+        chosen = "naive"
+    else:
+        chosen = "mixed"
+
+    # Simple heuristic confidence
+    confidence = 0.7 if decision in ("choose_graphrag", "choose_naiverag") else 0.6
 
     return {
-        "chosen": chosen,
+        "decision": decision,
         "final_answer": final_answer,
         "rationale": rationale,
+        # extra fields for Script 2's summary:
+        "chosen": chosen,
         "confidence": confidence,
-        "key_points": out.get("key_points") or []
     }
 
 # ----------------- Answer Judge Agent -----------------
@@ -1621,7 +1795,22 @@ Respond in JSON only.
 """
     log("\n[AnswerJudge] Prompt:", level="INFO")
     log(prompt, level="INFO")
-    out = safe_generate_json(prompt, JUDGE_SCHEMA, temp=0.0) or {}
+
+    # New: call with timeout + limited retries
+    out, judge_err = safe_generate_json_with_timeout(
+        prompt,
+        JUDGE_SCHEMA,
+        temp=0.0,
+        timeout_seconds=120,
+        max_timeouts=3,
+    )
+
+    if judge_err and judge_err.get("type") == "timeout":
+        log(f"[AnswerJudge] Using fallback due to repeated timeouts: {judge_err}", level="WARN")
+    elif judge_err:
+        log(f"[AnswerJudge] JSON generation error: {judge_err}", level="WARN")
+
+    out = out or {}
     accepted = bool(out.get("accepted", False))
     verdict = (out.get("verdict") or "inconclusive").strip().lower()
     problems = out.get("problems") or []
@@ -1783,7 +1972,20 @@ def agentic_multi_singlepass(query_original: str) -> Dict[str, Any]:
 
     # Aggregate
     t_ag = now_ms()
-    agg = aggregator_agent(query_original, naive_answer, graphrag_answer, user_lang)
+    agg = aggregator_agent(
+        query_original,
+        naive_answer=naive_answer,
+        graphrag_answer=graphrag_answer,
+        lang=user_lang,
+        graphrag_meta={
+            "telemetry": graph_result.get("telemetry", {}),
+            "context_hint": "Graph triples + chunks",
+        },
+        naiverag_meta={
+            "telemetry": naive_result.get("telemetry", {}),
+            "context_hint": "Top chunk content",
+        },
+    )
     t_agg = dur_ms(t_ag)
 
     final_answer = agg.get("final_answer", "") or ""
@@ -1859,14 +2061,28 @@ def agentic_multi_iterative(query_original: str) -> Dict[str, Any]:
             # Run both pipelines + aggregator
             naive_res = run_naive_rag(current_query)
             graph_res = run_graph_rag(current_query)
-            agg = aggregator_agent(current_query, naive_res.get("answer",""), graph_res.get("answer",""), user_lang)
+            agg = aggregator_agent(
+                current_query,
+                naive_answer=naive_res.get("answer", ""),
+                graphrag_answer=graph_res.get("answer", ""),
+                lang=user_lang,
+                graphrag_meta={
+                    "telemetry": graph_res.get("telemetry", {}),
+                    "context_hint": "Graph triples + chunks",
+                },
+                naiverag_meta={
+                    "telemetry": naive_res.get("telemetry", {}),
+                    "context_hint": "Top chunk content",
+                },
+            )
 
             aggregated_answer = agg.get("final_answer","")
             agg_decision = {
                 "chosen": agg.get("chosen"),
                 "confidence": float(agg.get("confidence") or 0.0),
                 "rationale": agg.get("rationale") or "",
-                "key_points": agg.get("key_points") or []
+                # Script 1 aggregator does not return key_points; keep empty for compatibility
+                "key_points": []
             }
 
             # Answer Judge

@@ -83,7 +83,7 @@ CLEAN_PART_FILES = True  # remove worker part files after merging
 
 # Batched execution: number of subprocesses to run concurrently.
 # Set to 0 or a negative number to run all workers at once.
-BATCH_SIZE = int(os.getenv("MULTI_AGENT_BATCH_SIZE", "50"))
+BATCH_SIZE = int(os.getenv("MULTI_AGENT_BATCH_SIZE", "5"))
 
 # ----------------- Utilities & logging -----------------
 

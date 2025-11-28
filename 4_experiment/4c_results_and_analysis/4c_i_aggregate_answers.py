@@ -88,20 +88,20 @@ else:
 
 
 PATTERN_1 = [
-    os.path.join(BASE_INPUT_DIRECTORY, "no_11_multi_agent_answers_20251120-152528_approach_1_both_3.jsonl")
+    os.path.join(BASE_INPUT_DIRECTORY, "multi_agent_answers_20251127-235336_19_approach_2_both_2_iq_newest.jsonl")
 ]
 
 PATTERN_2 = [
-    os.path.join(BASE_INPUT_DIRECTORY, "no_17_multi_agent_answers_20251118-033715_approach_2_both_5_answer_judge_3.jsonl")
+    os.path.join(BASE_INPUT_DIRECTORY, "multi_agent_answers_20251128-004804_19_approach_2_both_3_iq_newest.jsonl")
 ]
 
-# PATTERN_3 = [
-#     os.path.join(BASE_INPUT_DIRECTORY, "no_17_multi_agent_answers_20251119-034643_approach_2_both_4_answer_judge_3.jsonl")
-# ]
+PATTERN_3 = [
+    os.path.join(BASE_INPUT_DIRECTORY, "multi_agent_answers_20251128-061844_19_approach_2_both_4_iq_newest.jsonl")
+]
 
-# PATTERN_4 = [
-#     os.path.join(BASE_INPUT_DIRECTORY, "no_17_multi_agent_answers_20251118-033715_approach_2_both_5_answer_judge_3.jsonl")
-# ]
+PATTERN_4 = [
+    os.path.join(BASE_INPUT_DIRECTORY, "multi_agent_answers_20251128-075705_19_approach_2_both_5_iq_newest.jsonl")
+]
 
 # PATTERN_5 = [
 #     os.path.join(BASE_INPUT_DIRECTORY, "graph_rag_answers_20251114-125358_4_hop_1.jsonl")
@@ -236,8 +236,8 @@ def main():
 
     pattern_1_files = expand_paths(PATTERN_1)
     pattern_2_files = expand_paths(PATTERN_2)
-    # pattern_3_files = expand_paths(PATTERN_3)
-    # pattern_4_files = expand_paths(PATTERN_4)
+    pattern_3_files = expand_paths(PATTERN_3)
+    pattern_4_files = expand_paths(PATTERN_4)
     # pattern_5_files = expand_paths(PATTERN_5)
     # pattern_6_files = expand_paths(PATTERN_6)
 
@@ -317,7 +317,7 @@ def main():
     pattern_1_data = load_group(
         pattern_1_files,
         source_answer_field="final_answer",
-        dest_answer_field="approach_1_both_answer",
+        dest_answer_field="1_answer",
         include_question=True,
         include_ground_truth=True,
     )
@@ -325,26 +325,26 @@ def main():
     pattern_2_data = load_group(
         pattern_2_files,
         source_answer_field="final_answer",
-        dest_answer_field="approach_2_answer_judge_answer",
+        dest_answer_field="2_answer",
         include_question=True,
         include_ground_truth=True,
     )
 
-    # pattern_3_data = load_group(
-    #     pattern_3_files,
-    #     source_answer_field="final_answer",
-    #     dest_answer_field="approach_2_4_answer_judge_answer",
-    #     include_question=True,
-    #     include_ground_truth=True,
-    # )
+    pattern_3_data = load_group(
+        pattern_3_files,
+        source_answer_field="final_answer",
+        dest_answer_field="3_answer",
+        include_question=True,
+        include_ground_truth=True,
+    )
 
-    # pattern_4_data = load_group(
-    #     pattern_4_files,
-    #     source_answer_field="final_answer",
-    #     dest_answer_field="approach_2_5_answer_judge_answer",
-    #     include_question=True,
-    #     include_ground_truth=True,
-    # )
+    pattern_4_data = load_group(
+        pattern_4_files,
+        source_answer_field="final_answer",
+        dest_answer_field="4_answer",
+        include_question=True,
+        include_ground_truth=True,
+    )
 
     # pattern_5_data = load_group(
     #     pattern_5_files,
@@ -384,8 +384,8 @@ def main():
 
             p1 = pattern_1_data.get(id_key,{})
             p2 = pattern_2_data.get(id_key,{})
-            # p3 = pattern_3_data.get(id_key,{})
-            # p4 = pattern_4_data.get(id_key,{})
+            p3 = pattern_3_data.get(id_key,{})
+            p4 = pattern_4_data.get(id_key,{})
             # p5 = pattern_5_data.get(id_key,{})
             # p6 = pattern_6_data.get(id_key,{})
 
@@ -411,10 +411,10 @@ def main():
                 # "lexidkg_graphrag_3_hop_answer": g3.get("lexidkg_graphrag_3_hop_answer"),
                 # "lexidkg_graphrag_4_hop_answer": g4.get("lexidkg_graphrag_4_hop_answer"),
                 # "lexidkg_graphrag_5_hop_answer": g5.get("lexidkg_graphrag_5_hop_answer"),
-                "approach_1_both_answer": p1.get("approach_1_both_answer"),
-                "approach_2_answer_judge_answer": p2.get("approach_2_answer_judge_answer"),
-                # "approach_2_4_answer_judge_answer": p3.get("approach_2_4_answer_judge_answer"),
-                # "approach_2_5_answer_judge_answer": p4.get("approach_2_5_answer_judge_answer"),
+                "1_answer": p1.get("1_answer"),
+                "2_answer": p2.get("2_answer"),
+                "3_answer": p3.get("3_answer"),
+                "4_answer": p4.get("4_answer"),
                 # "graphrag_4_hop_answer": p5.get("graphrag_4_hop_answer"),
                 # "graphrag_5_hop_answer": p6.get("graphrag_5_hop_answer"),
             }

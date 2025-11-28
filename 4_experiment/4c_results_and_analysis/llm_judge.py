@@ -104,14 +104,18 @@ LOG_DIR = (SCRIPT_DIR / "llm_judge_logs").resolve()
 
 # Preferred label ordering for known models (extras will be appended)
 PREFERRED_LABEL_ORDER = [
-    "approach_1_both_answer",
-    "approach_2_answer_judge_answer",
+    "1_answer",
+    "2_answer",
+    "3_answer",
+    "4_answer",
 ]
 
 # Map JSONL keys to friendly, stable labels (optional explicit mapping)
 MODEL_KEY_TO_LABEL = {
-    "approach_1_both_answer": "approach_1_both_answer",
-    "approach_2_answer_judge_answer": "approach_2_answer_judge_answer",
+    "1_answer": "1_answer",
+    "2_answer": "2_answer",
+    "3_answer": "3_answer",
+    "4_answer": "4_answer",
 }
 
 

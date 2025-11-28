@@ -145,6 +145,13 @@ def _norm_id(x) -> str:
 def estimate_tokens_for_text(text: str) -> int:
     return max(1, int(len(text) / 4))
 
+def _truncate(s: str, max_chars: int) -> str:
+    if not isinstance(s, str):
+        return ""
+    if len(s) <= max_chars:
+        return s
+    return s[: max_chars - 20] + " ...[truncated]"
+
 def _as_float_list(vec) -> List[float]:
     if vec is None:
         return []
@@ -1115,107 +1122,123 @@ def run_graph_rag(query_original: str) -> Dict[str, Any]:
     return {"answer": answer, "triples": len(merged_triples), "chunks": len(chunks_ranked)}
 
 # ----------------- Aggregator Agent -----------------
+# ----------------- Aggregator Agent -----------------
 AGG_SCHEMA = {
-  "type": "object",
-  "properties": {
-    "chosen": {"type": "string", "enum": ["naive", "graphrag", "mixed"]},
-    "final_answer": {"type": "string"},
-    "rationale": {"type": "string"},
-    "confidence": {"type": "number"},
-    "key_points": {"type": "array", "items": {"type": "string"}}
-  },
-  "required": ["chosen", "final_answer"]
+    "type": "object",
+    "properties": {
+        "decision": {"type": "string", "enum": ["choose_graphrag", "choose_naiverag", "merge"]},
+        "final_answer": {"type": "string"},
+        "rationale": {"type": "string"}
+    },
+    "required": ["decision", "final_answer"]
 }
 
-def aggregator_agent(query: str, naive_answer: str, graphrag_answer: str, lang: str) -> Dict[str, Any]:
+def aggregator_agent(
+    query: str,
+    naive_answer: str,
+    graphrag_answer: str,
+    lang: str,
+    graphrag_meta: Optional[Dict[str, Any]] = None,
+    naiverag_meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Aggregator agent identical in behavior/prompt/schema to Script 1,
+    but adapted to Script 2's call site (naive vs GraphRAG naming).
+    """
+    g_meta = json.dumps(graphrag_meta or {}, ensure_ascii=False, indent=2)
+    n_meta = json.dumps(naiverag_meta or {}, ensure_ascii=False, indent=2)
+
     prompt = f"""
-You are the Aggregator. You receive:
-- The original user question.
-- Two candidate answers:
-  * Naive RAG answer (vector-search over chunks)
-  * GraphRAG answer (KG-assisted retrieval)
+You are the Aggregator Agent. Your task: produce the best possible final answer to the user's question.
 
-Goal:
-- Choose the best answer or combine them into a stronger final answer.
-- Prefer answers with explicit citations (UU, Pasal/Article numbers) and higher internal consistency.
-- If both are solid and compatible, you may merge key points.
-- If they conflict, select the more grounded/specific answer; briefly resolve the conflict if possible.
-- Be concise and accurate.
-- Respond in the same language as the user's question.
-
-Return JSON with:
-  - chosen: "naive" | "graphrag" | "mixed"
-  - final_answer: the final response text
-  - rationale: brief reasoning for your choice
-  - confidence: 0.0–1.0 (float)
-  - key_points: optional list of key bullets
-
-Question:
+Inputs:
+- Question (language='{lang}'):
 \"\"\"{query}\"\"\"
 
-Naive RAG answer:
-\"\"\"{naive_answer}\"\"\"
+- GraphRAG answer:
+\"\"\"{_truncate(graphrag_answer, 12000)}\"\"\"
 
-GraphRAG answer:
-\"\"\"{graphrag_answer}\"\"\"
+- NaiveRAG answer:
+\"\"\"{_truncate(naive_answer, 12000)}\"\"\"
+
+- GraphRAG meta (for context only; do not invent facts beyond the answers):
+{g_meta}
+
+- NaiveRAG meta (for context only; do not invent facts beyond the answers):
+{n_meta}
+
+Guidelines:
+- Choose the better answer OR synthesize a concise, coherent answer that combines non-conflicting strengths of both.
+- Prefer specificity and legal grounding (e.g., citing UU number / Pasal / Article) if present in the answers.
+- Do not add information that does not appear in either answer.
+- Keep the final answer in the same language as the user's question.
+- If merging, ensure consistency and avoid contradictions.
+
+Return JSON:
+- decision: 'choose_graphrag' | 'choose_naiverag' | 'merge'
+- final_answer: the chosen or synthesized answer
+- rationale: short explanation (1-2 sentences)
 """
+    est = estimate_tokens_for_text(prompt)
     log("\n[Aggregator] Prompt:", level="INFO")
     log(prompt, level="INFO")
-    out = safe_generate_json(prompt, AGG_SCHEMA, temp=0.0) or {}
-    chosen = (out.get("chosen") or "").strip().lower()
+    log(f"[Aggregator] Prompt size: {len(prompt)} chars, est_tokens≈{est}", level="INFO")
+
+    out = safe_generate_json(prompt, AGG_SCHEMA, temp=0.2) or {}
+    decision = (out.get("decision") or "").strip()
     final_answer = (out.get("final_answer") or "").strip()
     rationale = (out.get("rationale") or "").strip()
-    confidence = float(out.get("confidence") or 0.0)
 
-    # Fallback heuristic if model returns empty or invalid
-    if not final_answer or chosen not in ("naive", "graphrag", "mixed"):
-        log("[Aggregator] Fallback selection heuristic activated.", level="WARN")
-        def ref_score(txt: str) -> int:
-            if not isinstance(txt, str):
-                return 0
-            # Count citation-like patterns
-            patterns = [
-                r"\b(Pasal|Ayat|UU|Undang[- ]?Undang|Peraturan|Bab|Bagian)\b",
-                r"\b(Article|Section|Chapter|Act|Law|Regulation)\b",
-                r"\bPasal\s+\d+",
-                r"\bArticle\s+\d+",
-            ]
-            s = 0
-            for pat in patterns:
-                m = re.findall(pat, txt, flags=re.IGNORECASE)
-                s += len(m)
-            # Reward brackets/numbers
-            s += len(re.findall(r"\[\d+\]", txt))
-            # Reward numbers that look like references
-            s += len(re.findall(r"\b\d{1,3}(\.\d+)?\b", txt)) // 4
-            return s
+    # Fallback heuristic: same as Script 1
+    if decision not in ("choose_graphrag", "choose_naiverag", "merge") or not final_answer:
+        def score(a: str) -> int:
+            t = (a or "").lower()
+            cues = 0
+            cues += len(re.findall(r"\bpasal\b", t))
+            cues += len(re.findall(r"\buu\b", t))
+            cues += len(re.findall(r"\barticle\b", t))
+            cues += len(re.findall(r"\bsection\b", t))
+            cues += len(re.findall(r"\bperaturan\b", t))
+            cues += len(re.findall(r"\b\d{4}\b", t))
+            return cues
 
-        n_ok = isinstance(naive_answer, str) and len(naive_answer.strip()) > 0
-        g_ok = isinstance(graphrag_answer, str) and len(graphrag_answer.strip()) > 0
+        sg = score(graphrag_answer)
+        sn = score(naive_answer)
 
-        if g_ok and (ref_score(graphrag_answer) >= ref_score(naive_answer or "")):
-            chosen = "graphrag"
-            final_answer = graphrag_answer.strip()
-        elif n_ok:
-            chosen = "naive"
-            final_answer = naive_answer.strip()
+        if sn > sg and (naive_answer or "").strip():
+            decision = "choose_naiverag"
+            final_answer = (naive_answer or "").strip()
+            rationale = rationale or "Fallback: naive answer appears more specific."
         else:
-            chosen = "mixed"
-            final_answer = "Maaf, saya tidak menemukan jawaban berdasarkan konteks yang tersedia." if lang == "id" else "Sorry, I could not find an answer based on the available context."
-        rationale = rationale or "Selected based on citation density and completeness."
-        confidence = confidence or 0.55
+            decision = "choose_graphrag"
+            final_answer = (graphrag_answer or "").strip() or (naive_answer or "").strip()
+            rationale = rationale or "Fallback: GraphRAG chosen by default or better specificity."
 
-    # Ensure language alignment (soft, via instruction already)
-    log(f"[Aggregator] Decision: chosen={chosen}, confidence={confidence:.2f}", level="INFO")
-    log(f"[Aggregator] Rationale: {rationale}", level="INFO")
+        log("[Aggregator] Fallback decision used due to invalid or empty aggregator output.", level="WARN")
+
+    log(f"[Aggregator] Decision={decision} | Rationale: {rationale[:160]}", level="INFO")
+
+    # For backward compatibility with Script 2's expectations, we also
+    # derive a rough 'confidence' and 'chosen' label from Script-1-style decision.
+    if decision == "choose_graphrag":
+        chosen = "graphrag"
+    elif decision == "choose_naiverag":
+        chosen = "naive"
+    else:
+        chosen = "mixed"
+
+    # Simple heuristic confidence (not in Script 1, but used by Script 2 summary)
+    confidence = 0.7 if decision in ("choose_graphrag", "choose_naiverag") else 0.6
 
     return {
-        "chosen": chosen,
+        "decision": decision,
         "final_answer": final_answer,
         "rationale": rationale,
+        # extra fields for Script 2's summary:
+        "chosen": chosen,
         "confidence": confidence,
-        "key_points": out.get("key_points") or []
     }
+
 
 # ----------------- Orchestrator -----------------
 def agentic_multi(query_original: str) -> Dict[str, Any]:
@@ -1266,9 +1289,27 @@ def agentic_multi(query_original: str) -> Dict[str, Any]:
         naive_answer = naive_result.get("answer", "") or ""
         graphrag_answer = graph_result.get("answer", "") or ""
 
-        # Aggregate
+        # Build minimal meta objects to pass into the Script-1-style aggregator
+        graphrag_meta = {
+            "triples": graph_result.get("triples"),
+            "chunks": graph_result.get("chunks"),
+            "context_hint": "Graph triples + chunks",
+        }
+        naiverag_meta = {
+            "candidates": naive_result.get("candidates"),
+            "context_hint": "Top chunk content",
+        }
+
+        # Aggregate (Script-1-style aggregator)
         t_ag = now_ms()
-        agg = aggregator_agent(query_original, naive_answer, graphrag_answer, user_lang)
+        agg = aggregator_agent(
+            query_original,
+            naive_answer=naive_answer,
+            graphrag_answer=graphrag_answer,
+            lang=user_lang,
+            graphrag_meta=graphrag_meta,
+            naiverag_meta=naiverag_meta,
+        )
         t_agg = dur_ms(t_ag)
 
         final_answer = agg.get("final_answer", "") or ""
