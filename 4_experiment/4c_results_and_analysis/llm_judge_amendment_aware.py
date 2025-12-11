@@ -104,16 +104,16 @@ LOG_DIR = (SCRIPT_DIR / "llm_judge_logs").resolve()
 
 # Preferred label ordering for known models (extras will be appended)
 PREFERRED_LABEL_ORDER = [
-    "approach_2_both_answer",
-    "approach_2_router_answer",
-    "approach_2_query_decomposer_answer"
+    "1_answer",
+    "2_answer",
+    "3_answer",
 ]
 
 # Map JSONL keys to friendly, stable labels (optional explicit mapping)
 MODEL_KEY_TO_LABEL = {
-    "approach_2_both_answer": "approach_2_both_answer",
-    "approach_2_router_answer": "approach_2_router_answer",
-    "approach_2_query_decomposer_answer": "approach_2_query_decomposer_answer"
+    "1_answer": "1_answer",
+    "2_answer": "2_answer",
+    "3_answer": "3_answer",
 }
 
 
@@ -158,11 +158,15 @@ def label_from_key(key: str) -> Optional[str]:
 
 def collect_model_answers(item: Dict[str, Any]) -> Dict[str, str]:
     """
-    Returns a dict: {label -> answer_text} for any agentic_*_answer fields present.
+    Returns a dict: {label -> answer_text} for any *_answer fields present,
+    EXCLUDING the special 'outdated_answer' field, which is not a candidate.
     """
     out: Dict[str, str] = {}
     for key, value in item.items():
         if not isinstance(value, str):
+            continue
+        # Ignore the dedicated outdated reference answer
+        if key == "outdated_answer":
             continue
         if key.endswith("_answer"):
             label = label_from_key(key)
@@ -322,7 +326,19 @@ def read_jsonl(path: Path, logger: logging.Logger) -> List[Dict[str, Any]]:
     return items
 
 
-def build_prompt(question: str, ground_truth: str, candidates: Dict[str, str]) -> str:
+def build_prompt(
+    question: str,
+    ground_truth: str,
+    candidates: Dict[str, str],
+    outdated_answer: Optional[str] = None,
+) -> str:
+    """
+    Build the evaluation prompt.
+
+    - ground_truth: current, authoritative answer.
+    - outdated_answer: historically correct but now invalid;
+      used ONLY to detect outdated reasoning and must not justify partial credit.
+    """
     schema_entries = []
     for i, label in enumerate(candidates.keys()):
         comma = "," if i < len(candidates) - 1 else ""
@@ -333,19 +349,51 @@ def build_prompt(question: str, ground_truth: str, candidates: Dict[str, str]) -
     for label, answer in candidates.items():
         cand_blocks.append(f"{label}:\n{answer}")
 
+    outdated_block = ""
+    if outdated_answer is not None and str(outdated_answer).strip():
+        outdated_block = f"""
+
+Outdated Answer (historical, NO LONGER VALID):
+\"\"\"{outdated_answer.strip()}\"\"\""""
+
     return f"""
-You are an impartial evaluator. Score each candidate answer strictly against the Ground Truth.
+You are an impartial evaluator. Score each candidate answer strictly against the CURRENT Ground Truth.
+
+TEMPORAL / OUTDATED RULES (VERY IMPORTANT):
+- The "Ground Truth" is the only authoritative reference for what is correct NOW.
+- The "Outdated Answer" (if provided) may have been correct in the past but is now INVALID.
+- The Outdated Answer is given ONLY so you can:
+  - recognize outdated reasoning, and
+  - penalize it.
+- If a candidate clearly matches, relies on, or endorses the Outdated Answer where it conflicts
+  with the Ground Truth, you MUST assign score 0 (incorrect).
+- Do NOT give partial credit (score 1) just because something matches the Outdated Answer.
+  Historical correctness does not count; only current Ground Truth matters.
+- A candidate can receive score 2 ONLY if it is correct relative to the CURRENT Ground Truth.
 
 Scoring:
-- 0 = Did not answer the question OR is incorrect/contradicts the Ground Truth.
-- 1 = Partially correct per the Ground Truth (some correct elements but missing or includes inaccuracies).
-- 2 = Correct per the Ground Truth (fully aligns; extra info is allowed only if it does not change the meaning or contradict).
+- 0 = Did not answer the question OR is incorrect OR contradicts the Ground Truth OR
+      relies on outdated rules that conflict with the Ground Truth.
+- 1 = Partially correct per the CURRENT Ground Truth (some correct elements but missing
+      important details or contains minor inaccuracies) AND does not centrally rely on
+      outdated rules that conflict with the Ground Truth; 
+- 2 = Correct per the CURRENT Ground Truth (fully aligns; extra info is allowed only if
+      it does not change the meaning or contradict).
+
+Important edge cases:
+- If a candidate mixes some correct information (aligned with Ground Truth) with
+  outdated or incorrect information (aligned with Outdated Answer) and the outdated part
+  is substantial or central, you MUST give 0, not 1.
+- If a candidate is vague/ambiguous about whether it is using current or outdated rules,
+  judge based on what it actually implies. If you cannot reasonably interpret it as
+  aligned with the current Ground Truth, assign 0.
 
 Rules:
-- Judge only on factual alignment to the Ground Truth.
-- Ignore style, verbosity, or citations unless they introduce contradictions.
+- Judge only on factual alignment to the CURRENT Ground Truth (and penalize outdated content as above).
+- Ignore style, verbosity, or citations unless they introduce contradictions or outdated claims.
 - Output valid, minimal JSON only. No code fences, no extra commentary.
 - Use EXACTLY these keys (do not rename): {", ".join(candidates.keys())}
+- If the score is 0, provide in the reason whether it is because of outdated answer or simply wrong.
 
 Output JSON schema:
 {schema}
@@ -353,8 +401,8 @@ Output JSON schema:
 Question:
 {question}
 
-Ground Truth:
-{ground_truth}
+Ground Truth (current, authoritative):
+{ground_truth}{outdated_block}
 
 Candidate Answers:
 {chr(10).join(cand_blocks)}
@@ -573,6 +621,7 @@ def evaluate_dataset(items: List[Dict[str, Any]],
         qid = item.get("id", "")
         q = (item.get("question") or "").strip()
         gt = (item.get("ground_truth") or "").strip()
+        outdated_answer = (item.get("outdated_answer") or "").strip()
 
         if not (q and gt):
             logger.warning(f"[Q{idx+1}] id={qid} Missing question or ground truth. Skipping.")
@@ -586,7 +635,7 @@ def evaluate_dataset(items: List[Dict[str, Any]],
             continue
 
         candidates = {lbl: model_answers[lbl] for lbl in expected_labels}
-        prompt = build_prompt(q, gt, candidates)
+        prompt = build_prompt(q, gt, candidates, outdated_answer=outdated_answer or None)
 
         parsed, duration, attempts, error_info = call_llm_with_retry(
             model, limiter, prompt, logger, idx, total_questions, expected_labels, qid=qid, max_attempts=MAX_ATTEMPTS

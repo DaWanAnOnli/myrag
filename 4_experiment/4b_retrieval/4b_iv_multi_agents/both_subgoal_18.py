@@ -65,7 +65,7 @@ LLM_CALLS_PER_MINUTE = int(os.getenv("LLM_CALLS_PER_MINUTE", "13"))
 EMBEDDING_CALLS_PER_MINUTE = int(os.getenv("EMBEDDING_CALLS_PER_MINUTE", "0"))  # 0 disables embedding throttling
 
 # ---------- Agentic Supervisor parameters ----------
-SUBGOAL_MAX_N = int(os.getenv("SUBGOAL_MAX_N", "5"))
+SUBGOAL_MAX_N = int(os.getenv("SUBGOAL_MAX_N", "3"))
 SUBGOALS_RUN_IN_PARALLEL = os.getenv("SUBGOALS_RUN_IN_PARALLEL", "true").lower() in ("1","true","yes","y")
 SUBGOALS_MAX_WORKERS = int(os.getenv("SUBGOALS_MAX_WORKERS", str(SUBGOAL_MAX_N)))
 SUBGOAL_ANSWER_SNIPPET_CLAMP = int(os.getenv("SUBGOAL_ANSWER_SNIPPET_CLAMP", "2000"))

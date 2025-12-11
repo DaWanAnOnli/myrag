@@ -1,6 +1,6 @@
 # analyze_llm_calls_supervisor.py
 """
-Analyzes log files from the Agentic Supervisor RAG system.
+Analyzes log files from the Agentic Supervisor RAG system (updated for latest logging format).
 Tracks LLM calls including subgoal generation, per-subgoal pipelines, and final aggregation.
 Counts subgoals generated and aggregator decisions at both subgoal and final levels.
 Ignores Agent 1/1b calls in Naive RAG pipeline per user request.
@@ -16,7 +16,7 @@ from collections import Counter
 
 # Relative paths from this script's location
 SCRIPT_DIR = Path(__file__).resolve().parent
-LOG_FOLDER = SCRIPT_DIR / "../../4b_retrieval/4b_iv_multi_agents/question_terminal_logs_multi_agent/no_18_approach_2_both_5_subgoal_new_fix"
+LOG_FOLDER = SCRIPT_DIR / "../../4b_retrieval/4b_iv_multi_agents/question_terminal_logs_multi_agent/no_18_both_5_subgoals_newest"
 OUTPUT_FOLDER = SCRIPT_DIR / "llm_calls_analysis_results_approach_2_both_5_subgoal"
 
 
@@ -47,7 +47,9 @@ def extract_subgoal_info(log_path: Path) -> tuple:
             content = f.read()
             
             # Extract subgoal count
-            match = re.search(r'Produced (\d+) subgoal\(s\):', content)
+            # Current supervisor log:
+            # [Supervisor] Executing N subgoal(s).
+            match = re.search(r'\[Supervisor\] Executing\s+(\d+)\s+subgoal\(s\)\.', content)
             if match:
                 num_subgoals = int(match.group(1))
             
@@ -58,17 +60,17 @@ def extract_subgoal_info(log_path: Path) -> tuple:
                     num_subgoals = int(match.group(1))
             
             # Extract per-subgoal aggregator decisions
-            # Look for patterns like [sg=sg1] ... [Aggregator] Decision:
-            subgoal_blocks = re.findall(
-                r'\[sg=(sg\d+)\].*?\[Aggregator\] Decision: chosen=(\w+)',
-                content,
+            # Context prefix: [sg=SG1]
+            # Aggregator line: [Aggregator] Decision=choose_graphrag | Rationale: ...
+            pattern = re.compile(
+                r'\[sg=(SG\d+)\].*?\[Aggregator\]\s+Decision=([a-zA-Z_]+)',
                 re.DOTALL
             )
             
-            for sg_id, chosen in subgoal_blocks:
+            for sg_id, decision in pattern.findall(content):
                 subgoal_details.append({
                     'subgoal_id': sg_id,
-                    'aggregator_chosen': chosen
+                    'aggregator_decision': decision
                 })
     
     except Exception as e:
@@ -78,7 +80,12 @@ def extract_subgoal_info(log_path: Path) -> tuple:
 
 
 def extract_final_aggregator_decision(log_path: Path) -> Dict[str, any]:
-    """Extract final aggregator decision from the log."""
+    """
+    Extract final aggregator decision from the log.
+
+    NOTE: Current RAG code does not log an explicit FinalAggregator confidence,
+    so we return a stub with confidence=0.0 and empty rationale.
+    """
     decision = {
         'confidence': 0.0,
         'rationale': ''
@@ -88,10 +95,12 @@ def extract_final_aggregator_decision(log_path: Path) -> Dict[str, any]:
         with open(log_path, 'r', encoding='utf-8') as f:
             content = f.read()
             
-            # Look for FinalAggregator confidence
-            conf_match = re.search(r'\[FinalAggregator\] Confidence=([\d.]+)', content)
-            if conf_match:
-                decision['confidence'] = float(conf_match.group(1))
+            # If you later add something like:
+            #   [FinalAggregator] Confidence=0.82
+            # you can parse it with:
+            # conf_match = re.search(r'\[FinalAggregator\]\s+Confidence=([\d.]+)', content)
+            # if conf_match:
+            #     decision['confidence'] = float(conf_match.group(1))
     
     except Exception as e:
         print(f"Error extracting final aggregator from {log_path.name}: {e}")
@@ -139,28 +148,29 @@ def analyze_log_file(log_path: Path) -> Dict:
             # Extract subgoal info
             num_subgoals, subgoal_details = extract_subgoal_info(log_path)
             result['num_subgoals'] = num_subgoals
-            result['subgoal_aggregator_choices'] = [s['aggregator_chosen'] for s in subgoal_details]
+            result['subgoal_aggregator_choices'] = [s['aggregator_decision'] for s in subgoal_details]
             
             # Extract final aggregator
             final_agg = extract_final_aggregator_decision(log_path)
             result['final_aggregator_confidence'] = final_agg['confidence']
             
             # Count Subgoal Generator prompts (should be 1)
-            subgoal_gen_matches = re.findall(r'\[SubgoalGenerator\] Prompt:', content)
+            # log("\n[SubgoalGenerator] Prompt:", level="INFO")
+            subgoal_gen_matches = re.findall(r'\[SubgoalGenerator\]\s+Prompt:', content)
             result['subgoal_gen_calls'] = len(subgoal_gen_matches)
             
             # Count Agent 1 prompts (only in GraphRAG, never in Naive)
-            agent1_matches = re.findall(r'\[Agent 1\] Prompt:', content)
+            agent1_matches = re.findall(r'\[Agent 1\]\s+Prompt:', content)
             result['agent1_calls'] = len(agent1_matches)
             
             # Count Agent 1b prompts (only in GraphRAG, never in Naive)
-            agent1b_matches = re.findall(r'\[Agent 1b\] Prompt:', content)
+            agent1b_matches = re.findall(r'\[Agent 1b\]\s+Prompt:', content)
             result['agent1b_calls'] = len(agent1b_matches)
             
             # Count Agent 2 prompts by pipeline
             agent2_naive = 0
             agent2_graphrag = 0
-            for match in re.finditer(r'\[Agent 2 - (Naive|GraphRAG)\] Prompt:', content):
+            for match in re.finditer(r'\[Agent 2 - (Naive|GraphRAG)\]\s+Prompt:', content):
                 pipeline = match.group(1)
                 if pipeline == 'Naive':
                     agent2_naive += 1
@@ -171,12 +181,14 @@ def analyze_log_file(log_path: Path) -> Dict:
             result['agent2_graphrag_calls'] = agent2_graphrag
             
             # Count per-subgoal Aggregator prompts
-            # These are marked with [sg=...] context
-            per_sg_agg = len(re.findall(r'\[sg=sg\d+\].*?\[Aggregator\] Prompt:', content, re.DOTALL))
+            # These are marked with [sg=SGx] context
+            per_sg_agg = len(
+                re.findall(r'\[sg=SG\d+\].*?\[Aggregator\]\s+Prompt:', content, re.DOTALL)
+            )
             result['per_subgoal_aggregator_calls'] = per_sg_agg
             
             # Count Final Aggregator prompts (should be 1)
-            final_agg_matches = re.findall(r'\[FinalAggregator\] Prompt:', content)
+            final_agg_matches = re.findall(r'\[FinalAggregator\]\s+Prompt:', content)
             result['final_aggregator_calls'] = len(final_agg_matches)
             
             # Total LLM calls

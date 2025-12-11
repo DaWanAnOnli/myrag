@@ -1,3 +1,8 @@
+# images
+*.png
+*.txt
+*.json
+*.csv
 # Django
 *.log
 *.pot

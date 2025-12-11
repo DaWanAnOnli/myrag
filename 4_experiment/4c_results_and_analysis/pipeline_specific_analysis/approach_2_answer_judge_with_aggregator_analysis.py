@@ -1,22 +1,13 @@
 #!/usr/bin/env python3
 """
-Multi-Agent Answer Judge Iteration Analysis Script (Updated)
+Multi-Agent Answer Judge Iteration Analysis Script (Updated + Aggregator Decision Analysis)
 
 Extracts iteration counts from the NEW multi-agent RAG log files produced by
 `agentic_multi_iterative` in multi_agent.py, maps them to LLM judge scores,
 and generates analysis reports.
 
-What it assumes about the logs (from the new orchestrator):
-
-At the end of each run you log something like:
-
-    === Agentic Multi-Iteration Summary ===
-    - Total iterations used: 2
-    - Total runtime: 12345 ms
-
-And per-iteration you log headers like:
-
-    ========== [Iter 1/2] ==========
+New: also analyzes the distribution of Aggregator decisions across all
+iterations and per iteration index.
 """
 
 import os
@@ -29,26 +20,26 @@ from typing import Dict, List, Tuple
 # ============ CONFIGURATION ============
 # Path to the CSV file with LLM judge results
 CSV_FILE = Path(
-    "../../../dataset/4_experiment/4c_experiment_results/new/llm_judge_results_20251128-065247_no_17_newest_3.csv"
+    "../../../dataset/4_experiment/4c_experiment_results/new/llm_judge_results_20251127-042826_no_17_newest_1.csv"
 )
 
 # Layer 1 folder containing the layer 2 experiment folders
 # (each subfolder contains many .txt logs, one per question)
 LAYER1_FOLDER = Path(
-    "../../4b_retrieval/4b_iv_multi_agents/question_terminal_logs_multi_agent/no_17_answer_judge_3_newest"
+    "../../4b_retrieval/4b_iv_multi_agents/question_terminal_logs_multi_agent/no_17_answer_judge_1_newest"
 )
 
 # Mapping of folder names (each experiment setting) to CSV column names
 # Adjust these if your CSV schema / experiment naming changes.
 FOLDER_TO_COLUMN = {
-    "no_17_both_2_answer_judge_3_newest": "1_answer score",
-    "no_17_both_3_answer_judge_3_newest": "2_answer score",
-    "no_17_both_4_answer_judge_3_newest": "3_answer score",
-    "no_17_both_5_answer_judge_3_newest": "4_answer score",
+    "no_17_both_2_answer_judge_1_newest": "1_answer score",
+    "no_17_both_3_answer_judge_1_newest": "2_answer score",
+    "no_17_both_4_answer_judge_1_newest": "3_answer score",
+    "no_17_both_5_answer_judge_1_newest": "4_answer score",
 }
 
 # Output directory for results
-OUTPUT_DIR = Path("results_17_answer_judge_newest")
+OUTPUT_DIR = Path("results_17_answer_judge_newest_with_aggregator_analyses")
 
 
 # ============ HELPER FUNCTIONS ============
@@ -86,16 +77,12 @@ def extract_iterations_from_log(log_path: Path) -> int:
         return -1
 
     # --- Method 1: Summary line (most reliable) ---
-    # New multi-iter code logs:
-    #   "=== Agentic Multi-Iteration Summary ==="
-    #   "- Total iterations used: {it}"
     m1 = re.search(
         r"^-+\s*Total\s+iterations\s+used:\s+(\d+)\s*$|^.*-+\s*Total\s+iterations\s+used:\s+(\d+)",
         content,
         flags=re.MULTILINE,
     )
     if m1:
-        # group(1) or group(2) depending on which alternative matched
         for g in m1.groups():
             if g is not None:
                 try:
@@ -114,8 +101,6 @@ def extract_iterations_from_log(log_path: Path) -> int:
             pass
 
     # --- Method 2: Header lines "========== [Iter X/Y] ==========" ---
-    # The current orchestrator logs:
-    #   "========== [Iter 1/2] =========="
     iter_matches = re.findall(
         r"=+\s*\[Iter\s+(\d+)/\d+\]\s*=+", content
     )
@@ -126,7 +111,6 @@ def extract_iterations_from_log(log_path: Path) -> int:
             pass
 
     # --- Method 3: Any "[Iter X]" pattern as last fallback ---
-    # This is more permissive; may over-detect if "[Iter ...]" appears in other contexts
     loose_matches = re.findall(r"\[Iter\s+(\d+)\]", content)
     if loose_matches:
         try:
@@ -136,6 +120,56 @@ def extract_iterations_from_log(log_path: Path) -> int:
 
     # If all else fails
     return -1
+
+
+def extract_aggregator_decisions_from_log(log_path: Path) -> List[Tuple[int, str]]:
+    """
+    Extract (iteration_number, aggregator_decision) pairs from a log file.
+
+    We rely on:
+      - Iteration headers: "========== [Iter 1/2] =========="
+      - Aggregator logs:   "[Aggregator] Decision=choose_graphrag | Rationale: ..."
+
+    If an Aggregator decision appears outside any recognized iteration header,
+    we assign it to iteration 1 as a fallback.
+    """
+    decisions: List[Tuple[int, str]] = []
+
+    try:
+        with open(log_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception as e:
+        print(f"Error reading {log_path}: {e}")
+        return decisions
+
+    # Split into lines for a simple sequential scan
+    lines = content.splitlines()
+
+    # Regex for iteration header and aggregator decision line
+    iter_header_re = re.compile(r"=+\s*\[Iter\s+(\d+)/\d+\]\s*=+")
+    # Decision line as logged in multi_agent.py:
+    # log(f"[Aggregator] Decision={decision} | Rationale: {rationale[:160]}", level="INFO")
+    decision_re = re.compile(r"\[Aggregator\]\s+Decision=([\w_]+)\b")
+
+    current_iter = 1  # default fallback
+
+    for line in lines:
+        # Update current_iter when we see a new iteration header
+        m_iter = iter_header_re.search(line)
+        if m_iter:
+            try:
+                current_iter = int(m_iter.group(1))
+            except ValueError:
+                current_iter = current_iter  # keep previous
+            continue
+
+        # Look for decision lines
+        m_dec = decision_re.search(line)
+        if m_dec:
+            decision = m_dec.group(1).strip()
+            decisions.append((current_iter, decision))
+
+    return decisions
 
 
 def load_scores_from_csv(csv_path: Path) -> Dict[str, Dict[int, int]]:
@@ -185,7 +219,7 @@ def process_experiment_folder(
     folder_path: Path,
     column_name: str,
     scores_for_experiment: Dict[int, int],
-) -> List[Tuple[int, int, int]]:
+) -> List[Tuple[int, int, int, List[Tuple[int, str]]]]:
     """
     Process all log files in an experiment folder.
 
@@ -195,9 +229,14 @@ def process_experiment_folder(
         scores_for_experiment: {question_id: score} for this experiment
 
     Returns:
-        List of (question_id, iterations, score)
+        List of (question_id, iterations, score, aggregator_decisions)
+        where:
+          - question_id: int
+          - iterations: total iterations used (int)
+          - score: LLM judge score (int)
+          - aggregator_decisions: List[(iter_index, decision_str)]
     """
-    results: List[Tuple[int, int, int]] = []
+    results: List[Tuple[int, int, int, List[Tuple[int, str]]]] = []
     failed_extractions: List[Tuple[int, str]] = []
 
     log_files = sorted(folder_path.glob("*.txt"))
@@ -218,7 +257,9 @@ def process_experiment_folder(
         if score == -1:
             print(f"  Warning: No score found in column '{column_name}' for question ID {q_id}")
 
-        results.append((q_id, iterations, score))
+        agg_decisions = extract_aggregator_decisions_from_log(log_file)
+
+        results.append((q_id, iterations, score, agg_decisions))
 
     if failed_extractions:
         print(f"  WARNING: Failed to extract iterations from {len(failed_extractions)} files:")
@@ -230,13 +271,15 @@ def process_experiment_folder(
     return results
 
 
-def analyze_results(results: List[Tuple[int, int, int]], experiment_name: str) -> str:
+def analyze_results(results: List[Tuple[int, int, int, List[Tuple[int, str]]]], experiment_name: str) -> str:
     """
-    Analyze the (question_id, iterations, score) tuples and generate a text report.
+    Analyze the (question_id, iterations, score, aggregator_decisions) tuples and generate a text report.
 
     - Overall score distribution
     - Iteration count distribution
     - Score distribution conditional on iterations
+    - Overall Aggregator decision distribution (over all iterations)
+    - Aggregator decision distribution conditional on iteration index
     """
     lines: List[str] = []
     lines.append("=" * 80)
@@ -248,19 +291,35 @@ def analyze_results(results: List[Tuple[int, int, int]], experiment_name: str) -
     lines.append(f"Total questions processed: {total_q}")
     lines.append("")
 
-    # Group by iteration count
+    # Group by iteration count (for questions)
     by_iterations: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
-    for q_id, iters, score in results:
+    # Scoring stats
+    score_counts: Dict[int, int] = defaultdict(int)
+
+    # Aggregator decision stats
+    # Overall counts (across all iterations, all questions)
+    decision_counts: Dict[str, int] = defaultdict(int)
+    # By iteration index
+    #   iter_index -> decision -> count
+    decision_by_iter: Dict[int, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+
+    for q_id, iters, score, agg_decisions in results:
+        # For iteration-level grouping (per question)
         by_iterations[iters].append((q_id, score))
 
-    # Overall score distribution
+        # Score stats
+        if score >= 0:
+            score_counts[score] += 1
+
+        # Aggregator stats
+        for iter_idx, dec in agg_decisions:
+            dec_key = dec or "UNKNOWN"
+            decision_counts[dec_key] += 1
+            decision_by_iter[iter_idx][dec_key] += 1
+
+    # ========== OVERALL SCORE DISTRIBUTION ==========
     lines.append("OVERALL SCORE DISTRIBUTION:")
     lines.append("-" * 40)
-    score_counts: Dict[int, int] = defaultdict(int)
-    for _, _, s in results:
-        if s >= 0:
-            score_counts[s] += 1
-
     total_scored = sum(score_counts.values())
     for score in sorted(score_counts.keys()):
         count = score_counts[score]
@@ -274,8 +333,8 @@ def analyze_results(results: List[Tuple[int, int, int]], experiment_name: str) -
         lines.append("  No valid scores available.")
     lines.append("")
 
-    # Iteration distribution
-    lines.append("ITERATION DISTRIBUTION:")
+    # ========== ITERATION DISTRIBUTION (PER QUESTION) ==========
+    lines.append("ITERATION DISTRIBUTION (PER QUESTION):")
     lines.append("-" * 40)
     for iters in sorted(by_iterations.keys()):
         count = len(by_iterations[iters])
@@ -283,8 +342,8 @@ def analyze_results(results: List[Tuple[int, int, int]], experiment_name: str) -
         lines.append(f"  {iters} iteration(s): {count:4d} questions ({pct:5.2f}%)")
     lines.append("")
 
-    # Score distribution by iteration count
-    lines.append("SCORE DISTRIBUTION BY ITERATION COUNT:")
+    # ========== SCORE DISTRIBUTION BY ITERATION COUNT ==========
+    lines.append("SCORE DISTRIBUTION BY ITERATION COUNT (PER QUESTION):")
     lines.append("=" * 80)
 
     for iters in sorted(by_iterations.keys()):
@@ -316,13 +375,50 @@ def analyze_results(results: List[Tuple[int, int, int]], experiment_name: str) -
     lines.append("")
     lines.append("=" * 80)
 
+    # ========== NEW: OVERALL AGGREGATOR DECISION DISTRIBUTION ==========
+    total_decisions = sum(decision_counts.values())
+    lines.append("")
+    lines.append("AGGREGATOR DECISION DISTRIBUTION (ALL ITERATIONS, ALL QUESTIONS):")
+    lines.append("-" * 80)
+    lines.append(f"Total aggregator decisions observed: {total_decisions}")
+    if total_decisions == 0:
+        lines.append("  No aggregator decisions found in logs.")
+    else:
+        for dec in sorted(decision_counts.keys()):
+            count = decision_counts[dec]
+            pct = (count / total_decisions * 100.0)
+            lines.append(f"  Decision '{dec}': {count:5d} times ({pct:5.2f}%)")
+    lines.append("")
+    lines.append("=" * 80)
+
+    # ========== NEW: AGGREGATOR DECISION DISTRIBUTION BY ITERATION INDEX ==========
+    lines.append("AGGREGATOR DECISION DISTRIBUTION BY ITERATION INDEX:")
+    lines.append("=" * 80)
+
+    if not decision_by_iter:
+        lines.append("  No aggregator decisions found by iteration.")
+    else:
+        for iter_idx in sorted(decision_by_iter.keys()):
+            dec_map = decision_by_iter[iter_idx]
+            iter_total = sum(dec_map.values())
+            lines.append("")
+            lines.append(f"Iteration {iter_idx}: {iter_total} total decisions")
+            lines.append("-" * 40)
+            for dec in sorted(dec_map.keys()):
+                count = dec_map[dec]
+                pct = (count / iter_total * 100.0) if iter_total > 0 else 0.0
+                lines.append(f"  Decision '{dec}': {count:5d} times ({pct:5.2f}%)")
+
+    lines.append("")
+    lines.append("=" * 80)
+
     return "\n".join(lines)
 
 
 # ============ MAIN ============
 
 def main():
-    print("Starting UPDATED Multi-Agent Iteration analysis...")
+    print("Starting UPDATED Multi-Agent Iteration analysis (with Aggregator decisions)...")
     print(f"CSV file: {CSV_FILE}")
     print(f"Layer 1 folder: {LAYER1_FOLDER}")
     print(f"Output directory: {OUTPUT_DIR}")
@@ -356,16 +452,18 @@ def main():
         results = process_experiment_folder(folder_path, column_name, scores_for_experiment)
         print(f"  Processed {len(results)} questions successfully")
 
-        # Save raw results
+        # Save raw results (per-question)
         results_file = OUTPUT_DIR / f"{folder_name}_results.csv"
         with open(results_file, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
+            # For CSV we’ll store only per-question fields (aggregator decisions are per-iteration and
+            # more complex; they go into the text analysis report)
             writer.writerow(["question_id", "iterations_used", "llm_judge_score"])
-            for q_id, iterations, score in sorted(results):
+            for q_id, iterations, score, _ in sorted(results):
                 writer.writerow([q_id, iterations, score])
         print(f"  Saved per-question results to: {results_file}")
 
-        # Generate & save analysis report
+        # Generate & save analysis report (includes aggregator decision analysis)
         analysis_text = analyze_results(results, folder_name)
         analysis_file = OUTPUT_DIR / f"{folder_name}_analysis.txt"
         with open(analysis_file, "w", encoding="utf-8") as f:

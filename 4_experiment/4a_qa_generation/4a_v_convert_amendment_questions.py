@@ -30,7 +30,8 @@ def csv_to_jsonl(csv_file, jsonl_file):
                         "id": int(row["No"].strip()),
                         "source_filename": row["UU (max 5 latest per year), no APBN amendments before 1996"].strip(),
                         "question": row["question"].strip(),
-                        "answer": row["ground truth"].strip()
+                        "answer": row["ground truth"].strip(),
+                        "outdated_answer": row["wrong answer"].strip() if row.get("wrong answer") else ""
                     }
                     
                     # Write each object as a single line
@@ -55,6 +56,5 @@ if __name__ == "__main__":
     # Specify your input and output file names
     csv_file = "../../dataset/4_experiment/4a_qa_generation/4a_v_amendment_questions/UU_Amendments.csv"  # Change to your CSV file name
     jsonl_file = "../../dataset/4_experiment/4a_qa_generation/4a_v_amendment_questions/amendment_questions.jsonl"  # Change to your desired output file name
-    
     
     csv_to_jsonl(csv_file, jsonl_file)
