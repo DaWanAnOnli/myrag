@@ -88,20 +88,20 @@ else:
 
 
 PATTERN_1 = [
-    os.path.join(BASE_INPUT_DIRECTORY, "multi_agent_answers_20251127-235336_19_approach_2_both_2_iq_newest.jsonl")
+    os.path.join(BASE_INPUT_DIRECTORY, "no_1_naive_rag_answers_20251005-194548_1250.jsonl")
 ]
 
 PATTERN_2 = [
-    os.path.join(BASE_INPUT_DIRECTORY, "multi_agent_answers_20251128-004804_19_approach_2_both_3_iq_newest.jsonl")
+    os.path.join(BASE_INPUT_DIRECTORY, "no_2_graph_rag_answers_20251114-133218_5_hop_1.jsonl")
 ]
 
-PATTERN_3 = [
-    os.path.join(BASE_INPUT_DIRECTORY, "multi_agent_answers_20251128-061844_19_approach_2_both_4_iq_newest.jsonl")
-]
+# PATTERN_3 = [
+#     os.path.join(BASE_INPUT_DIRECTORY, "multi_agent_answers_20251130-182015_no_11_amendment_aware_post_aggregation.jsonl")
+# ]
 
-PATTERN_4 = [
-    os.path.join(BASE_INPUT_DIRECTORY, "multi_agent_answers_20251128-075705_19_approach_2_both_5_iq_newest.jsonl")
-]
+# PATTERN_4 = [
+#     os.path.join(BASE_INPUT_DIRECTORY, "multi_agent_answers_20251128-075705_19_approach_2_both_5_iq_newest.jsonl")
+# ]
 
 # PATTERN_5 = [
 #     os.path.join(BASE_INPUT_DIRECTORY, "graph_rag_answers_20251114-125358_4_hop_1.jsonl")
@@ -236,8 +236,8 @@ def main():
 
     pattern_1_files = expand_paths(PATTERN_1)
     pattern_2_files = expand_paths(PATTERN_2)
-    pattern_3_files = expand_paths(PATTERN_3)
-    pattern_4_files = expand_paths(PATTERN_4)
+    # pattern_3_files = expand_paths(PATTERN_3)
+    # pattern_4_files = expand_paths(PATTERN_4)
     # pattern_5_files = expand_paths(PATTERN_5)
     # pattern_6_files = expand_paths(PATTERN_6)
 
@@ -316,7 +316,7 @@ def main():
 
     pattern_1_data = load_group(
         pattern_1_files,
-        source_answer_field="final_answer",
+        source_answer_field="agentic_naive_rag_answer",
         dest_answer_field="1_answer",
         include_question=True,
         include_ground_truth=True,
@@ -324,27 +324,27 @@ def main():
 
     pattern_2_data = load_group(
         pattern_2_files,
-        source_answer_field="final_answer",
+        source_answer_field="generated_answer",
         dest_answer_field="2_answer",
         include_question=True,
         include_ground_truth=True,
     )
 
-    pattern_3_data = load_group(
-        pattern_3_files,
-        source_answer_field="final_answer",
-        dest_answer_field="3_answer",
-        include_question=True,
-        include_ground_truth=True,
-    )
+    # pattern_3_data = load_group(
+    #     pattern_3_files,
+    #     source_answer_field="final_answer",
+    #     dest_answer_field="3_answer",
+    #     include_question=True,
+    #     include_ground_truth=True,
+    # )
 
-    pattern_4_data = load_group(
-        pattern_4_files,
-        source_answer_field="final_answer",
-        dest_answer_field="4_answer",
-        include_question=True,
-        include_ground_truth=True,
-    )
+    # pattern_4_data = load_group(
+    #     pattern_4_files,
+    #     source_answer_field="final_answer",
+    #     dest_answer_field="4_answer",
+    #     include_question=True,
+    #     include_ground_truth=True,
+    # )
 
     # pattern_5_data = load_group(
     #     pattern_5_files,
@@ -384,8 +384,8 @@ def main():
 
             p1 = pattern_1_data.get(id_key,{})
             p2 = pattern_2_data.get(id_key,{})
-            p3 = pattern_3_data.get(id_key,{})
-            p4 = pattern_4_data.get(id_key,{})
+            # p3 = pattern_3_data.get(id_key,{})
+            # p4 = pattern_4_data.get(id_key,{})
             # p5 = pattern_5_data.get(id_key,{})
             # p6 = pattern_6_data.get(id_key,{})
 
@@ -413,8 +413,8 @@ def main():
                 # "lexidkg_graphrag_5_hop_answer": g5.get("lexidkg_graphrag_5_hop_answer"),
                 "1_answer": p1.get("1_answer"),
                 "2_answer": p2.get("2_answer"),
-                "3_answer": p3.get("3_answer"),
-                "4_answer": p4.get("4_answer"),
+                # "3_answer": p3.get("3_answer"),
+                # "4_answer": p4.get("4_answer"),
                 # "graphrag_4_hop_answer": p5.get("graphrag_4_hop_answer"),
                 # "graphrag_5_hop_answer": p6.get("graphrag_5_hop_answer"),
             }

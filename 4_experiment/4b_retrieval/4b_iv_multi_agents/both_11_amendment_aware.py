@@ -63,7 +63,7 @@ NEO4J_PASS = os.getenv("NEO4J_PASS", "password")
 
 # Neo4j retry/timeout controls
 NEO4J_TX_TIMEOUT_S = float(os.getenv("NEO4J_TX_TIMEOUT_S", "60"))
-NEO4J_MAX_ATTEMPTS = int(os.getenv("NEO4J_MAX_ATTEMPTS", "10"))
+NEO4J_MAX_ATTEMPTS = int(os.getenv("NEO4J_MAX_ATTEMPTS", "100000000"))
 NEO4J_MAX_CONCURRENCY = int(os.getenv("NEO4J_MAX_CONCURRENCY", "0"))  # 0=unlimited
 
 # Models
@@ -2211,6 +2211,133 @@ def run_multi_agent(query_original: str) -> Dict[str, Any]:
             _LOGGER.close()
             _LOGGER = None
 
+def run_multi_agent_after_aggregation(query_original: str) -> Dict[str, Any]:
+    """
+    Option B: Same as run_multi_agent, but the amendment-aware pipeline runs
+    AFTER aggregation (once on the aggregated final answer), rather than per-pipeline before aggregation.
+    """
+    global _LOGGER
+    ts_name = make_timestamp_name()
+    log_file = Path.cwd() / f"{ts_name}.multi-agent.txt"
+    _LOGGER = FileLogger(log_file, also_console=True)
+    set_log_context(None, None)
+    t_all = now_ms()
+    try:
+        log("=== Multi-Agent RAG run started ===")
+        log(f"Process info: pid={_pid()}")
+        log(f"Log file: {log_file}")
+        log(f"Original Query: {query_original}")
+        log(f"Parameters: MAX_ANSWER_JUDGE_ITERS={MAX_ANSWER_JUDGE_ITERS}, MAX_CHUNKS_FINAL={MAX_CHUNKS_FINAL}, TOP_K_CHUNKS={TOP_K_CHUNKS}")
+        log(f"LLM limits: EMBED(max_conc={LLM_EMBED_MAX_CONCURRENCY}, qps={LLM_EMBED_QPS}), GEN(max_conc={LLM_GEN_MAX_CONCURRENCY}, qps={LLM_GEN_QPS})")
+        log(f"Neo4j: attempts={NEO4J_MAX_ATTEMPTS}, tx_timeout_s={NEO4J_TX_TIMEOUT_S:.1f}, max_concurrency={NEO4J_MAX_CONCURRENCY or 'unlimited'}")
+        user_lang = detect_user_language(query_original)
+        log(f"[Language] Detected user language: {user_lang}")
+
+        # Build ChunkStore once (shared by GraphRAG)
+        chunk_store = ChunkStore(LANGCHAIN_DIR, set(SKIP_FILES))
+
+        # Results to fill (from parallel threads)
+        G_res: Dict[str, Any] = {}
+        N_res: Dict[str, Any] = {}
+        exc: Dict[str, str] = {}
+
+        def run_G():
+            try:
+                set_log_context("G", None)
+                base_out = run_graphrag_loop(query_original, chunk_store, user_lang)
+                base_answer = (base_out.get("final_answer") or "").strip()
+                # NOTE (Option B): no amendment pass here
+                G_res.update(base_out)
+                G_res["final_answer"] = base_answer
+                G_res["amendment"] = {
+                    "has_amendments": False,
+                    "currency_warnings": "",
+                    "amendment_info": [],
+                    "amending_chunks_used": 0
+                }
+            except Exception as e:
+                exc["G"] = str(e)
+                log(f"[G] Error: {e}", level="ERROR")
+
+        def run_N():
+            try:
+                set_log_context("N", None)
+                base_out = run_naiverag_loop(query_original, user_lang)
+                base_answer = (base_out.get("final_answer") or "").strip()
+                # NOTE (Option B): no amendment pass here
+                N_res.update(base_out)
+                N_res["final_answer"] = base_answer
+                N_res["amendment"] = {
+                    "has_amendments": False,
+                    "currency_warnings": "",
+                    "amendment_info": [],
+                    "amending_chunks_used": 0
+                }
+            except Exception as e:
+                exc["N"] = str(e)
+                log(f"[N] Error: {e}", level="ERROR")
+
+        # Run both pipelines in parallel threads
+        t0 = now_ms()
+        tG = Thread(target=run_G, name="GraphRAGThread", daemon=True)
+        tN = Thread(target=run_N, name="NaiveRAGThread", daemon=True)
+        tG.start(); tN.start()
+        tG.join(); tN.join()
+        log(f"[MultiAgent] Pipelines completed in {dur_ms(t0):.0f} ms")
+
+        g_answer = (G_res.get("final_answer") or "").strip()
+        n_answer = (N_res.get("final_answer") or "").strip()
+
+        if "G" in exc and not g_answer and n_answer:
+            final = {"decision": "choose_naiverag", "final_answer": n_answer, "rationale": "GraphRAG failed. Using NaiveRAG answer."}
+        elif "N" in exc and not n_answer and g_answer:
+            final = {"decision": "choose_graphrag", "final_answer": g_answer, "rationale": "NaiveRAG failed. Using GraphRAG answer."}
+        else:
+            # Provide small meta to aggregator for audit
+            g_meta = {
+                "iterations_used": G_res.get("iterations_used"),
+                "context_hint": "Graph triples + chunks",
+                "per_iteration_count": len(G_res.get("per_iteration", []) or []),
+                "amendment": G_res.get("amendment", {})
+            }
+            n_meta = {
+                "iterations_used": N_res.get("iterations_used"),
+                "context_hint": "Top chunk content",
+                "iteration_runs_count": len(N_res.get("iteration_runs", []) or []),
+                "amendment": N_res.get("amendment", {})
+            }
+            final = aggregator_agent(query_original, g_answer, n_answer, g_meta, n_meta, user_lang)
+
+        # NOTE (Option B): single amendment-aware pass AFTER aggregation
+        amended = apply_amendments_pre_aggregation(query_original, final.get("final_answer", ""), user_lang)
+        final["final_answer"] = amended["final_answer"]
+
+        total_ms = dur_ms(t_all)
+        set_log_context(None, None)
+        log("\n=== Multi-Agent RAG summary ===")
+        log(f"- GraphRAG iters: {G_res.get('iterations_used')}")
+        log(f"- NaiveRAG iters: {N_res.get('iterations_used')}")
+        log(f"- Aggregator decision: {final.get('decision')}")
+        log(f"- Total runtime: {total_ms:.0f} ms")
+        log("\n=== Final Answer (Aggregated) ===")
+        log(final.get("final_answer",""))
+        log(f"\nLogs saved to: {log_file}")
+
+        return {
+            "final_answer": final.get("final_answer",""),
+            "aggregator": {
+                "decision": final.get("decision",""),
+                "rationale": final.get("rationale","")
+            },
+            "graphrag": G_res,
+            "naiverag": N_res,
+            "log_file": str(log_file)
+        }
+    finally:
+        if _LOGGER is not None:
+            _LOGGER.close()
+            _LOGGER = None
+
 # ----------------- Main -----------------
 if __name__ == "__main__":
     try:
@@ -2218,7 +2345,7 @@ if __name__ == "__main__":
         if not user_query:
             print("Empty query. Exiting.")
         else:
-            res = run_multi_agent(user_query)
+            res = run_multi_agent_after_aggregation(user_query)
             print("\n===== Aggregated Final Answer =====\n")
             print(res.get("final_answer",""))
     finally:

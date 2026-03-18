@@ -17,3 +17,7 @@ wheel
 numpy
 opencv-python
 utils
+openai
+FlagEmbedding
+pydantic
+pydantic-core

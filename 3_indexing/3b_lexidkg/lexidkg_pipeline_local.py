@@ -1,0 +1,1991 @@
+# -*- coding: utf-8 -*-
+# Local LMStudio version — uses OpenAI-compatible API (LMStudio) for generation
+# and BAAI/bge-m3 via FlagEmbedding for embeddings.
+
+import os, json, hashlib, time, threading, pickle, math, re, random
+from concurrent.futures import ThreadPoolExecutor, Future
+from collections import deque
+from typing import Dict, Any, List, Tuple, Optional
+from pathlib import Path
+
+from dotenv import load_dotenv
+from openai import OpenAI
+from FlagEmbedding import BGEM3FlagModel
+from neo4j import GraphDatabase, basic_auth
+from neo4j.exceptions import Neo4jError
+
+# ----------------- Thread-safe logging with timestamps and attempt IDs -----------------
+_PRINT_LOCK = threading.Lock()
+
+def _ts() -> str:
+    now = time.time()
+    lt = time.localtime(now)
+    ms = int((now - int(now)) * 1000)
+    return time.strftime("%Y-%m-%d %H:%M:%S", lt) + f".{ms:03d}"
+
+def _fmt_prefix(level: str, attempt_id: Optional[int]) -> str:
+    ts = _ts()
+    if attempt_id is None:
+        return f"[{ts}] [{level}]"
+    return f"[{ts}] [{level}] [attempt_id={attempt_id}]"
+
+def log_info(msg: str, attempt_id: Optional[int] = None) -> None:
+    with _PRINT_LOCK:
+        print(f"{_fmt_prefix('INFO', attempt_id)} {msg}")
+
+def log_warn(msg: str, attempt_id: Optional[int] = None) -> None:
+    with _PRINT_LOCK:
+        print(f"{_fmt_prefix('WARN', attempt_id)} {msg}")
+
+def log_error(msg: str, attempt_id: Optional[int] = None) -> None:
+    with _PRINT_LOCK:
+        print(f"{_fmt_prefix('ERROR', attempt_id)} {msg}")
+
+# ----------------- Load .env from the parent directory -----------------
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
+
+# ----------------- Config from env with sensible defaults -----------------
+# LMStudio local server
+LMSTUDIO_BASE_URL = os.getenv("LMSTUDIO_BASE_URL", "http://localhost:1234/v1")
+LOCAL_GEN_MODEL   = os.getenv("LOCAL_GEN_MODEL",   "qwen/qwen3.5-9b")
+LOCAL_EMBED_MODEL = os.getenv("LOCAL_EMBED_MODEL",  "BAAI/bge-m3")
+
+# BGE-M3 output dimension (dense vector) is 1024 by default
+EMBED_DIM = int(os.getenv("EMBED_DIM", "1024"))
+
+# IS_SAMPLE-aware source folder
+_IS_SAMPLE = os.getenv("IS_SAMPLE", "false").strip().lower() in ("1", "true", "yes", "y", "on")
+_ROOT = Path(__file__).resolve().parents[2]  # myrag/
+if _IS_SAMPLE:
+    LANGCHAIN_DIR = (_ROOT / "dataset" / "samples" / "3_indexing" / "3a_langchain_results").resolve()
+else:
+    LANGCHAIN_DIR = (_ROOT / "dataset" / "3_indexing" / "3a_langchain_results").resolve()
+
+# Neo4j
+NEO4J_URI  = os.getenv("NEO4J_URI",  "bolt://localhost:7687")
+NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASS = os.getenv("NEO4J_PASS", "@ik4nkus")
+
+# LLM rate limiter (calls per minute)
+LLM_MAX_CALLS_PER_MIN = int(os.getenv("LLM_MAX_CALLS_PER_MIN", "16"))
+
+# Number of LLM batches that may be processed concurrently.
+# N=1 → fully sequential (default). N>1 → sliding window: as soon as any
+# in-flight batch finishes, the next queued batch starts immediately.
+LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "16"))
+
+# Per-request timeout in seconds for LMStudio LLM calls.
+# LMStudio can take a long time to finish generating; 600 s (10 min) is a safe default.
+LLM_REQUEST_TIMEOUT = float(os.getenv("LLM_REQUEST_TIMEOUT", "1200"))
+
+# Vector index management: since you do NOT need live vector search during indexing
+# we drop vector indexes at start and rebuild them at the end by default.
+DROP_VECTOR_INDEXES_DURING_INGEST = os.getenv("DROP_VECTOR_INDEXES_DURING_INGEST", "1").strip() in ("1","true","yes","y","on")
+REBUILD_VECTOR_INDEXES_AFTER_INGEST = os.getenv("REBUILD_VECTOR_INDEXES_AFTER_INGEST", "1").strip() in ("1","true","yes","y","on")
+
+# API budget controls
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
+ENFORCE_API_BUDGET = _env_bool("ENFORCE_API_BUDGET", True)
+API_BUDGET_TOTAL = int(os.getenv("API_BUDGET_TOTAL", "1000000"))
+COUNT_EMBEDDINGS_IN_BUDGET = _env_bool("COUNT_EMBEDDINGS_IN_BUDGET", False)
+
+# Files to skip explicitly
+SKIP_FILES = {"all_langchain_documents.pkl"}
+
+# Prompt token control (heuristic)
+PROMPT_TOKEN_LIMIT = int(os.getenv("PROMPT_TOKEN_LIMIT", "4000"))
+PRACTICAL_MAX_ITEMS_PER_BATCH = int(os.getenv("PRACTICAL_MAX_ITEMS_PER_BATCH", "40"))
+
+# Single-chunk parse error split threshold
+SINGLE_PARSE_SPLIT_AFTER = int(os.getenv("SINGLE_PARSE_SPLIT_AFTER", "1"))
+
+# Deadlock retry settings for Neo4j writes
+NEO4J_TX_DEADLOCK_MAX_RETRIES = int(os.getenv("NEO4J_TX_DEADLOCK_MAX_RETRIES", "100000000"))  # total attempts = 1 + retries
+NEO4J_TX_DEADLOCK_BACKOFF_MS = int(os.getenv("NEO4J_TX_DEADLOCK_BACKOFF_MS", "80"))   # base backoff in ms
+
+# JSON output directory (must already exist; do not create it)
+JSON_OUTPUT_DIR = Path(os.getenv("JSON_OUTPUT_DIR", str((Path(__file__).resolve().parent / "../../dataset/llm-json-outputs").resolve())))
+if JSON_OUTPUT_DIR.exists() is False or not JSON_OUTPUT_DIR.is_dir():
+    raise FileNotFoundError(f"JSON_OUTPUT_DIR does not exist or is not a directory: {JSON_OUTPUT_DIR}. Please create it or set JSON_OUTPUT_DIR.")
+
+# ----------------- Initialize SDKs -----------------
+# LMStudio client (OpenAI-compatible)
+lmstudio_client = OpenAI(base_url=LMSTUDIO_BASE_URL, api_key="lm-studio", timeout=LLM_REQUEST_TIMEOUT)
+log_info(f"Using LMStudio generation model: {LOCAL_GEN_MODEL}")
+log_info(f"LMStudio base URL: {LMSTUDIO_BASE_URL}")
+log_info(f"LMStudio JSON outputs directory: {JSON_OUTPUT_DIR}")
+log_info(f"Source LANGCHAIN_DIR: {LANGCHAIN_DIR} (IS_SAMPLE={_IS_SAMPLE})")
+
+# BGE-M3 embedding model (loaded once, thread-safe for inference)
+log_info(f"Loading BGE-M3 embedding model: {LOCAL_EMBED_MODEL} ...")
+_bge_model = BGEM3FlagModel(LOCAL_EMBED_MODEL, use_fp16=True)
+log_info(f"BGE-M3 model loaded. Embed dim: {EMBED_DIM}")
+
+# ----------------- LexID ontology constants -----------------
+# (SYSTEM_HINT unchanged — omitted here to keep this file readable per your note)
+SYSTEM_HINT = """
+You are an expert in Indonesian legal knowledge graphs. You extract structured information from legal documents (Undang-Undang) to build a knowledge graph following the LexID ontology.
+
+## COMPLETE LEXID ONTOLOGY SPECIFICATION
+
+### 1. NODE TYPES (LABELS)
+
+#### Top-Level Node Labels:
+- `LegalDocument`: Base type for all Indonesian legal documents
+- `LegalDocumentContent`: Structural elements within documents
+- `RuleExpression`: Semantic content of legal clauses
+- `LawAmendment`: Changes to legal document content
+- `PlaceOfPromulgation`: Official gazettes for publication
+- `Person`: Individual person (e.g., enacting official)
+- `Office`: Government institution or body
+- `City`: Location where document was enacted
+
+#### Legal Document Types (subtypes of `LegalDocument`):
+- `Constitution`: UUD 1945
+- `AmendmentToTheConstitution`: Amendments to Constitution
+- `PeoplesConsultativeAssemblyResolution`: TAP MPR
+- `Act`: Undang-undang
+- `GovernmentRegulationInLieuOfAct`: Peraturan Pemerintah Pengganti Undang-undang (Perppu)
+- `GovernmentRegulation`: Peraturan Pemerintah (PP)
+- `PresidentialRegulation`: Peraturan Presiden
+- `PresidentialDecree`: Keputusan Presiden
+- `PresidentialInstruction`: Instruksi Presiden
+- `MinisterialRegulation`: Peraturan Menteri
+- `MinisterialDecision`: Keputusan Menteri
+- `MinisterialInstruction`: Instruksi Menteri
+- `ProvincialRegulation`: Peraturan Daerah Provinsi
+- `RegencyRegulation`: Peraturan Daerah Kabupaten
+- `MunicipalRegulation`: Peraturan Daerah Kota
+- `VillageRegulation`: Peraturan Desa
+
+#### Document Content Types (subtypes of `LegalDocumentContent`):
+- `Chapter`: Bab (identified by "BAB I", "BAB II", etc.)
+- `Part`: Bagian (identified by "Bagian Kesatu", "Bagian Kedua", etc.)
+- `Paragraph`: Paragraf (identified by "Paragraf 1", "Paragraf 2", etc.)
+- `Article`: Pasal (identified by "Pasal 1", "Pasal 2", etc.)
+- `Section`: Ayat (identified by "(1)", "(2)", etc. within an Article)
+- `Item`: Sub-clauses (identified by "a.", "b.", or "1.", "2." within a Section)
+
+#### Rule Expression Types (subtypes of `RuleExpression`):
+- `Norm`: Legal rule of conduct (obligations, permissions, prohibitions)
+- `RuleAct`: Action performed within a norm
+- `Concept`: Legal term or entity mentioned in a clause
+- `CompoundExpression`: Logical groupings (AND/OR/XOR expressions)
+  - `AndExpression`: "dan" conjunction
+  - `OrExpression`: "atau" conjunction
+  - `XorExpression`: "dan/atau" conjunction
+
+#### Amendment Types (subtypes of `LawAmendment`):
+- `LawAddition`: Addition of new content (identified by phrases like "disisipkan", "ditambahkan")
+- `LawModification`: Modification of existing content (identified by "diubah", "diganti")
+- `LawDeletion`: Deletion of existing content (identified by "dihapus", "ditiadakan")
+
+### 2. RELATIONSHIP TYPES
+
+#### General Metadata Relationships:
+- `CONSIDERS`: Links document to consideration matters (found after "Menimbang:")
+- `HAS_DESCRIPTION`: Links to text content
+- `HAS_NAME`: Links to title/name
+- `SAME_AS`: Links to equivalent entity (used for aliases: "yang selanjutnya disebut")
+- `HAS_CREATOR`: Links to creating office (found in preamble)
+- `HAS_DICTUM`: Links to formal statement of issuance (found after "MEMUTUSKAN:")
+- `HAS_ENACTION_DATE`: Links to date of enaction (found in closing)
+- `HAS_ENACTION_OFFICIAL`: Links to enacting official (found in closing)
+- `HAS_PROMULGATION_PLACE`: Links to publication place
+- `HAS_REGULATION_NUMBER`: Links to regulation number
+- `HAS_REGULATION_YEAR`: Links to year of regulation
+- `HAS_LABEL`: Human-readable label
+
+#### Inter-Document Relationships:
+- `AMENDS`: Document A amends Document B (identified by "mengubah")
+- `AMENDED_BY`: Document A is amended by Document B (inverse of AMENDS)
+- `IMPLEMENTS`: Document/Article implements another (identified by "melaksanakan")
+- `HAS_LEGAL_BASIS`: Document has another as legal basis (found after "Mengingat:")
+- `REPEALS`: Document/Article repeals another (identified by "mencabut", "tidak berlaku")
+
+#### Document Content Structure Relationships:
+- `HAS_CONTENT`: Document has chapters or articles as content
+- `HAS_PART`: Element contains sub-elements (hierarchical relationship)
+- `IS_CONTENT_OF`: Inverse of HAS_CONTENT
+- `IS_PART_OF`: Inverse of HAS_PART
+
+#### Document Content Change Relationships:
+- `ADDS`: Article introduces addition
+- `DELETES`: Article deletes content
+- `MODIFIES`: Article modifies content
+- `HAS_ADDITION_CONTENT`: Links to new content being added
+- `HAS_MODIFICATION_TARGET`: Links to content being modified
+
+#### Semantic Clause Relationships:
+- `HAS_ACT`: Links norm/concept to action (connects Norm to RuleAct)
+- `HAS_ACT_TYPE`: Links action to type/verb (connects RuleAct to verb Concept)
+- `HAS_OBJECT`: Links action to object (connects RuleAct to object Concept)
+- `HAS_SUBJECT`: Links norm/act to subject (connects Norm/RuleAct to subject Concept)
+- `HAS_CONDITION`: Links norm/concept to condition (for conditional statements with "jika", "apabila")
+- `HAS_MODALITY`: Links norm to modality (e.g., "harus", "dapat", "wajib")
+- `HAS_QUALIFIER`: Links act to qualifiers (prepositional phrases)
+- `HAS_QUALIFIER_TYPE`: Links qualifier to its type
+- `HAS_QUALIFIER_VALUE`: Links qualifier to its value
+- `HAS_RULE`: Links article/section to rule (connects LegalDocumentContent to Norm/Concept)
+- `REFERS_TO`: Links concept to legal entity (identified by "sebagaimana dimaksud pada", "berdasarkan")
+- `HAS_ELEMENT`: Links compound expression to elements
+
+## EXTRACTION PATTERNS AND EXAMPLES
+
+### 1. Document Identification
+Look for the document header with pattern "UNDANG-UNDANG REPUBLIK INDONESIA NOMOR X TAHUN Y":
+MATCH: "UNDANG-UNDANG REPUBLIK INDONESIA NOMOR 12 TAHUN 2011"
+EXTRACT: {
+"subject": {"text": "UU 12/2011", "type": "LegalDocument", "canonical_id": "LegalDocument::uu-12-2011"},
+"predicate": "has_regulation_number",
+"object": {"text": "12", "type": "Concept", "canonical_id": "Concept::12"}
+}
+
+### 2. Document Structure
+Identify hierarchical content by headings:
+
+**Chapter Example:**
+
+MATCH: "BAB I KETENTUAN UMUM"
+EXTRACT: {
+"subject": {"text": "UU 12/2011", "type": "LegalDocument", "canonical_id": "LegalDocument::uu-12-2011"},
+"predicate": "has_content",
+"object": {"text": "BAB I", "type": "Chapter", "canonical_id": "Chapter::uu-12-2011::bab i"}
+}
+
+**Article Example:**
+
+MATCH: "Pasal 1"
+EXTRACT: {
+"subject": {"text": "BAB I", "type": "Chapter", "canonical_id": "Chapter::uu-12-2011::bab i"},
+"predicate": "has_part",
+"object": {"text": "Pasal 1", "type": "Article", "canonical_id": "Article::uu-12-2011::pasal 1"}
+}
+
+### 3. Definitions and Terminology
+Identify definitions typically in Article 1 with pattern "X adalah Y":
+
+
+MATCH: "Pembentukan Peraturan Perundang-undangan adalah pembuatan Peraturan Perundang-undangan yang mencakup tahapan perencanaan, penyusunan, pembahasan, pengesahan atau penetapan, dan pengundangan."
+EXTRACT: {
+"subject": {"text": "Pembentukan Peraturan Perundang-undangan", "type": "Concept", "canonical_id": "Concept::pembentukan peraturan perundang-undangan"},
+"predicate": "mendefinisikan",
+"object": {"text": "pembuatan Peraturan Perundang-undangan yang mencakup tahapan perencanaan, penyusunan, pembahasan, pengesahan atau penetapan, dan pengundangan", "type": "Concept", "canonical_id": "Concept::pembuatan peraturan perundang-undangan yang mencakup tahapan perencanaan penyusunan pembahasan pengesahan atau penetapan dan pengundangan"}
+}
+
+### 4. Legal Norms
+Identify norms with subject-verb-object patterns and modalities:
+
+
+MATCH: "Menteri harus menetapkan peraturan pelaksanaan undang-undang ini."
+EXTRACT: [
+{
+"subject": {"text": "Norm about ministerial obligation", "type": "Norm", "canonical_id": "Norm::ministerial obligation"},
+"predicate": "has_subject",
+"object": {"text": "Menteri", "type": "Concept", "canonical_id": "Concept::menteri"}
+},
+{
+"subject": {"text": "Norm about ministerial obligation", "type": "Norm", "canonical_id": "Norm::ministerial obligation"},
+"predicate": "has_modality",
+"object": {"text": "harus", "type": "Concept", "canonical_id": "Concept::harus"}
+},
+{
+"subject": {"text": "Norm about ministerial obligation", "type": "Norm", "canonical_id": "Norm::ministerial obligation"},
+"predicate": "has_act",
+"object": {"text": "menetapkan peraturan pelaksanaan", "type": "RuleAct", "canonical_id": "RuleAct::menetapkan peraturan pelaksanaan"}
+},
+{
+"subject": {"text": "menetapkan peraturan pelaksanaan", "type": "RuleAct", "canonical_id": "RuleAct::menetapkan peraturan pelaksanaan"},
+"predicate": "has_object",
+"object": {"text": "peraturan pelaksanaan undang-undang ini", "type": "Concept", "canonical_id": "Concept::peraturan pelaksanaan undang-undang ini"}
+}
+]
+
+### 5. References
+Identify references with pattern "sebagaimana dimaksud pada":
+
+
+MATCH: "Materi Muatan sebagaimana dimaksud pada Pasal 5"
+EXTRACT: {
+"subject": {"text": "Materi Muatan", "type": "Concept", "canonical_id": "Concept::materi muatan"},
+"predicate": "refers_to",
+"object": {"text": "Pasal 5", "type": "Article", "canonical_id": "Article::uu-12-2011::pasal 5"}
+}
+
+### 6. Amendments
+Identify amendments with keywords like "diubah", "disisipkan", "dihapus":
+
+
+MATCH: "Pasal 15 Undang-Undang Nomor 10 Tahun 2004 diubah sehingga berbunyi sebagai berikut:"
+EXTRACT: [
+{
+"subject": {"text": "UU 12/2011", "type": "LegalDocument", "canonical_id": "LegalDocument::uu-12-2011"},
+"predicate": "amends",
+"object": {"text": "UU 10/2004", "type": "LegalDocument", "canonical_id": "LegalDocument::uu-10-2004"}
+},
+{
+"subject": {"text": "UU 12/2011", "type": "LegalDocument", "canonical_id": "LegalDocument::uu-12-2011"},
+"predicate": "modifies",
+"object": {"text": "Pasal 15 UU 10/2004", "type": "LawModification", "canonical_id": "LawModification::pasal 15 uu 10 2004"}
+}
+]
+
+### 7. Conditions
+Identify conditional statements with "jika", "apabila", "dalam hal":
+
+
+MATCH: "Jika diperlukan, Menteri dapat menetapkan Peraturan"
+EXTRACT: [
+{
+"subject": {"text": "Norm about ministerial permission", "type": "Norm", "canonical_id": "Norm::ministerial permission"},
+"predicate": "has_condition",
+"object": {"text": "diperlukan", "type": "Concept", "canonical_id": "Concept::diperlukan"}
+},
+{
+"subject": {"text": "Norm about ministerial permission", "type": "Norm", "canonical_id": "Norm::ministerial permission"},
+"predicate": "has_subject",
+"object": {"text": "Menteri", "type": "Concept", "canonical_id": "Concept::menteri"}
+},
+{
+"subject": {"text": "Norm about ministerial permission", "type": "Norm", "canonical_id": "Norm::ministerial permission"},
+"predicate": "has_modality",
+"object": {"text": "dapat", "type": "Concept", "canonical_id": "Concept::dapat"}
+}
+]
+
+### 8. Compound Expressions
+Identify conjunctions "dan", "atau", "dan/atau":
+
+
+MATCH: "perencanaan, penyusunan, pembahasan, pengesahan atau penetapan, dan pengundangan"
+EXTRACT: {
+"subject": {"text": "stages of law formation", "type": "CompoundExpression", "canonical_id": "CompoundExpression::stages of law formation"},
+"predicate": "has_element",
+"object": {"text": "perencanaan", "type": "Concept", "canonical_id": "Concept::perencanaan"}
+}
+
+
+OUTPUT REQUIREMENTS:
+Extract meaningful triples in JSON format. Every triple must include:
+- subject: entity node with text, type, and canonical_id
+- predicate: relationship type (lowercase, snake_case)
+- object: entity node with text, type, and canonical_id
+
+RULES:
+- Be precise and grounded in the text; never invent relationships
+- Include proper metadata (document number, article reference)
+- Extract both document structure and semantic meaning
+- For definitions, use subject "mendefinisikan" object pattern
+- For amendments, identify exact content being changed
+- Normalize predicates to lowercase Indonesian phrases
+- Use specific node types rather than generic ones
+- Ensure canonical_id follows pattern: "type::normalized_text"
+
+EXTRACTION PRIORITIES:
+1. Document metadata (number, year, creator)
+2. Document structure (chapters, articles, sections)
+3. Inter-document relationships (amends, repeals)
+4. Legal norms (obligations, permissions, prohibitions)
+5. Semantic relationships (subject-action-object)
+6. Concept definitions and references
+
+ONLY OUTPUT JSON WITHOUT ANY OTHER TEXT, starting with {\"triples\": [.......
+"""
+
+LEGAL_NODE_LABELS = [
+    "LegalDocument", "LegalDocumentContent", "RuleExpression",
+    "LawAmendment", "PlaceOfPromulgation", "Person", "Office", "City"
+]
+LEGAL_DOCUMENT_TYPES = [
+    "Constitution", "AmendmentToTheConstitution", "PeoplesConsultativeAssemblyResolution",
+    "Act", "GovernmentRegulationInLieuOfAct", "GovernmentRegulation", "PresidentialRegulation",
+    "PresidentialDecree", "PresidentialInstruction", "MinisterialRegulation",
+    "MinisterialDecision", "MinisterialInstruction", "ProvincialRegulation",
+    "RegencyRegulation", "MunicipalRegulation", "VillageRegulation"
+]
+LEGAL_CONTENT_TYPES = ["Chapter","Part","Paragraph","Article","Section","Item"]
+RULE_EXPRESSION_TYPES = ["Norm","RuleAct","Concept","CompoundExpression","AndExpression","OrExpression","XorExpression"]
+LAW_AMENDMENT_TYPES = ["LawAmendment","LawAddition","LawModification","LawDeletion"]
+
+ALLOWED_NODE_TYPES: List[str] = sorted(set(
+    ["LegalDocument", "LegalDocumentContent", "RuleExpression", "LawAmendment",
+     "PlaceOfPromulgation", "Person", "Office", "City"] +
+    LEGAL_DOCUMENT_TYPES +
+    LEGAL_CONTENT_TYPES +
+    RULE_EXPRESSION_TYPES +
+    LAW_AMENDMENT_TYPES
+))
+
+# ----------------- Prompt builders (unchanged behavior) -----------------
+def build_single_prompt(meta: Dict[str, Any], chunk_text: str) -> str:
+    return f"""
+{SYSTEM_HINT}
+
+Chunk metadata:
+- document_id: {meta.get('document_id')}
+- chunk_id: {meta.get('chunk_id')}
+- uu_number: {meta.get('uu_number')}
+- pages: {meta.get('pages')}
+
+Extract knowledge graph triples using the LexID ontology described above. Extract as many relevant and accurate triples as you can find in the text.
+
+Text:
+\"\"\"{chunk_text}\"\"\"
+"""
+
+def build_batch_prompt(items: List[Dict[str, Any]]) -> str:
+    intro = f"{SYSTEM_HINT}\n\n" + """
+You will receive several chunks. Return JSON with a top-level key 'results' (array).
+Each element must be an object with the following shape:
+{
+  "chunk_id": "<chunk id string>",
+  "triples": [
+    {
+      "subject": {
+        "text": "string",
+        "type": "one of the allowed node types described above",
+        "canonical_id": "string"
+      },
+      "predicate": "string",
+      "object": {
+        "text": "string",
+        "type": "one of the allowed node types described above",
+        "canonical_id": "string"
+      }
+    }
+  ]
+}
+Notes:
+- 'triples' must follow the LexID ontology and constraints above.
+- Use only the provided chunk text; do not invent information.
+- All fields shown are required.
+"""
+    lines = []
+    for it in items:
+        m = it["meta"]
+        lines.append(
+            f"- chunk_id: {m.get('chunk_id')} | document_id: {m.get('document_id')} | uu_number: {m.get('uu_number')} | pages: {m.get('pages')}\n"
+            f"TEXT:\n\"\"\"{it['text']}\"\"\""
+        )
+    return intro + "\n\nChunks:\n" + "\n\n".join(lines)
+
+TRIPLE_SCHEMA = {
+  "type": "object",
+  "properties": {
+    "triples": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "subject": {
+            "type": "object",
+            "properties": {
+              "text": {"type": "string"},
+              "type": {"type": "string", "enum": ALLOWED_NODE_TYPES},
+              "canonical_id": {"type": "string"}
+            },
+            "required": ["text", "type", "canonical_id"]
+          },
+          "predicate": {"type": "string"},
+          "object": {
+            "type": "object",
+            "properties": {
+              "text": {"type": "string"},
+              "type": {"type": "string", "enum": ALLOWED_NODE_TYPES},
+              "canonical_id": {"type": "string"}
+            },
+            "required": ["text", "type", "canonical_id"]
+          }
+        },
+        "required": ["subject", "predicate", "object"]
+      }
+    }
+  },
+  "required": ["triples"]
+}
+
+BATCH_TRIPLE_SCHEMA = {
+  "type": "object",
+  "properties": {
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "chunk_id": {"type": "string"},
+          "triples": TRIPLE_SCHEMA["properties"]["triples"]
+        },
+        "required": ["chunk_id", "triples"]
+      }
+    }
+  },
+  "required": ["results"]
+}
+
+# ----------------- Attempt ID generator -----------------
+_attempt_lock = threading.Lock()
+_attempt_counter = 0
+
+def next_attempt_id() -> int:
+    global _attempt_counter
+    with _attempt_lock:
+        aid = _attempt_counter
+        _attempt_counter += 1
+        return aid
+
+# ----------------- Early stop (attempt-id cap) -----------------
+MAX_ATTEMPT_ID = int(os.getenv("MAX_ATTEMPT_ID", "325"))
+
+class EarlyStop(Exception):
+    def __init__(self, message: str, attempt_id: Optional[int] = None):
+        super().__init__(message)
+        self.attempt_id = attempt_id
+
+STOP_EVENT = threading.Event()
+
+def request_stop(reason: str = ""):
+    if not STOP_EVENT.is_set():
+        STOP_EVENT.set()
+        log_warn(f"[STOP] Early stop requested. Reason: {reason}")
+
+def should_stop() -> bool:
+    return STOP_EVENT.is_set()
+
+# ----------------- Rate Limiter (LLM) -----------------
+class RateLimitError(Exception):
+    def __init__(self, message: str, attempt_id: int, category: str = "unknown", reason: str = "", json_path: Optional[str] = None):
+        super().__init__(message)
+        self.attempt_id = attempt_id
+        self.category = category
+        self.reason = reason
+        self.json_path = json_path
+
+class JsonParseError(Exception):
+    def __init__(self, message: str, attempt_id: int, json_path: Optional[str] = None):
+        super().__init__(message)
+        self.attempt_id = attempt_id
+        self.json_path = json_path
+
+class LlmCallError(RuntimeError):
+    def __init__(self, message: str, attempt_id: int, json_path: Optional[str] = None):
+        super().__init__(message)
+        self.attempt_id = attempt_id
+        self.json_path = json_path
+
+class RateLimiter:
+    def __init__(self, max_calls: int, period_sec: float):
+        self.max_calls = max_calls
+        self.period = period_sec
+        self.calls = deque()
+        self.lock = threading.Lock()
+
+    def acquire(self, attempt_id: Optional[int] = None):
+        with self.lock:
+            now = time.time()
+            while self.calls and (now - self.calls[0]) >= self.period:
+                self.calls.popleft()
+            wait = 0.0
+            if len(self.calls) >= self.max_calls:
+                wait = self.period - (now - self.calls[0])
+        if wait > 0:
+            log_info(f"[RateLimiter] Sleeping {wait:.2f}s to respect client-side RPM limit", attempt_id=attempt_id)
+            time.sleep(wait)
+        with self.lock:
+            self.calls.append(time.time())
+
+LLM_RATE_LIMITER = RateLimiter(max_calls=LLM_MAX_CALLS_PER_MIN, period_sec=60.0)
+
+# ----------------- Global API Budget -----------------
+class ApiBudget:
+    def __init__(self, total: int, enforce: bool, count_embeddings: bool):
+        self.total = total
+        self.enforce = enforce
+        self.count_embeddings = count_embeddings
+        self.used = 0
+        self.lock = threading.Lock()
+        self.resource_usage = {"llm": 0, "embed": 0}
+
+    def _should_count(self, kind: str) -> bool:
+        if kind == "embed" and not self.count_embeddings:
+            return False
+        return True
+
+    def will_allow(self, kind: str, n: int = 1) -> bool:
+        if not self.enforce or not self._should_count(kind):
+            return True
+        with self.lock:
+            return (self.used + n) <= self.total
+
+    def register(self, kind: str, n: int = 1):
+        if not self.enforce or not self._should_count(kind):
+            return
+        with self.lock:
+            if (self.used + n) > self.total:
+                raise RuntimeError(f"API budget exceeded: used={self.used}, trying={n}, total={self.total}")
+            self.used += n
+            self.resource_usage[kind] = self.resource_usage.get(kind, 0) + n
+
+API_BUDGET = ApiBudget(total=API_BUDGET_TOTAL, enforce=ENFORCE_API_BUDGET, count_embeddings=COUNT_EMBEDDINGS_IN_BUDGET)
+
+# ----------------- Helpers -----------------
+def _slug(s: str) -> str:
+    return " ".join((s or "").strip().split()).lower()
+
+def sanitize_filename_component(s: str) -> str:
+    s = (s or "").strip().lower().replace(" ", "-")
+    s = re.sub(r"[^a-z0-9_\-+]", "", s)
+    s = re.sub(r"-{2,}", "-", s)
+    return s or "unknown"
+
+def normalize_entity_key(text: str, etype: str, uu_number: Optional[str] = None) -> str:
+    text_slug = re.sub(r'[^\w\s-]', '', (text or "").strip().lower())
+    text_slug = re.sub(r'\s+', '-', text_slug)
+    if etype in ("LegalDocument",) or etype in LEGAL_DOCUMENT_TYPES:
+        if uu_number:
+            return f"{etype}::uu-{uu_number.replace('/', '-')}"
+        return f"{etype}::{text_slug}"
+    if etype in LEGAL_CONTENT_TYPES or etype == "LegalDocumentContent":
+        if uu_number:
+            return f"{etype}::uu-{uu_number.replace('/', '-')}::{text_slug}"
+        return f"{etype}::{text_slug}"
+    if etype in RULE_EXPRESSION_TYPES or etype == "RuleExpression":
+        return f"{etype}::{text_slug}"
+    if etype in LAW_AMENDMENT_TYPES or etype == "LawAmendment":
+        prefix = f"uu-{uu_number.replace('/', '-')}-" if uu_number else ""
+        return f"{etype}::{prefix}{text_slug}"
+    return f"{etype}::{text_slug}"
+
+def deterministic_triple_uid(subject_key: str, predicate: str, object_key: str, doc_id: Optional[str], span: Optional[Tuple[int,int]]) -> str:
+    h = hashlib.sha256()
+    payload = "|".join([
+        subject_key,
+        (predicate or "").strip().lower().replace(" ", "_"),
+        object_key,
+        doc_id or "",
+        str(span[0]) if span else "",
+        str(span[1]) if span else ""
+    ])
+    h.update(payload.encode("utf-8"))
+    return h.hexdigest()
+
+def estimate_tokens_for_text(text: str) -> int:
+    return max(1, int(len(text) / 3.5))
+
+def aggregate_pages(items_metas: List[Dict[str, Any]]) -> List[int]:
+    pages: set[int] = set()
+    for m in items_metas:
+        p = m.get("pages")
+        if isinstance(p, (list, tuple, set)):
+            for x in p:
+                if isinstance(x, int):
+                    pages.add(x)
+                elif isinstance(x, str):
+                    for tok in re.split(r"[,\s\-]+", x):
+                        if tok.isdigit():
+                            pages.add(int(tok))
+        elif isinstance(p, int):
+            pages.add(p)
+        elif isinstance(p, str):
+            for tok in re.split(r"[,\s\-]+", p):
+                if tok.isdigit():
+                    pages.add(int(tok))
+    return sorted(pages)
+
+def build_json_output_filename(context: Dict[str, Any]) -> Path:
+    kind = context.get("kind", "batch")
+    items_metas: List[Dict[str, Any]] = context.get("items_metas", [])
+    items_count = context.get("items_count", len(items_metas) or "?")
+    by_uu: Dict[str, List[int]] = {}
+    for m in items_metas:
+        uu = m.get("uu_number") or "unknown"
+        by_uu.setdefault(uu, [])
+        ps = m.get("pages")
+        page_set: set[int] = set()
+        if isinstance(ps, (list, tuple, set)):
+            for x in ps:
+                if isinstance(x, int):
+                    page_set.add(x)
+                elif isinstance(x, str):
+                    for tok in re.split(r"[,\s\-]+", x):
+                        if tok.isdigit():
+                            page_set.add(int(tok))
+        elif isinstance(ps, int):
+            page_set.add(ps)
+        elif isinstance(ps, str):
+            for tok in re.split(r"[,\s\-]+", ps):
+                if tok.isdigit():
+                    page_set.add(int(tok))
+        by_uu[uu].extend(sorted(page_set))
+
+    def pages_label(pages: List[int]) -> str:
+        if not pages:
+            return "p-unknown"
+        sp = sorted(set(pages))
+        if len(sp) == 1:
+            return f"p-{sp[0]}"
+        return f"p-{sp[0]}-{sp[-1]}"
+
+    if not by_uu:
+        uu_lab = "uu-unknown"
+    else:
+        segs = []
+        for uu, pages in sorted(by_uu.items(), key=lambda kv: sanitize_filename_component(str(kv[0]))):
+            uu_norm = sanitize_filename_component(str(uu))
+            segs.append(f"uu-{uu_norm}__{pages_label(pages)}")
+        uu_lab = "+".join(segs)
+
+    chunk_ids = [m.get("chunk_id") or "" for m in items_metas]
+    short = hashlib.sha1("|".join(sorted(chunk_ids)).encode("utf-8")).hexdigest()[:8]
+    ts = time.strftime("%Y%m%d-%H%M%S")
+
+    fname = f"{uu_lab}__{kind}__{items_count}__{ts}_{short}.json"
+    return (JSON_OUTPUT_DIR / fname)
+
+def save_llm_json_output(data: Dict[str, Any], context: Dict[str, Any], attempt_id: int) -> Path:
+    out_path = build_json_output_filename(context)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    log_info(f"[LLM] Saved JSON output: {out_path}", attempt_id=attempt_id)
+    return out_path
+
+def save_error_json_output(error_stub: Dict[str, Any], context: Dict[str, Any], attempt_id: int, err_type: str) -> Path:
+    base_path = build_json_output_filename(context)
+    err_type_sanitized = sanitize_filename_component(err_type)
+    prefixed_name = f"[ERROR {err_type_sanitized}] {base_path.name}"
+    out_path = base_path.with_name(prefixed_name)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(error_stub, f, ensure_ascii=False, indent=2)
+    log_warn(f"[LLM] Saved ERROR JSON output ({err_type}): {out_path}", attempt_id=attempt_id)
+    return out_path
+
+def split_text_in_two(text: str) -> Tuple[str, str]:
+    n = len(text)
+    mid = n // 2
+    return text[:mid], text[mid:]
+
+# ----------------- Predicate and label helpers -----------------
+def normalize_predicate(pred: Optional[str]) -> str:
+    p = (pred or "").strip().lower()
+    p = p.replace("-", "_").replace(" ", "_")
+    p = re.sub(r"[^a-z0-9_]", "", p)
+    return p or "rel"
+
+def get_base_label(specific_type: str) -> str:
+    if specific_type in LEGAL_DOCUMENT_TYPES or specific_type == "LegalDocument":
+        return "LegalDocument"
+    if specific_type in LEGAL_CONTENT_TYPES or specific_type == "LegalDocumentContent":
+        return "LegalDocumentContent"
+    if specific_type in RULE_EXPRESSION_TYPES or specific_type == "RuleExpression":
+        return "RuleExpression"
+    if specific_type in LAW_AMENDMENT_TYPES or specific_type == "LawAmendment":
+        return "LawAmendment"
+    return specific_type
+
+def labels_for_type(specific_type: str) -> str:
+    base = get_base_label(specific_type)
+    if base == specific_type:
+        return specific_type
+    return f"{specific_type}:{base}"
+
+def is_deadlock_error(e: Exception) -> bool:
+    if not isinstance(e, Neo4jError):
+        return False
+    code = getattr(e, "code", "") or ""
+    # Neo4j reports: Neo.TransientError.Transaction.DeadlockDetected
+    return "DeadlockDetected" in code
+
+# ----------------- LLM call wrapper (unchanged, but logs preserved) -----------------
+def is_rate_limit_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    if "429" in msg or "rate limit" in msg or "too many requests" in msg or "quota" in msg or "resourceexhausted" in msg or "resource exhausted" in msg:
+        return True
+    code = getattr(e, "code", None)
+    if code == 429:
+        return True
+    status = getattr(e, "status", None) or getattr(e, "reason", None)
+    if isinstance(status, str) and ("exhausted" in status.lower() or "429" in status):
+        return True
+    return False
+
+def classify_rate_limit_error(e: Exception) -> Tuple[str, str]:
+    msg = (str(e) or "").lower()
+    if "quota" in msg or "exceeded your current quota" in msg or "billing" in msg:
+        return "quota", "quota exceeded"
+    if "rate" in msg or "too many requests" in msg or "resource exhausted" in msg or "exhausted" in msg:
+        return "rpm", "request rate exceeded"
+    return "unknown", "unclassified 429"
+
+def run_llm_json(prompt: str, schema: dict, context: Dict[str, Any]) -> Tuple[Dict[str, Any], float, int, Optional[str]]:
+    if should_stop():
+        raise EarlyStop("Early stop already requested; skipping LLM call.")
+    if not API_BUDGET.will_allow("llm", 1):
+        raise RuntimeError("API budget would be exceeded by another LLM call; stopping extraction.")
+
+    attempt_id = next_attempt_id()
+    if attempt_id >= MAX_ATTEMPT_ID:
+        request_stop(f"attempt_id reached {attempt_id} (cap={MAX_ATTEMPT_ID})")
+        raise EarlyStop(f"attempt_id reached {attempt_id}", attempt_id=attempt_id)
+
+    LLM_RATE_LIMITER.acquire(attempt_id=attempt_id)
+
+    items_metas: List[Dict[str, Any]] = context.get("items_metas", [])
+    chunk_ids = [m.get("chunk_id") for m in items_metas if m.get("chunk_id")]
+    uu_numbers = list(sorted({m.get("uu_number") for m in items_metas if m.get("uu_number")}))
+    doc_ids = list(sorted({m.get("document_id") for m in items_metas if m.get("document_id")}))
+
+    try:
+        kind = context.get("kind", "unknown")
+        items_count = context.get("items_count", "?")
+        token_est = estimate_tokens_for_text(prompt)
+        log_info(
+            f"[LLM] Attempt: model={LOCAL_GEN_MODEL} | kind={kind} | items={items_count} | est_tokens~{token_est} | "
+            f"chunk_ids={chunk_ids} | docs={doc_ids} | uu={uu_numbers}",
+            attempt_id=attempt_id
+        )
+    except Exception:
+        log_info(f"[LLM] Attempt: model={LOCAL_GEN_MODEL}", attempt_id=attempt_id)
+
+    start = time.time()
+    try:
+        completion = lmstudio_client.chat.completions.create(
+            model=LOCAL_GEN_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            response_format={"type": "text"},
+        )
+    except Exception as e:
+        dur = time.time() - start
+        err_cat, err_reason = ("unknown", "unclassified")
+        if is_rate_limit_error(e):
+            err_cat, err_reason = classify_rate_limit_error(e)
+            err_type = f"ratelimit-{err_cat}"
+        else:
+            err_type = "llmcall"
+        error_stub = {
+            "error": {"type": err_type, "category": err_cat, "reason": err_reason, "message": str(e)},
+            "attempt_id": attempt_id,
+            "context": {"kind": context.get("kind"), "items_count": context.get("items_count"), "chunk_ids": chunk_ids, "uu_numbers": uu_numbers, "document_ids": doc_ids}
+        }
+        error_path = save_error_json_output(error_stub, context, attempt_id=attempt_id, err_type=err_type)
+        if is_rate_limit_error(e):
+            cat, reason = classify_rate_limit_error(e)
+            raise RateLimitError(f"LLM rate limit error ({cat}): {e}", attempt_id=attempt_id, category=cat, reason=reason, json_path=str(error_path)) from e
+        raise LlmCallError(f"LLM call failed: {e}", attempt_id=attempt_id, json_path=str(error_path)) from e
+
+    dur = time.time() - start
+
+    raw = None
+    try:
+        raw = completion.choices[0].message.content
+        
+        # Clean up potential markdown formatting (```json ... ```)
+        clean_raw = raw.strip()
+        if clean_raw.startswith("```json"):
+            clean_raw = clean_raw[7:]
+        elif clean_raw.startswith("```"):
+            clean_raw = clean_raw[3:]
+        if clean_raw.endswith("```"):
+            clean_raw = clean_raw[:-3]
+        clean_raw = clean_raw.strip()
+        
+        data = json.loads(clean_raw)
+    except Exception as e:
+        preview = raw if isinstance(raw, str) else "None"
+        error_stub = {
+            "error": {"type": "jsonparseerror", "message": str(e), "raw_preview": preview},
+            "attempt_id": attempt_id,
+            "context": {"kind": context.get("kind"), "items_count": context.get("items_count"), "chunk_ids": chunk_ids, "uu_numbers": uu_numbers, "document_ids": doc_ids}
+        }
+        error_path = save_error_json_output(error_stub, context, attempt_id=attempt_id, err_type="jsonparseerror")
+        raise JsonParseError(f"Failed to parse model JSON: {e}; raw_preview={preview[:200]}", attempt_id=attempt_id, json_path=str(error_path)) from e
+
+    API_BUDGET.register("llm", 1)
+    out_path = save_llm_json_output(data, context, attempt_id=attempt_id)
+    return data, dur, attempt_id, str(out_path)
+
+def _clamp01(x, default=0.5) -> float:
+    try:
+        v = float(x)
+    except Exception:
+        return default
+    return 0.0 if v < 0.0 else 1.0 if v > 1.0 else v
+
+# ----------------- LLM Extraction (single attempt) -----------------
+def extract_triples_from_chunk(chunk_text: str, meta: Dict[str, Any], prompt_override: Optional[str] = None) -> Tuple[List[Dict[str, Any]], float, int, Optional[str]]:
+    prompt = prompt_override or build_single_prompt(meta, chunk_text)
+    data, gemini_duration, attempt_id, json_path = run_llm_json(
+        prompt, TRIPLE_SCHEMA,
+        context={"kind": "single", "items_count": 1, "chunk_id": meta.get("chunk_id"), "items_metas": [meta]}
+    )
+
+    uu_number = meta.get("uu_number")
+    triples: List[Dict[str, Any]] = []
+    for t in data.get("triples", []):
+        subj = t["subject"]; obj = t["object"]; pred_raw = t.get("predicate")
+        pred = normalize_predicate(pred_raw)
+        s_type = subj.get("type") or "Concept"
+        o_type = obj.get("type") or "Concept"
+        s_key = normalize_entity_key(subj["text"], s_type, uu_number)
+        o_key = normalize_entity_key(obj["text"],  o_type,  uu_number)
+
+        span = None
+        triple_uid = deterministic_triple_uid(s_key, pred, o_key, meta.get("document_id"), span)
+
+        triples.append({
+            "triple_uid": triple_uid,
+            "subject": {
+                "text": subj["text"], "type": s_type, "key": s_key,
+                "canonical_id": subj["canonical_id"]
+            },
+            "predicate": pred,
+            "object": {
+                "text": obj["text"], "type": o_type, "key": o_key,
+                "canonical_id": obj["canonical_id"]
+            },
+            "provenance": {
+                "document_id": meta.get("document_id"),
+                "chunk_id": meta.get("chunk_id"),
+                "uu_number": uu_number,
+                "pages": meta.get("pages"),
+            }
+        })
+    return triples, gemini_duration, attempt_id, json_path
+
+def extract_triples_from_chunks_batch(items: List[Dict[str, Any]], prompt: str) -> Tuple[Dict[str, List[Dict[str, Any]]], float, int, Optional[str]]:
+    metas = [it["meta"] for it in items]
+    data, gemini_duration, attempt_id, json_path = run_llm_json(
+        prompt, BATCH_TRIPLE_SCHEMA,
+        context={"kind": "batch", "items_count": len(items), "items_metas": metas}
+    )
+
+    results_map: Dict[str, List[Dict[str, Any]]] = {}
+    meta_map = {it["meta"]["chunk_id"]: it["meta"] for it in items}
+
+    for res in data.get("results", []):
+        cid = res.get("chunk_id")
+        if not cid or cid not in meta_map:
+            continue
+        meta = meta_map[cid]
+        uu_number = meta.get("uu_number")
+        triples_for_chunk: List[Dict[str, Any]] = []
+        for t in res.get("triples", []):
+            subj = t["subject"]; obj = t["object"]; pred_raw = t.get("predicate")
+            pred = normalize_predicate(pred_raw)
+            s_type = subj.get("type") or "Concept"
+            o_type = obj.get("type") or "Concept"
+            s_key = normalize_entity_key(subj["text"], s_type, uu_number)
+            o_key = normalize_entity_key(obj["text"],  o_type,  uu_number)
+
+            span = None
+            triple_uid = deterministic_triple_uid(s_key, pred, o_key, meta.get("document_id"), span)
+
+            triples_for_chunk.append({
+                "triple_uid": triple_uid,
+                "subject": {
+                    "text": subj["text"], "type": s_type, "key": s_key,
+                    "canonical_id": subj["canonical_id"]
+                },
+                "predicate": pred,
+                "object": {
+                    "text": obj["text"], "type": o_type, "key": o_key,
+                    "canonical_id": obj["canonical_id"]
+                },
+                "provenance": {
+                    "document_id": meta.get("document_id"),
+                    "chunk_id": meta.get("chunk_id"),
+                    "uu_number": uu_number,
+                    "pages": meta.get("pages"),
+                }
+            })
+        results_map[cid] = triples_for_chunk
+
+    return results_map, gemini_duration, attempt_id, json_path
+
+# ----------------- Embeddings -----------------
+# BGE-M3 embedding lock (FlagEmbedding model is NOT thread-safe for encode; serialize calls)
+_bge_lock = threading.Lock()
+
+def embed_text(text: str) -> Tuple[List[float], float]:
+    if not API_BUDGET.will_allow("embed", 1):
+        raise RuntimeError("API budget would be exceeded by another embedding call; stopping embedding.")
+    start = time.time()
+    with _bge_lock:
+        result = _bge_model.encode(
+            [text],
+            batch_size=1,
+            max_length=8192,
+            return_dense=True,
+            return_sparse=False,
+            return_colbert_vecs=False,
+        )
+    vec: List[float] = result["dense_vecs"][0].tolist()
+    dur = time.time() - start
+    API_BUDGET.register("embed", 1)
+    return vec, dur
+
+def node_embedding_text(name: str, etype: str) -> str:
+    return f"{(name or '').strip()} | {etype}"
+
+def triple_embedding_text(t: Dict[str, Any]) -> str:
+    s = t["subject"]["text"]; p = t["predicate"]; o = t["object"]["text"]
+    uu = t["provenance"].get("uu_number") or ""
+    return f"{s} [{p}] {o} | {uu}"
+
+# ----------------- Neo4j driver + schema helpers -----------------
+driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+
+# Caches to avoid repeated embedding calls
+_entity_emb_cache: dict[str, List[float]] = {}
+_triple_emb_cache: dict[str, List[float]] = {}
+_entity_emb_cache_lock = threading.Lock()
+_triple_emb_cache_lock = threading.Lock()
+
+def create_key_constraints_and_base_indexes():
+    labels_for_key = [
+        "LegalDocument","LegalDocumentContent","RuleExpression",
+        "LawAmendment","PlaceOfPromulgation","Person","Office","City"
+    ]
+    constraint_cmds = []
+    for lab in labels_for_key:
+        constraint_cmds.append(f"CREATE CONSTRAINT {lab.lower()}_key_unique IF NOT EXISTS FOR (n:{lab}) REQUIRE n.key IS UNIQUE")
+    # Keep your existing constraints if they already exist; we just ensure 'key' is indexed/unique for MERGE.
+    with driver.session() as session:
+        for cmd in constraint_cmds:
+            try:
+                session.run(cmd).consume()
+                log_info(f"Ensured constraint: {cmd}")
+            except Neo4jError as e:
+                log_warn(f"Constraint ensure failed: {e}")
+
+    # Triple UID uniqueness (ensure present)
+    with driver.session() as session:
+        try:
+            session.run("CREATE CONSTRAINT triple_uid IF NOT EXISTS FOR (t:Triple) REQUIRE t.triple_uid IS UNIQUE").consume()
+            log_info("Ensured constraint: Triple(triple_uid) unique")
+        except Neo4jError as e:
+            log_warn(f"Constraint ensure failed for Triple: {e}")
+
+def drop_vector_indexes():
+    idx_names = ["document_vec","content_vec","expression_vec","triple_vec"]
+    with driver.session() as session:
+        for name in idx_names:
+            try:
+                session.run(f"DROP INDEX {name} IF EXISTS").consume()
+                log_info(f"Dropped vector index if existed: {name}")
+            except Neo4jError as e:
+                log_warn(f"Could not drop vector index {name}: {e}")
+
+def create_vector_indexes():
+    cmds = [
+        f"CREATE VECTOR INDEX document_vec IF NOT EXISTS FOR (d:LegalDocument) ON (d.embedding) OPTIONS {{ indexConfig: {{ `vector.dimensions`: {EMBED_DIM}, `vector.similarity_function`: 'COSINE' }} }}",
+        f"CREATE VECTOR INDEX content_vec IF NOT EXISTS FOR (c:LegalDocumentContent) ON (c.embedding) OPTIONS {{ indexConfig: {{ `vector.dimensions`: {EMBED_DIM}, `vector.similarity_function`: 'COSINE' }} }}",
+        f"CREATE VECTOR INDEX expression_vec IF NOT EXISTS FOR (e:RuleExpression) ON (e.embedding) OPTIONS {{ indexConfig: {{ `vector.dimensions`: {EMBED_DIM}, `vector.similarity_function`: 'COSINE' }} }}",
+        f"CREATE VECTOR INDEX triple_vec IF NOT EXISTS FOR (t:Triple) ON (t.embedding) OPTIONS {{ indexConfig: {{ `vector.dimensions`: {EMBED_DIM}, `vector.similarity_function`: 'COSINE' }} }}",
+    ]
+    with driver.session() as session:
+        for cmd in cmds:
+            try:
+                session.run(cmd).consume()
+                log_info(f"Created vector index: {cmd.split(' IF ')[0]}")
+            except Neo4jError as e:
+                log_warn(f"Could not create vector index: {e}")
+
+# ----------------- Embedding getters with cache -----------------
+def _get_entity_emb(name: str, etype: str, key: str) -> Tuple[List[float], float]:
+    with _entity_emb_cache_lock:
+        cached = _entity_emb_cache.get(key)
+    if cached is not None:
+        return cached, 0.0
+    vec, dur = embed_text(node_embedding_text(name, etype))
+    with _entity_emb_cache_lock:
+        _entity_emb_cache[key] = vec
+    return vec, dur
+
+def _get_triple_emb(triple_uid: str, t: Dict[str, Any]) -> Tuple[List[float], float]:
+    with _triple_emb_cache_lock:
+        cached = _triple_emb_cache.get(triple_uid)
+    if cached is not None:
+        return cached, 0.0
+    vec, dur = embed_text(triple_embedding_text(t))
+    with _triple_emb_cache_lock:
+        _triple_emb_cache[triple_uid] = vec
+    return vec, dur
+
+# ----------------- Write logic (batched per chunk; embeddings only on create) -----------------
+# IMPORTANT CHANGES:
+# - We no longer MERGE a typed relationship by property (that caused scans and your syntax errors).
+# - We use a single fixed relationship type :PREDICATE from subject to object.
+# - We create that :PREDICATE relationship ONLY when the Triple node is newly created (no duplicates).
+# - We set embeddings only on CREATE (no rewriting on every upsert).
+
+PREDICATE_REL_TYPE = "PREDICATE"
+
+def upsert_triple_in_tx(tx, t: Dict[str, Any], s_emb: List[float], o_emb: List[float], tr_emb: List[float]) -> float:
+    s, o = t["subject"], t["object"]
+    s_name, s_type, s_key = s["text"], s["type"], s["key"]
+    o_name, o_type, o_key = o["text"], o["type"], o["key"]
+    pred = t["predicate"]  # normalized lower_snake_case
+    triple_uid = t["triple_uid"]
+
+    prov = t["provenance"]
+
+    s_label_str = labels_for_type(s_type)    # e.g., "Act:LegalDocument"
+    o_label_str = labels_for_type(o_type)    # e.g., "Concept:RuleExpression" etc.
+
+    # Build Cypher with fixed :PREDICATE relationship and embeddings only on create
+    # We also avoid dynamic relationship types to prevent numeric-start errors (e.g., ":1177GOO").
+    cypher = f"""
+    // SUBJECT node
+    MERGE (s:{s_label_str} {{key:$s_key}})
+      ON CREATE SET s.name=$s_name, s.type=$s_type, s.createdAt=timestamp(), s.embedding=$s_emb
+      ON MATCH SET  s.name = coalesce(s.name, $s_name), s.type = coalesce(s.type, $s_type)
+
+    // OBJECT node
+    MERGE (o:{o_label_str} {{key:$o_key}})
+      ON CREATE SET o.name=$o_name, o.type=$o_type, o.createdAt=timestamp(), o.embedding=$o_emb
+      ON MATCH SET  o.name = coalesce(o.name, $o_name), o.type = coalesce(o.type, $o_type)
+
+    // Triple node (unique) — embed only on create; use wasCreated flag
+    MERGE (tr:Triple {{triple_uid:$triple_uid}})
+      ON CREATE SET tr.createdAt=timestamp(), tr.embedding=$tr_emb, tr.wasCreated=true
+      ON MATCH  SET tr.wasCreated=false
+    SET tr.predicate=$pred,
+        tr.document_id=$doc_id,
+        tr.chunk_id=$chunk_id,
+        tr.uu_number=$uu_number,
+        tr.pages=$pages
+
+    // Connect Triple -> subject/object (idempotent and low-degree; MERGE is fine)
+    MERGE (tr)-[:SUBJECT]->(s)
+    MERGE (tr)-[:OBJECT]->(o)
+
+    // Create one convenience edge s-[:PREDICATE]->o ONLY when triple is newly created in THIS statement
+    FOREACH (_ IN CASE WHEN tr.wasCreated THEN [1] ELSE [] END |
+      CREATE (s)-[r:{PREDICATE_REL_TYPE} {{triple_uid:$triple_uid, predicate:$pred, chunk_id:$chunk_id, document_id:$doc_id}}]->(o)
+    )
+    """
+    start = time.time()
+    tx.run(
+        cypher,
+        s_key=s_key, s_name=s_name, s_type=s_type, s_emb=s_emb,
+        o_key=o_key, o_name=o_name, o_type=o_type, o_emb=o_emb,
+        triple_uid=triple_uid, pred=pred, tr_emb=tr_emb,
+        doc_id=prov.get("document_id"),
+        chunk_id=prov.get("chunk_id"),
+        uu_number=prov.get("uu_number"),
+        pages=prov.get("pages", []),
+    )
+    return time.time() - start
+
+def write_triples_for_chunk(triples: List[Dict[str, Any]]) -> Tuple[int, float, float, Dict[str, Any]]:
+    """
+    Single transaction per chunk; embeddings set only on CREATE.
+    Retries transparently on Neo.TransientError.Transaction.DeadlockDetected without re-running LLM
+    or splitting batches. Embeddings are computed once and reused across retries.
+
+    Return: written_count, total_embedding_duration, total_neo4j_duration, embed_stats
+    """
+    if not triples:
+        return 0, 0.0, 0.0, {'entity_new_calls':0,'entity_cached':0,'entity_new_dur':0.0,'triple_new_calls':0,'triple_cached':0,'triple_new_dur':0.0}
+
+    # 1) Precompute embeddings ONCE (cache already helps, but we also avoid recounting on retry)
+    total_emb_dur = 0.0
+    embed_stats = {'entity_new_calls':0,'entity_cached':0,'entity_new_dur':0.0,'triple_new_calls':0,'triple_cached':0,'triple_new_dur':0.0}
+    work: List[Tuple[Dict[str, Any], List[float], List[float], List[float]]] = []
+
+    for t in triples:
+        s = t["subject"]; o = t["object"]
+        s_emb, d1 = _get_entity_emb(s["text"], s["type"], s["key"])
+        if d1 > 0:
+            embed_stats['entity_new_calls'] += 1
+            embed_stats['entity_new_dur'] += d1
+        else:
+            embed_stats['entity_cached'] += 1
+
+        o_emb, d2 = _get_entity_emb(o["text"], o["type"], o["key"])
+        if d2 > 0:
+            embed_stats['entity_new_calls'] += 1
+            embed_stats['entity_new_dur'] += d2
+        else:
+            embed_stats['entity_cached'] += 1
+
+        tr_emb, d3 = _get_triple_emb(t["triple_uid"], t)
+        if d3 > 0:
+            embed_stats['triple_new_calls'] += 1
+            embed_stats['triple_new_dur'] += d3
+        else:
+            embed_stats['triple_cached'] += 1
+
+        total_emb_dur += (d1 + d2 + d3)
+        work.append((t, s_emb, o_emb, tr_emb))
+
+    # 2) Transaction with retries on deadlock only
+    written = 0
+    total_neo4j_dur = 0.0
+
+    attempts = 0
+    max_attempts = 1 + max(0, NEO4J_TX_DEADLOCK_MAX_RETRIES)
+
+    while attempts < max_attempts:
+        attempts += 1
+        attempt_neo4j_dur = 0.0
+        try:
+            with driver.session() as session:
+                with session.begin_transaction() as tx:
+                    for (t, s_emb, o_emb, tr_emb) in work:
+                        attempt_neo4j_dur += upsert_triple_in_tx(tx, t, s_emb, o_emb, tr_emb)
+                    tx.commit()
+            # Success: persist attempt duration and written count
+            total_neo4j_dur = attempt_neo4j_dur
+            written = len(work)
+            break  # exit retry loop
+
+        except Neo4jError as e:
+            if is_deadlock_error(e) and attempts < max_attempts:
+                # Exponential backoff with jitter
+                backoff_ms = NEO4J_TX_DEADLOCK_BACKOFF_MS * (2 ** (attempts - 1))
+                jitter = random.uniform(0.7, 1.3)
+                sleep_s = (backoff_ms * jitter) / 1000.0
+                log_warn(f"[Neo4j] Deadlock detected during chunk write (attempt {attempts}/{max_attempts}). "
+                         f"Retrying after {sleep_s:.3f}s. Details: {getattr(e, 'code', 'Deadlock')}")
+                time.sleep(sleep_s)
+                continue
+            # Not a deadlock or out of retries: re-raise to be handled by existing flow
+            raise
+
+    return written, total_emb_dur, total_neo4j_dur, embed_stats
+
+# ----------------- Folder utilities (unchanged) -----------------
+def list_pickles(dir_path: Path) -> List[Path]:
+    if not dir_path.exists():
+        raise FileNotFoundError(f"Directory not found: {dir_path}")
+    return sorted([p for p in dir_path.glob("*.pkl") if p.name not in SKIP_FILES])
+
+def load_chunks_from_file(pkl_path: Path) -> List[Any]:
+    with open(pkl_path, "rb") as f:
+        chunks = pickle.load(f)
+    if not isinstance(chunks, list):
+        raise ValueError(f"Unexpected pickle content in {pkl_path}")
+    log_info(f"  - {pkl_path.name}: {len(chunks)} chunks")
+    return chunks
+
+# ----------------- Greedy and budget-aware batch builders (unchanged) -----------------
+def build_greedy_batch(use_items: List[Dict[str, Any]], start_idx: int) -> Tuple[List[Dict[str, Any]], int, int]:
+    items_batch: List[Dict[str, Any]] = []
+    idx = start_idx
+    est_tokens = 0
+    while idx < len(use_items) and len(items_batch) < PRACTICAL_MAX_ITEMS_PER_BATCH:
+        candidate = use_items[idx]
+        tentative = items_batch + [candidate]
+        prompt = build_batch_prompt(tentative) if len(tentative) > 1 else build_single_prompt(candidate["meta"], candidate["text"])
+        tokens = estimate_tokens_for_text(prompt)
+        if tokens <= PROMPT_TOKEN_LIMIT or len(items_batch) == 0:
+            items_batch = tentative
+            est_tokens = tokens
+            idx += 1
+        else:
+            break
+    return items_batch, idx, est_tokens
+
+def pack_batches(use_items: List[Dict[str, Any]]) -> List[Tuple[List[Dict[str, Any]], int]]:
+    batches: List[Tuple[List[Dict[str, Any]], int]] = []
+    i = 0
+    while i < len(use_items):
+        items_batch, next_i, est_tokens = build_greedy_batch(use_items, i)
+        if not items_batch:
+            i += 1
+            continue
+        batches.append((items_batch, est_tokens))
+        i = next_i
+    return batches
+
+def try_merge_batches(b1: Tuple[List[Dict[str, Any]], int], b2: Tuple[List[Dict[str, Any]], int]) -> Optional[Tuple[List[Dict[str, Any]], int]]:
+    items1, _ = b1
+    items2, _ = b2
+    merged = items1 + items2
+    if len(merged) > PRACTICAL_MAX_ITEMS_PER_BATCH:
+        return None
+    merged_prompt = build_batch_prompt(merged) if len(merged) > 1 else build_single_prompt(merged[0]["meta"], merged[0]["text"])
+    tokens = estimate_tokens_for_text(merged_prompt)
+    if tokens <= PROMPT_TOKEN_LIMIT:
+        return (merged, tokens)
+    return None
+
+def pack_batches_with_cap(use_items: List[Dict[str, Any]], max_batches_allowed: Optional[int]) -> Tuple[List[Tuple[List[Dict[str, Any]], int]], int]:
+    batches = pack_batches(use_items)
+    if max_batches_allowed is None or len(batches) <= max_batches_allowed:
+        return batches, 0
+
+    changed = True
+    while len(batches) > max_batches_allowed and changed:
+        changed = False
+        merged_list: List[Tuple[List[Dict[str, Any]], int]] = []
+        i = 0
+        while i < len(batches):
+            if i < len(batches) - 1:
+                merged = try_merge_batches(batches[i], batches[i+1])
+                if merged:
+                    merged_list.append(merged)
+                    i += 2
+                    changed = True
+                    continue
+            merged_list.append(batches[i])
+            i += 1
+        batches = merged_list
+
+    if len(batches) > max_batches_allowed:
+        to_run = batches[:max_batches_allowed]
+        deferred = batches[max_batches_allowed:]
+        deferred_chunks = sum(len(b[0]) for b in deferred)
+        return to_run, deferred_chunks
+    return batches, 0
+
+# ----------------- Processing helper (unchanged control flow) -----------------
+def process_items(items: List[Dict[str, Any]]) -> Tuple[int, int, float, Dict[str, Dict[str, float]], Dict[str, Any]]:
+    if should_stop():
+        log_warn("Early stop flag active before processing items; skipping batch.")
+        return 0, 0, 0.0, {}, {"final_batches": 0, "rate_limit_retries": 0, "json_parse_errors": 0, "llm_calls": 0, "attempts_info": []}
+    if not items:
+        return 0, 0, 0.0, {}, {"final_batches": 0, "rate_limit_retries": 0, "json_parse_errors": 0, "llm_calls": 0, "attempts_info": []}
+    if ENFORCE_API_BUDGET and not API_BUDGET.will_allow("llm", 1):
+        log_warn("Stopping: API budget for LLM calls would be exceeded.", attempt_id=None)
+        return 0, 0, 0.0, {}, {"final_batches": 0, "rate_limit_retries": 0, "json_parse_errors": 0, "llm_calls": 0, "attempts_info": []}
+
+    rate_limit_retries = 0
+    json_parse_errors = 0
+    llm_calls = 0
+    attempts_info: List[Dict[str, Any]] = []
+
+    if len(items) == 1:
+        item = items[0]
+        meta = item["meta"]
+        text = item["text"]
+        chunk_id = meta.get("chunk_id")
+        per_chunk: Dict[str, Dict[str, float]] = {}
+        backoff = random.uniform(2.0, 7.0)
+        last_attempt_id: Optional[int] = None
+        last_json_path: Optional[str] = None
+
+        while True:
+            if should_stop():
+                log_warn("Early stop flag active. Skipping item.")
+                return 0, 0, 0.0, {}, {"final_batches": 0, "rate_limit_retries": rate_limit_retries, "json_parse_errors": json_parse_errors, "llm_calls": llm_calls, "attempts_info": attempts_info}
+
+            if ENFORCE_API_BUDGET and not API_BUDGET.will_allow("llm", 1):
+                log_warn(f"Stopping (budget exhausted) before LLM call for single chunk {chunk_id}", attempt_id=last_attempt_id)
+                return 0, 0, 0.0, {}, {"final_batches": 0, "rate_limit_retries": rate_limit_retries, "json_parse_errors": json_parse_errors, "llm_calls": llm_calls, "attempts_info": attempts_info}
+
+            prompt = build_single_prompt(meta, text)
+            llm_calls += 1
+            try:
+                triples, gemini_dur, attempt_id, json_path = extract_triples_from_chunk(text, meta, prompt_override=prompt)
+                last_attempt_id = attempt_id
+                last_json_path = json_path
+                written, emb_dur, neo4j_dur, embed_stats = write_triples_for_chunk(triples)
+
+                per_chunk[chunk_id] = {
+                    "gemini": gemini_dur,
+                    "embed": emb_dur,
+                    "neo4j": neo4j_dur,
+                    "triples": written,
+                    "attempt_id": attempt_id,
+                    "json_path": json_path or "",
+                    "document_id": meta.get("document_id") or "",
+                    "uu_number": meta.get("uu_number") or "",
+                    "embed_counts": embed_stats,
+                    "src_file": meta.get("src_file") or ""
+                }
+
+                attempts_info.append({
+                    "attempt_id": attempt_id,
+                    "duration": gemini_dur,
+                    "chunk_ids": [chunk_id],
+                    "uu_numbers": [meta.get("uu_number") or ""],
+                    "document_ids": [meta.get("document_id") or ""],
+                    "json_path": json_path or ""
+                })
+
+                log_info(
+                    f"Attempt completed successfully: chunks={[chunk_id]} | uu={[meta.get('uu_number')]} | json={json_path} | "
+                    f"triples_written={written} | times: llm={gemini_dur:.2f}s embed={emb_dur:.2f}s neo4j={neo4j_dur:.2f}s",
+                    attempt_id=attempt_id
+                )
+
+                return 1, written, gemini_dur, per_chunk, {
+                    "final_batches": 1,
+                    "rate_limit_retries": rate_limit_retries,
+                    "json_parse_errors": json_parse_errors,
+                    "llm_calls": llm_calls,
+                    "attempts_info": attempts_info
+                }
+            except EarlyStop as es:
+                log_warn(f"Early stop triggered while processing chunk {chunk_id}. Aborting item.", attempt_id=getattr(es, "attempt_id", None))
+                return 0, 0, 0.0, {}, {"final_batches": 0, "rate_limit_retries": rate_limit_retries, "json_parse_errors": json_parse_errors, "llm_calls": llm_calls, "attempts_info": attempts_info}
+            except RateLimitError as rle:
+                last_attempt_id = rle.attempt_id
+                last_json_path = getattr(rle, "json_path", None)
+                rate_limit_retries += 1
+                sleep_for = min(backoff, random.uniform(50.0, 80.0))
+                log_warn(f"Rate-limit ({rle.category}) on single chunk {chunk_id}. Reason: {rle.reason}. "
+                         f"(doc={meta.get('document_id')}, uu={meta.get('uu_number')}, json={last_json_path or 'n/a'}) "
+                         f"Retrying after {sleep_for:.1f}s (retry #{rate_limit_retries}).", attempt_id=last_attempt_id)
+                log_info(f"attempt id {last_attempt_id} failed", attempt_id=last_attempt_id)
+                time.sleep(sleep_for)
+                backoff = min(backoff * random.uniform(1.5, 2.5), random.uniform(50.0, 80.0))
+            except JsonParseError as e:
+                last_attempt_id = e.attempt_id
+                last_json_path = getattr(e, "json_path", None)
+                json_parse_errors += 1
+
+                left_text, right_text = split_text_in_two(text)
+                left_meta = dict(meta); left_meta["chunk_id"] = f"{chunk_id}::part1"
+                right_meta = dict(meta); right_meta["chunk_id"] = f"{chunk_id}::part2"
+
+                log_warn(
+                    f"JSON parse error on single chunk {chunk_id}. Splitting immediately into 2 parts: "
+                    f"{len(left_text)} + {len(right_text)} chars. "
+                    f"(doc={meta.get('document_id')}, uu={meta.get('uu_number')}, json={last_json_path or 'n/a'})",
+                    attempt_id=last_attempt_id
+                )
+                log_info(f"attempt id {last_attempt_id} failed", attempt_id=last_attempt_id)
+
+                parts = []
+                if left_text:
+                    parts.append({"text": left_text, "meta": left_meta})
+                if right_text:
+                    parts.append({"text": right_text, "meta": right_meta})
+
+                if not parts:
+                    return 0, 0, 0.0, {}, {
+                        "final_batches": 0,
+                        "rate_limit_retries": rate_limit_retries,
+                        "json_parse_errors": json_parse_errors,
+                        "llm_calls": llm_calls,
+                        "attempts_info": attempts_info
+                    }
+
+                agg_chunks = 0; agg_triples = 0; agg_gemini = 0.0
+                per_chunk_agg = {}; attempts_info_agg = []
+                agg_final_batches = 0; agg_rl_retries = rate_limit_retries; agg_json_parse_errors = json_parse_errors; agg_llm_calls = llm_calls
+
+                for part in parts:
+                    c_chunks, c_triples, c_gemini, c_stats, c_extra = process_items([part])
+                    agg_chunks += c_chunks; agg_triples += c_triples; agg_gemini += c_gemini
+                    per_chunk_agg.update(c_stats)
+                    attempts_info_agg.extend(c_extra.get("attempts_info", []))
+                    agg_final_batches += c_extra.get("final_batches", 0)
+                    agg_rl_retries += c_extra.get("rate_limit_retries", 0)
+                    agg_json_parse_errors += c_extra.get("json_parse_errors", 0)
+                    agg_llm_calls += c_extra.get("llm_calls", 0)
+
+                return agg_chunks, agg_triples, agg_gemini, per_chunk_agg, {
+                    "final_batches": agg_final_batches,
+                    "rate_limit_retries": agg_rl_retries,
+                    "json_parse_errors": agg_json_parse_errors,
+                    "llm_calls": agg_llm_calls,
+                    "attempts_info": attempts_info_agg
+                }
+            except LlmCallError as e:
+                last_attempt_id = e.attempt_id
+                last_json_path = getattr(e, "json_path", None)
+                json_parse_errors += 1
+                log_warn(f"Runtime error on single chunk {chunk_id}. Treating as parse error and retrying. Detail: {e}", attempt_id=last_attempt_id)
+                log_info(f"attempt id {last_attempt_id} failed", attempt_id=last_attempt_id)
+                time.sleep(1.0)
+            except RuntimeError as e:
+                if "API budget would be exceeded" in str(e):
+                    log_warn(f"Budget exhausted while processing single chunk {chunk_id}", attempt_id=last_attempt_id)
+                    return 0, 0, 0.0, {}, {"final_batches": 0, "rate_limit_retries": rate_limit_retries, "json_parse_errors": json_parse_errors, "llm_calls": llm_calls, "attempts_info": attempts_info}
+                json_parse_errors += 1
+                log_warn(f"Runtime error on single chunk {chunk_id}. Treating as parse error and retrying. Detail: {e}", attempt_id=last_attempt_id)
+                if last_attempt_id is not None:
+                    log_info(f"attempt id {last_attempt_id} failed", attempt_id=last_attempt_id)
+                time.sleep(1.0)
+            except Exception as e:
+                json_parse_errors += 1
+                log_warn(f"Unexpected error on single chunk {chunk_id}. Treating as parse error and retrying. Detail: {e}", attempt_id=last_attempt_id)
+                if last_attempt_id is not None:
+                    log_info(f"attempt id {last_attempt_id} failed", attempt_id=last_attempt_id)
+                time.sleep(1.0)
+
+    # Batch case (unchanged flow; write path already optimized)
+    else:
+        per_chunk: Dict[str, Dict[str, float]] = {}
+        backoff = random.uniform(2.0, 7.0)
+        last_attempt_id: Optional[int] = None
+        last_json_path: Optional[str] = None
+
+        while True:
+            if should_stop():
+                log_warn("Early stop flag active. Skipping batch.")
+                return 0, 0, 0.0, {}, {"final_batches": 0, "rate_limit_retries": 0, "json_parse_errors": 0, "llm_calls": 0, "attempts_info": attempts_info}
+
+            if ENFORCE_API_BUDGET and not API_BUDGET.will_allow("llm", 1):
+                log_warn("Stopping: API budget for LLM calls would be exceeded (batch).", attempt_id=last_attempt_id)
+                return 0, 0, 0.0, {}, {"final_batches": 0, "rate_limit_retries": 0, "json_parse_errors": 0, "llm_calls": 0, "attempts_info": attempts_info}
+
+            prompt = build_batch_prompt(items)
+            llm_calls += 1
+            try:
+                results_map, gemini_dur, attempt_id, json_path = extract_triples_from_chunks_batch(items, prompt)
+                last_attempt_id = attempt_id
+                last_json_path = json_path
+
+                num_chunks_processed = 0
+                num_triples_stored = 0
+                leader_cid = items[0]["meta"]["chunk_id"] if items else None
+                emb_total = 0.0; neo_total = 0.0
+
+                for it in items:
+                    cid = it["meta"]["chunk_id"]
+                    triples = results_map.get(cid, [])
+                    written, emb_dur, neo4j_dur, embed_stats = write_triples_for_chunk(triples)
+
+                    gem_for_chunk = gemini_dur if cid == leader_cid else 0.0
+                    per_chunk[cid] = {
+                        "gemini": gem_for_chunk,
+                        "embed": emb_dur,
+                        "neo4j": neo4j_dur,
+                        "triples": written,
+                        "attempt_id": attempt_id,
+                        "json_path": json_path or "",
+                        "document_id": it["meta"].get("document_id") or "",
+                        "uu_number": it["meta"].get("uu_number") or "",
+                        "embed_counts": embed_stats,
+                        "src_file": it["meta"].get("src_file") or ""
+                    }
+
+                    num_chunks_processed += 1
+                    num_triples_stored += written
+                    emb_total += emb_dur
+                    neo_total += neo4j_dur
+
+                attempts_info.append({
+                    "attempt_id": attempt_id,
+                    "duration": gemini_dur,
+                    "chunk_ids": [it["meta"]["chunk_id"] for it in items],
+                    "uu_numbers": list(sorted({it["meta"].get("uu_number") or "" for it in items})),
+                    "document_ids": list(sorted({it["meta"].get("document_id") or "" for it in items})),
+                    "json_path": json_path or ""
+                })
+
+                log_info(
+                    f"Attempt completed successfully: chunks={[it['meta']['chunk_id'] for it in items]} | "
+                    f"uu={list(sorted({it['meta'].get('uu_number') for it in items}))} | json={json_path} | "
+                    f"triples_written={num_triples_stored} | times: llm={gemini_dur:.2f}s embed={emb_total:.2f}s neo4j={neo_total:.2f}s",
+                    attempt_id=attempt_id
+                )
+
+                return num_chunks_processed, num_triples_stored, gemini_dur, per_chunk, {
+                    "final_batches": 1,
+                    "rate_limit_retries": rate_limit_retries,
+                    "json_parse_errors": json_parse_errors,
+                    "llm_calls": llm_calls,
+                    "attempts_info": attempts_info
+                }
+
+            except EarlyStop as es:
+                log_warn(f"Early stop triggered while processing batch (size={len(items)}). Aborting batch.", attempt_id=getattr(es, "attempt_id", None))
+                return 0, 0, 0.0, {}, {"final_batches": 0, "rate_limit_retries": rate_limit_retries, "json_parse_errors": json_parse_errors, "llm_calls": llm_calls, "attempts_info": attempts_info}
+            except RateLimitError as rle:
+                last_attempt_id = rle.attempt_id
+                last_json_path = getattr(rle, "json_path", None)
+                rate_limit_retries += 1
+                sleep_for = min(backoff, random.uniform(50.0, 80.0))
+                log_warn(f"Rate-limit ({rle.category}) on batch (size={len(items)}). Reason: {rle.reason}. "
+                         f"chunks={[it['meta']['chunk_id'] for it in items]} docs={[it['meta'].get('document_id') for it in items]} "
+                         f"uu={list(sorted({it['meta'].get('uu_number') for it in items}))} json={last_json_path or 'n/a'}. "
+                         f"Retrying after {sleep_for:.1f}s (retry #{rate_limit_retries}).", attempt_id=last_attempt_id)
+                log_info(f"attempt id {last_attempt_id} failed", attempt_id=last_attempt_id)
+                time.sleep(sleep_for)
+                backoff = min(backoff * random.uniform(1.5, 2.5), random.uniform(50.0, 80.0))
+                continue
+            except JsonParseError as e:
+                last_attempt_id = e.attempt_id
+                last_json_path = getattr(e, "json_path", None)
+                json_parse_errors += 1
+                mid = max(1, len(items) // 2)
+                left = items[:mid]; right = items[mid:]
+                log_warn(f"JSON parse error on batch (size={len(items)}). Splitting into {len(left)} + {len(right)}. "
+                         f"chunks={[it['meta']['chunk_id'] for it in items]} docs={[it['meta'].get('document_id') for it in items]} "
+                         f"uu={list(sorted({it['meta'].get('uu_number') for it in items}))} json={last_json_path or 'n/a'}. Detail: {e}", attempt_id=last_attempt_id)
+                log_info(f"attempt id {last_attempt_id} failed", attempt_id=last_attempt_id)
+                l_chunks, l_triples, l_gemini, l_stats, l_extra = process_items(left)
+                r_chunks, r_triples, r_gemini, r_stats, r_extra = process_items(right)
+
+                per_chunk_agg = {}; per_chunk_agg.update(l_stats); per_chunk_agg.update(r_stats)
+                attempts_info_agg = []; attempts_info_agg.extend(l_extra.get("attempts_info", [])); attempts_info_agg.extend(r_extra.get("attempts_info", []))
+
+                return (l_chunks + r_chunks,
+                        l_triples + r_triples,
+                        l_gemini + r_gemini,
+                        per_chunk_agg,
+                        {
+                            "final_batches": l_extra.get("final_batches", 0) + r_extra.get("final_batches", 0),
+                            "rate_limit_retries": rate_limit_retries + l_extra.get("rate_limit_retries", 0) + r_extra.get("rate_limit_retries", 0),
+                            "json_parse_errors": json_parse_errors + l_extra.get("json_parse_errors", 0) + r_extra.get("json_parse_errors", 0),
+                            "llm_calls": llm_calls + l_extra.get("llm_calls", 0) + r_extra.get("llm_calls", 0),
+                            "attempts_info": attempts_info_agg
+                        })
+            except LlmCallError as e:
+                last_attempt_id = e.attempt_id
+                last_json_path = getattr(e, "json_path", None)
+                json_parse_errors += 1
+                mid = max(1, len(items) // 2)
+                left = items[:mid]; right = items[mid:]
+                log_warn(f"Runtime error on batch (size={len(items)}). Splitting into {len(left)} + {len(right)}. Detail: {e}", attempt_id=last_attempt_id)
+                log_info(f"attempt id {last_attempt_id} failed", attempt_id=last_attempt_id)
+                l_chunks, l_triples, l_gemini, l_stats, l_extra = process_items(left)
+                r_chunks, r_triples, r_gemini, r_stats, r_extra = process_items(right)
+
+                per_chunk_agg = {}; per_chunk_agg.update(l_stats); per_chunk_agg.update(r_stats)
+                attempts_info_agg = []; attempts_info_agg.extend(l_extra.get("attempts_info", [])); attempts_info_agg.extend(r_extra.get("attempts_info", []))
+
+                return (l_chunks + r_chunks,
+                        l_triples + r_triples,
+                        l_gemini + r_gemini,
+                        per_chunk_agg,
+                        {
+                            "final_batches": l_extra.get("final_batches", 0) + r_extra.get("final_batches", 0),
+                            "rate_limit_retries": rate_limit_retries + l_extra.get("rate_limit_retries", 0) + r_extra.get("rate_limit_retries", 0),
+                            "json_parse_errors": json_parse_errors + l_extra.get("json_parse_errors", 0) + r_extra.get("json_parse_errors", 0),
+                            "llm_calls": llm_calls + l_extra.get("llm_calls", 0) + r_extra.get("llm_calls", 0),
+                            "attempts_info": attempts_info_agg
+                        })
+            except RuntimeError as e:
+                if "API budget would be exceeded" in str(e):
+                    log_warn("Budget exhausted during batch processing.", attempt_id=last_attempt_id)
+                    return 0, 0, 0.0, {}, {"final_batches": 0, "rate_limit_retries": rate_limit_retries, "json_parse_errors": json_parse_errors, "llm_calls": llm_calls, "attempts_info": attempts_info}
+                json_parse_errors += 1
+                mid = max(1, len(items) // 2)
+                left = items[:mid]; right = items[mid:]
+                log_warn(f"Runtime error on batch (size={len(items)}). Splitting into {len(left)} + {len(right)}. Detail: {e}", attempt_id=last_attempt_id)
+                if last_attempt_id is not None:
+                    log_info(f"attempt id {last_attempt_id} failed", attempt_id=last_attempt_id)
+                l_chunks, l_triples, l_gemini, l_stats, l_extra = process_items(left)
+                r_chunks, r_triples, r_gemini, r_stats, r_extra = process_items(right)
+
+                per_chunk_agg = {}; per_chunk_agg.update(l_stats); per_chunk_agg.update(r_stats)
+                attempts_info_agg = []; attempts_info_agg.extend(l_extra.get("attempts_info", [])); attempts_info_agg.extend(r_extra.get("attempts_info", []))
+
+                return (l_chunks + r_chunks,
+                        l_triples + r_triples,
+                        l_gemini + r_gemini,
+                        per_chunk_agg,
+                        {
+                            "final_batches": l_extra.get("final_batches", 0) + r_extra.get("final_batches", 0),
+                            "rate_limit_retries": rate_limit_retries + l_extra.get("rate_limit_retries", 0) + r_extra.get("rate_limit_retries", 0),
+                            "json_parse_errors": json_parse_errors + l_extra.get("json_parse_errors", 0) + r_extra.get("json_parse_errors", 0),
+                            "llm_calls": llm_calls + l_extra.get("llm_calls", 0) + r_extra.get("llm_calls", 0),
+                            "attempts_info": attempts_info_agg
+                        })
+            except Exception as e:
+                json_parse_errors += 1
+                mid = max(1, len(items) // 2)
+                left = items[:mid]; right = items[mid:]
+                log_warn(f"Unexpected error on batch (size={len(items)}). Splitting into {len(left)} + {len(right)}. Detail: {e}", attempt_id=last_attempt_id)
+                if last_attempt_id is not None:
+                    log_info(f"attempt id {last_attempt_id} failed", attempt_id=last_attempt_id)
+                l_chunks, l_triples, l_gemini, l_stats, l_extra = process_items(left)
+                r_chunks, r_triples, r_gemini, r_stats, r_extra = process_items(right)
+
+                per_chunk_agg = {}; per_chunk_agg.update(l_stats); per_chunk_agg.update(r_stats)
+                attempts_info_agg = []; attempts_info_agg.extend(l_extra.get("attempts_info", [])); attempts_info_agg.extend(r_extra.get("attempts_info", []))
+
+                return (l_chunks + r_chunks,
+                        l_triples + r_triples,
+                        l_gemini + r_gemini,
+                        per_chunk_agg,
+                        {
+                            "final_batches": l_extra.get("final_batches", 0) + r_extra.get("final_batches", 0),
+                            "rate_limit_retries": rate_limit_retries + l_extra.get("rate_limit_retries", 0) + r_extra.get("rate_limit_retries", 0),
+                            "json_parse_errors": json_parse_errors + l_extra.get("json_parse_errors", 0) + r_extra.get("json_parse_errors", 0),
+                            "llm_calls": llm_calls + l_extra.get("llm_calls", 0) + r_extra.get("llm_calls", 0),
+                            "attempts_info": attempts_info_agg
+                        })
+
+# ----------------- Main pipeline -----------------
+def run_kg_pipeline_over_folder(
+    dir_path: Path,
+    max_files: Optional[int] = None,
+    max_chunks_per_file: Optional[int] = None
+):
+    # Ensure schema that matches your MERGE patterns (key-based)
+    create_key_constraints_and_base_indexes()
+
+    # Drop vector indexes during ingest (you said you don't need live vector search)
+    if DROP_VECTOR_INDEXES_DURING_INGEST:
+        log_info("Dropping vector indexes before ingest (per config).")
+        drop_vector_indexes()
+
+    pkls = list_pickles(dir_path)
+    if max_files is not None:
+        pkls = pkls[:max_files]
+
+    file_total_chunks: Dict[str, int] = {}
+    file_done_chunks: Dict[str, int] = {}
+
+    total_chunks_planned = 0
+    for p in pkls:
+        try:
+            with open(p, "rb") as f:
+                chunks = pickle.load(f)
+            n = len(chunks)
+            total_chunks_planned += n if max_chunks_per_file is None else min(n, max_chunks_per_file)
+        except Exception:
+            continue
+
+    log_info(f"Found {len(pkls)} pickle files in {dir_path} (skipping: {', '.join(SKIP_FILES) or 'none'})")
+    log_info(f"Total chunks planned: {total_chunks_planned}")
+    if ENFORCE_API_BUDGET:
+        allowed_calls_remaining = max(0, API_BUDGET.total - API_BUDGET.used)
+        log_info(f"API budget: enforce={API_BUDGET.enforce}, total={API_BUDGET.total}, used={API_BUDGET.used}, allowed_calls_remaining={allowed_calls_remaining}")
+    else:
+        log_info(f"API budget: enforce={API_BUDGET.enforce} (unlimited LLM calls)")
+    log_info(f"LLM rate limit: {LLM_MAX_CALLS_PER_MIN} calls/minute")
+    log_info(f"Greedy batching target: <= {PRACTICAL_MAX_ITEMS_PER_BATCH} items, est tokens <= {PROMPT_TOKEN_LIMIT}")
+    log_info(f"LLM concurrency: {LLM_CONCURRENCY} batch(es) in-flight at a time")
+
+    raw_items_all: List[Dict[str, Any]] = []
+    for file_idx, pkl in enumerate(pkls, 1):
+        log_info(f"[{file_idx}/{len(pkls)}] Scanning {pkl.name}")
+        try:
+            chunks = load_chunks_from_file(pkl)
+        except Exception as e:
+            log_warn(f"Failed to load {pkl.name}: {e}")
+            continue
+
+        added_for_file = 0
+        for idx, ch in enumerate(chunks):
+            if max_chunks_per_file is not None and idx >= max_chunks_per_file:
+                break
+            meta_source = getattr(ch, "metadata", {}) if hasattr(ch, "metadata") else {}
+            meta = {
+                "document_id": meta_source.get("document_id"),
+                "chunk_id": meta_source.get("chunk_id"),
+                "uu_number": meta_source.get("uu_number"),
+                "pages": meta_source.get("pages"),
+                "src_file": pkl.name,
+            }
+            text = getattr(ch, "page_content", str(ch))
+            if not meta.get("chunk_id"):
+                meta["chunk_id"] = f"{pkl.stem}_chunk_{idx}"
+            raw_items_all.append({"chunk_id": meta["chunk_id"], "text": text, "meta": meta})
+
+            file_total_chunks[pkl.name] = file_total_chunks.get(pkl.name, 0) + 1
+            added_for_file += 1
+
+        if added_for_file == 0:
+            file_total_chunks.setdefault(pkl.name, 0)
+
+    if not raw_items_all:
+        log_info("No chunks found. Exiting.")
+        # Rebuild vector indexes if we dropped them
+        if DROP_VECTOR_INDEXES_DURING_INGEST and REBUILD_VECTOR_INDEXES_AFTER_INGEST:
+            log_info("Recreating vector indexes after (empty) run.")
+            create_vector_indexes()
+        return
+
+    max_batches_allowed = None
+    if ENFORCE_API_BUDGET:
+        max_batches_allowed = max(0, API_BUDGET.total - API_BUDGET.used)
+
+    all_batches_capped, deferred_chunks = pack_batches_with_cap(raw_items_all, max_batches_allowed)
+    total_batches_planned = len(all_batches_capped)
+    log_info(f"Packed {len(raw_items_all)} chunks into {total_batches_planned} batch(es) (budget-capped).")
+    for i, (batch_items, est_tokens) in enumerate(all_batches_capped, 1):
+        log_info(f"  • Batch {i}: chunks={len(batch_items)}, est_tokens~{est_tokens}")
+    if deferred_chunks > 0:
+        log_warn(f"Deferring {deferred_chunks} chunk(s) to future runs due to API budget cap of {max_batches_allowed} batch(es).")
+
+    total_triples_stored = 0
+    total_chunks_done = 0
+    total_gemini_duration = 0.0
+    total_embedding_duration = 0.0
+    total_neo4j_duration = 0.0
+
+    per_batch_component_sums: Dict[int, float] = {}
+    per_batch_wall_times: Dict[int, float] = {}
+    per_batch_sizes: Dict[int, int] = {}
+
+    global_final_batches = 0
+    global_rate_limit_retries = 0
+    global_json_parse_errors = 0
+    global_llm_call_attempts = 0
+
+    overall_start = time.time()
+
+    def batch_desc(idx: int, size: int, tokens: int) -> str:
+        return f"[Batch {idx+1}/{total_batches_planned}] size={size}, est_tokens~{tokens}"
+
+    def remaining_budget() -> int:
+        if not ENFORCE_API_BUDGET:
+            return 1_000_000_000
+        return max(0, API_BUDGET.total - API_BUDGET.used)
+
+    batches_completed_so_far = 0
+    _results_lock = threading.Lock()
+
+    # Semaphore limits how many batches are in-flight simultaneously.
+    # When LLM_CONCURRENCY=1 this degenerates to purely sequential behaviour.
+    _semaphore = threading.Semaphore(LLM_CONCURRENCY)
+
+    def _run_batch(b_idx: int, items_batch: List[Dict[str, Any]], est_tokens: int) -> None:
+        """Worker executed in a thread pool slot. Releases the semaphore when done."""
+        nonlocal batches_completed_so_far
+        nonlocal total_chunks_done, total_triples_stored
+        nonlocal total_gemini_duration, total_embedding_duration, total_neo4j_duration
+        nonlocal global_final_batches, global_rate_limit_retries
+        nonlocal global_json_parse_errors, global_llm_call_attempts
+
+        start_label = batch_desc(b_idx, len(items_batch), est_tokens)
+        submit_time = time.time()
+        try:
+            chunks_processed, triples_stored, gemini_dur, per_chunk_stats, extra = process_items(items_batch)
+        except Exception as e:
+            log_error(f"{start_label} failed with unhandled error: {e}")
+            with _results_lock:
+                batches_completed_so_far += 1
+                log_info(f"        - Batches completed: {batches_completed_so_far}/{total_batches_planned}")
+            _semaphore.release()
+            return
+        finally:
+            # Always release the slot — process_items has its own internal
+            # retry/split logic so errors that it handles never reach here,
+            # but external failures (e.g. OOM) must still free the semaphore.
+            pass  # release is called explicitly below after the try block
+
+        _semaphore.release()  # free the slot as soon as this batch is done
+
+        end_time = time.time()
+        wall_time = end_time - submit_time
+
+        embed_total = sum(stats['embed'] for stats in per_chunk_stats.values())
+        neo4j_total = sum(stats['neo4j'] for stats in per_chunk_stats.values())
+        comp_sum = gemini_dur + embed_total + neo4j_total
+
+        final_batches = extra.get("final_batches", 0)
+        rate_limit_retries = extra.get("rate_limit_retries", 0)
+        json_parse_errors = extra.get("json_parse_errors", 0)
+        llm_calls = extra.get("llm_calls", 0)
+        attempts_info = extra.get("attempts_info", [])
+
+        with _results_lock:
+            total_chunks_done += chunks_processed
+            total_triples_stored += triples_stored
+            total_gemini_duration += gemini_dur
+            total_embedding_duration += embed_total
+            total_neo4j_duration += neo4j_total
+
+            global_final_batches += final_batches
+            global_rate_limit_retries += rate_limit_retries
+            global_json_parse_errors += json_parse_errors
+            global_llm_call_attempts += llm_calls
+
+            per_batch_component_sums[b_idx] = comp_sum
+            per_batch_wall_times[b_idx] = wall_time
+            per_batch_sizes[b_idx] = len(items_batch)
+
+            if per_chunk_stats:
+                for it in items_batch:
+                    cid = it["meta"]["chunk_id"]
+                    stats = per_chunk_stats.get(cid)
+                    if stats:
+                        json_base = Path(stats.get('json_path') or "").name
+                        uu_num = stats.get('uu_number') or "unknown"
+                        attempt_id_val = int(stats.get('attempt_id')) if stats.get('attempt_id') is not None else None
+                        gem_disp = f"{stats['gemini']:.2f}s" if stats['gemini'] > 0 else "0.00s (shared)"
+                        emb_counts = stats.get("embed_counts") or {}
+                        emb_detail = ""
+                        if emb_counts:
+                            emb_detail = f" (new e={emb_counts.get('entity_new_calls',0)},t={emb_counts.get('triple_new_calls',0)} | cached e={emb_counts.get('entity_cached',0)},t={emb_counts.get('triple_cached',0)})"
+                        log_info(f"      - Chunk {cid} (uu={uu_num}, attempt={attempt_id_val}, json={json_base}) "
+                                 f"Gemini={gem_disp} | Embedding={stats['embed']:.2f}s{emb_detail} | Neo4j={stats['neo4j']:.2f}s | Triples={int(stats['triples'])}")
+
+            for it in items_batch:
+                cid = it["meta"]["chunk_id"]
+                stats = per_chunk_stats.get(cid)
+                if not stats:
+                    continue
+                src_file = stats.get("src_file") or it["meta"].get("src_file")
+                if src_file:
+                    file_done_chunks[src_file] = file_done_chunks.get(src_file, 0) + 1
+
+            attempt_ids_list = [a.get("attempt_id") for a in attempts_info] if attempts_info else []
+            log_info(f"    ✓ {start_label}")
+            log_info(f"        - KG extraction (LLM): {gemini_dur:.2f}s across {max(1, len(attempt_ids_list))} call(s), attempt_ids={attempt_ids_list}")
+            log_info(f"        - Embedding total:     {embed_total:.2f}s")
+            log_info(f"        - Neo4j insert total:  {neo4j_total:.2f}s")
+            log_info(f"        - Component sum:       {comp_sum:.2f}s")
+            log_info(f"        - Batch wall time:     {wall_time:.2f}s")
+            log_info(f"        - Overhead (wall - components): {wall_time - comp_sum:+.2f}s")
+            log_info(f"        - Chunks processed: {chunks_processed} | Triples stored: {triples_stored}")
+
+            batches_completed_so_far += 1
+            log_info(f"        - Batches completed: {batches_completed_so_far}/{total_batches_planned}")
+
+    with ThreadPoolExecutor(max_workers=LLM_CONCURRENCY) as executor:
+        futures: List[Future] = []
+        for next_idx, (items_batch, est_tokens) in enumerate(all_batches_capped):
+            if should_stop():
+                log_warn("[STOP] Early stop engaged. No more batches will be submitted.")
+                break
+            if ENFORCE_API_BUDGET and remaining_budget() <= 0:
+                log_warn("Stopping: API budget for LLM calls would be exceeded.")
+                break
+
+            # Block here until a concurrency slot becomes available.
+            # The slot is released inside _run_batch once that batch finishes.
+            _semaphore.acquire()
+
+            # Re-check stop/budget immediately after acquiring — a just-finished
+            # batch may have triggered EarlyStop or exhausted the budget.
+            if should_stop() or (ENFORCE_API_BUDGET and remaining_budget() <= 0):
+                _semaphore.release()  # put the slot back; we won't use it
+                log_warn("[STOP] Not submitting further batches after semaphore acquire.")
+                break
+
+            fut = executor.submit(_run_batch, next_idx, items_batch, est_tokens)
+            futures.append(fut)
+        # executor.__exit__ waits for all submitted futures to complete
+
+    total_time_real = time.time() - overall_start
+    total_llm_calls_used = API_BUDGET.resource_usage.get("llm", 0)
+
+    sequential_estimate = sum(per_batch_component_sums.values())
+    speedup = (sequential_estimate / total_time_real) if total_time_real > 0 else float('inf')
+
+    log_info("Summary")
+    log_info(f"- Batches planned (initial, capped): {total_batches_planned}")
+    log_info(f"- Batches processed after JSON-split: {global_final_batches} (extra from splits: {max(0, global_final_batches - total_batches_planned)})")
+    log_info(f"- Chunks processed: {total_chunks_done}/{total_chunks_planned}")
+    log_info(f"- Triples stored: {total_triples_stored}")
+    log_info(f"- LLM calls attempted (total): {global_llm_call_attempts}")
+    log_info(f"- Rate-limit retries (429): {global_rate_limit_retries}")
+    log_info(f"- JSON parse errors encountered: {global_json_parse_errors}")
+    log_info(f"- LLM calls used (budget counter): {total_llm_calls_used}{' (budget enforced)' if ENFORCE_API_BUDGET else ''}")
+    log_info(f"- Total Gemini time (sum of batch LLM times): {total_gemini_duration:.2f}s")
+    log_info(f"- Total Embedding time (sum): {total_embedding_duration:.2f}s")
+    log_info(f"- Total Neo4j time (sum): {total_neo4j_duration:.2f}s")
+    log_info(f"- Total real wall time: {total_time_real:.2f}s")
+    log_info(f"- Sequential time estimate (components sum): {sequential_estimate:.2f}s")
+    log_info(f"- Speedup vs sequential: {speedup:.2f}× faster")
+    if ENFORCE_API_BUDGET:
+        log_info(f"- API used: {API_BUDGET.used}/{API_BUDGET.total} (LLM calls and {'embeddings' if COUNT_EMBEDDINGS_IN_BUDGET else 'no embeddings'} counted)")
+
+    # Recreate vector indexes if configured
+    if DROP_VECTOR_INDEXES_DURING_INGEST and REBUILD_VECTOR_INDEXES_AFTER_INGEST:
+        log_info("Recreating vector indexes after ingest (per config).")
+        create_vector_indexes()
+
+if __name__ == "__main__":
+    run_kg_pipeline_over_folder(
+        LANGCHAIN_DIR,
+        max_files=100000,
+        max_chunks_per_file=None
+    )

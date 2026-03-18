@@ -218,3 +218,13 @@ dataset
 
 # api_testing logs
 api_testing/outputs
+
+# all txt, json, csv and images
+*.txt
+*.json
+*.png
+*.jpg
+*.jpeg
+*.csv
+
+!requirements.txt
