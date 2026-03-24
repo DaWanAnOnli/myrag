@@ -1,5 +1,5 @@
 import dotenv
-from langchain.docstore.document import Document
+from langchain_core.documents import Document
 import json
 import tiktoken
 from typing import List, Dict, Any, Optional, Tuple
@@ -42,9 +42,9 @@ else:
 
 
 LIMIT_FILES = None  # Set to integer to limit files processed, None for all files
-MIN_CHUNK_SIZE = 400   # tokens
-MAX_CHUNK_SIZE = 800   # tokens
-CHUNK_OVERLAP = 100    # tokens
+MIN_CHUNK_SIZE = 512   # tokens
+MAX_CHUNK_SIZE = 1024   # tokens
+CHUNK_OVERLAP = 256    # tokens
 FORCE_OVERWRITE = False  # Skip user confirmation for directory overwrite
 
 PAGE_BREAK = "\n\n--- PAGE BREAK ---\n\n"
@@ -71,18 +71,9 @@ class Tokenizer:
 # CORE FUNCTIONS
 # =============================================================================
 
-def combine_text_and_ocr(page: Dict[str, Any]) -> str:
-    """Combine text and OCR content from a page."""
-    text_content = page.get('text', '').strip()
-    ocr_content = page.get('ocr', '').strip()
-
-    combined = []
-    if text_content:
-        combined.append(text_content)
-    if ocr_content:
-        combined.append(ocr_content)
-
-    return '\n\n'.join(combined)
+def extract_final_text(page: Dict[str, Any]) -> str:
+    """Extract final text content from a page."""
+    return page.get('final_text', '').strip()
 
 
 def build_combined_text_and_token_map(
@@ -99,7 +90,7 @@ def build_combined_text_and_token_map(
     """
     page_texts = []
     for page in pages:
-        page_text = combine_text_and_ocr(page)
+        page_text = extract_final_text(page)
         page_texts.append((page['page_number'], page_text))
 
     # Create combined text (used for character lengths and samples)
@@ -273,11 +264,9 @@ def process_single_json_file(json_file_path: str) -> tuple[List[Document], Optio
         sorted_pages = sorted(document_data['pages'], key=lambda x: x['page_number'])
 
         # Gather plain character stats from the input
-        total_text_length = 0
-        total_ocr_length = 0
+        total_final_text_length = 0
         for page in sorted_pages:
-            total_text_length += page.get('text_length', 0)
-            total_ocr_length += page.get('ocr_length', 0)
+            total_final_text_length += page.get('final_text_length', 0)
 
         tokenizer = Tokenizer("cl100k_base")
 
@@ -285,8 +274,7 @@ def process_single_json_file(json_file_path: str) -> tuple[List[Document], Optio
         combined_text, combined_tokens, page_token_ranges = build_combined_text_and_token_map(sorted_pages, tokenizer)
 
         doc_summary.update({
-            'total_text_length': total_text_length,
-            'total_ocr_length': total_ocr_length,
+            'total_final_text_length': total_final_text_length,
             'combined_content_length': len(combined_text),
             'combined_content_characters': len(combined_text.replace(' ', '').replace('\n', ''))
         })
@@ -506,8 +494,7 @@ def process_json_directory() -> Dict[str, Any]:
                 'tanggal_berlaku': doc_summary['tanggal_berlaku'],
                 'total_pages_in_pdf': doc_summary['total_pages_in_pdf'],
                 'pages_processed': doc_summary['pages_processed'],
-                'total_text_length': doc_summary['total_text_length'],
-                'total_ocr_length': doc_summary['total_ocr_length'],
+                'total_final_text_length': doc_summary.get('total_final_text_length', 0),
                 'combined_content_length': doc_summary['combined_content_length'],
                 'total_tokens': doc_summary['total_tokens'],
                 'num_chunks_created': doc_summary['num_chunks_created'],

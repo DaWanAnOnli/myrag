@@ -436,20 +436,16 @@ def process_single_page_isolated(doc, page_index, ocr_reader):
             extremely_similar = similarity >= 0.90 or (similarity >= 0.80 and len_close)
 
             if extremely_similar:
-                # Prefer regular PDF text unless it looks corrupted or the page is effectively scanned
                 if _looks_corrupted(reg) and not _looks_corrupted(ocr):
                     final_text_source = "ocr"
                 elif ocr_strategy == "full_page_ocr" and page_analysis["is_likely_scanned"]:
                     final_text_source = "ocr"
                 else:
                     final_text_source = "regular"
-
-                # Blank the unused text to avoid duplication downstream
-                if final_text_source == "regular":
-                    ocr = ""
-                else:
-                    reg = ""
                 duplicates_merged = True
+            else:
+                # Texts are distinct (e.g. native text + OCR from image blocks) — keep both
+                final_text_source = "both"
 
         elif reg and not ocr:
             final_text_source = "regular"
@@ -458,8 +454,13 @@ def process_single_page_isolated(doc, page_index, ocr_reader):
         else:
             final_text_source = "none"
 
-        final_text = reg if final_text_source == "regular" else (ocr if final_text_source == "ocr" else "")
-
+        # Update final_text resolution to handle "both"
+        final_text = (
+            reg if final_text_source == "regular"
+            else ocr if final_text_source == "ocr"
+            else f"{reg} {ocr}".strip() if final_text_source == "both"
+            else ""
+        )
         result = {
             "page_number": int(page_num),
             "page_index": int(page_index),
@@ -594,6 +595,7 @@ def main():
     # ======================
     MAX_PDF_FILES = None  # Set to None to process ALL PDFs, or a number to limit
     MAX_PAGES_PER_PDF = None  # Set to None to process ALL pages, or a number to limit
+    PROCESS_EXTENSION = "both"  # Options: "pdf", "PDF", "both"
     
     print("=" * 60)
     print("PDF OCR WITH METADATA EXTRACTION - INDIVIDUAL JSON FILES (PaddleOCR)")
@@ -634,9 +636,18 @@ def main():
     tmp_dir = _ensure_ocr_json_tmp_dir()
     print(f"🗂️  Temp OCR JSON dir: {tmp_dir}")
     
-    pdf_files = list(pdf_directory.glob("*.pdf"))
+    if PROCESS_EXTENSION == "pdf":
+        pdf_files = list(pdf_directory.glob("*.pdf"))
+    elif PROCESS_EXTENSION == "PDF":
+        pdf_files = list(pdf_directory.glob("*.PDF"))
+    elif PROCESS_EXTENSION == "both":
+        pdf_files = [f for f in pdf_directory.iterdir() if f.is_file() and f.suffix.lower() == '.pdf']
+    else:
+        print(f"❌ ERROR: Invalid PROCESS_EXTENSION: {PROCESS_EXTENSION}. Must be 'pdf', 'PDF', or 'both'.")
+        return
+
     if not pdf_files:
-        print("❌ ERROR: No PDF files found in input directory!")
+        print(f"❌ ERROR: No files matching extension pattern '{PROCESS_EXTENSION}' found in input directory!")
         return
     
     if MAX_PDF_FILES is None:

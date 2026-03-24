@@ -10,7 +10,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from FlagEmbedding import BGEM3FlagModel
+from sentence_transformers import SentenceTransformer
 from neo4j import GraphDatabase, basic_auth
 from neo4j.exceptions import Neo4jError
 
@@ -67,12 +67,12 @@ NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASS = os.getenv("NEO4J_PASS", "@ik4nkus")
 
 # LLM rate limiter (calls per minute)
-LLM_MAX_CALLS_PER_MIN = int(os.getenv("LLM_MAX_CALLS_PER_MIN", "16"))
+LLM_MAX_CALLS_PER_MIN = int(os.getenv("LLM_MAX_CALLS_PER_MIN", "24"))
 
 # Number of LLM batches that may be processed concurrently.
 # N=1 → fully sequential (default). N>1 → sliding window: as soon as any
 # in-flight batch finishes, the next queued batch starts immediately.
-LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "16"))
+LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "24"))
 
 # Per-request timeout in seconds for LMStudio LLM calls.
 # LMStudio can take a long time to finish generating; 600 s (10 min) is a safe default.
@@ -99,7 +99,7 @@ SKIP_FILES = {"all_langchain_documents.pkl"}
 
 # Prompt token control (heuristic)
 PROMPT_TOKEN_LIMIT = int(os.getenv("PROMPT_TOKEN_LIMIT", "4000"))
-PRACTICAL_MAX_ITEMS_PER_BATCH = int(os.getenv("PRACTICAL_MAX_ITEMS_PER_BATCH", "40"))
+PRACTICAL_MAX_ITEMS_PER_BATCH = int(os.getenv("PRACTICAL_MAX_ITEMS_PER_BATCH", "1"))
 
 # Single-chunk parse error split threshold
 SINGLE_PARSE_SPLIT_AFTER = int(os.getenv("SINGLE_PARSE_SPLIT_AFTER", "1"))
@@ -109,7 +109,7 @@ NEO4J_TX_DEADLOCK_MAX_RETRIES = int(os.getenv("NEO4J_TX_DEADLOCK_MAX_RETRIES", "
 NEO4J_TX_DEADLOCK_BACKOFF_MS = int(os.getenv("NEO4J_TX_DEADLOCK_BACKOFF_MS", "80"))   # base backoff in ms
 
 # JSON output directory (must already exist; do not create it)
-JSON_OUTPUT_DIR = Path(os.getenv("JSON_OUTPUT_DIR", str((Path(__file__).resolve().parent / "../../dataset/llm-json-outputs").resolve())))
+JSON_OUTPUT_DIR = Path(os.getenv("JSON_OUTPUT_DIR", str((Path(__file__).resolve().parent / "../../dataset/3_indexing/3b_lexidkg_llm_json_outputs").resolve())))
 if JSON_OUTPUT_DIR.exists() is False or not JSON_OUTPUT_DIR.is_dir():
     raise FileNotFoundError(f"JSON_OUTPUT_DIR does not exist or is not a directory: {JSON_OUTPUT_DIR}. Please create it or set JSON_OUTPUT_DIR.")
 
@@ -122,10 +122,12 @@ log_info(f"LMStudio JSON outputs directory: {JSON_OUTPUT_DIR}")
 log_info(f"Source LANGCHAIN_DIR: {LANGCHAIN_DIR} (IS_SAMPLE={_IS_SAMPLE})")
 
 # BGE-M3 embedding model (loaded once, thread-safe for inference)
-log_info(f"Loading BGE-M3 embedding model: {LOCAL_EMBED_MODEL} ...")
-_bge_model = BGEM3FlagModel(LOCAL_EMBED_MODEL, use_fp16=True)
-log_info(f"BGE-M3 model loaded. Embed dim: {EMBED_DIM}")
-
+log_info(f"Loading embedding model via SentenceTransformers: {LOCAL_EMBED_MODEL} ...")
+_bge_model = SentenceTransformer(
+    LOCAL_EMBED_MODEL,
+    trust_remote_code=True
+)
+log_info(f"Embedding model loaded. Embed dim: {EMBED_DIM}")
 # ----------------- LexID ontology constants -----------------
 # (SYSTEM_HINT unchanged — omitted here to keep this file readable per your note)
 SYSTEM_HINT = """
@@ -539,7 +541,7 @@ def next_attempt_id() -> int:
         return aid
 
 # ----------------- Early stop (attempt-id cap) -----------------
-MAX_ATTEMPT_ID = int(os.getenv("MAX_ATTEMPT_ID", "325"))
+MAX_ATTEMPT_ID = int(os.getenv("MAX_ATTEMPT_ID", "100000000000000000000"))
 
 class EarlyStop(Exception):
     def __init__(self, message: str, attempt_id: Optional[int] = None):
@@ -855,8 +857,8 @@ def run_llm_json(prompt: str, schema: dict, context: Dict[str, Any]) -> Tuple[Di
         completion = lmstudio_client.chat.completions.create(
             model=LOCAL_GEN_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0,
             response_format={"type": "text"},
+            temperature=1.0
         )
     except Exception as e:
         dur = time.time() - start
@@ -882,6 +884,8 @@ def run_llm_json(prompt: str, schema: dict, context: Dict[str, Any]) -> Tuple[Di
     raw = None
     try:
         raw = completion.choices[0].message.content
+        used_tokens = completion.usage.total_tokens
+        log_info(f"[LLM] Used {used_tokens} tokens", attempt_id=attempt_id)
         
         # Clean up potential markdown formatting (```json ... ```)
         clean_raw = raw.strip()
@@ -1015,15 +1019,13 @@ def embed_text(text: str) -> Tuple[List[float], float]:
         raise RuntimeError("API budget would be exceeded by another embedding call; stopping embedding.")
     start = time.time()
     with _bge_lock:
-        result = _bge_model.encode(
+        vec = _bge_model.encode(
             [text],
             batch_size=1,
-            max_length=8192,
-            return_dense=True,
-            return_sparse=False,
-            return_colbert_vecs=False,
-        )
-    vec: List[float] = result["dense_vecs"][0].tolist()
+            convert_to_numpy=True,
+            normalize_embeddings=False,
+            show_progress_bar=False
+        )[0].tolist()
     dur = time.time() - start
     API_BUDGET.register("embed", 1)
     return vec, dur
