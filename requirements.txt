@@ -13,11 +13,13 @@ tenacity
 python-dotenv
 tiktoken
 langchain
+langchain-community
 wheel
 numpy
 opencv-python
 utils
 openai
-FlagEmbedding
+# FlagEmbedding
 pydantic
 pydantic-core
+sentence_transformers

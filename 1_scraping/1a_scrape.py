@@ -380,7 +380,7 @@ class BPKScraper:
                     all_data.append(data)
                 
                 # Be respectful - add delay between requests
-                time.sleep(2)
+                time.sleep(1)
             
             page_num += 1
             
@@ -453,13 +453,13 @@ def main():
     scraper = BPKScraper()
     
     # URL to scrape
-    start_url = "https://peraturan.bpk.go.id/Search?keywords=&tentang=&nomor=&entitas=513&jenis=19"
+    start_url = "https://peraturan.bpk.go.id/Search?keywords=&tentang=&nomor=&jenis=8"
     
     # Scrape data (limit to first 1 page for testing)
-    data = scraper.scrape_all_pages(start_url, max_pages=10000000)
+    data = scraper.scrape_all_pages(start_url, max_pages=1000000000)
     
     # Save to CSV
-    scraper.save_to_csv(data, 'bpk_perda_bandung_data.csv')
+    scraper.save_to_csv(data, 'uu_data.csv')
     
     print(f"\nScraping completed! Found {len(data)} records.")
     
