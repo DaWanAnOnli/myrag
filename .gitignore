@@ -233,3 +233,7 @@ api_testing/outputs
 *.csv
 
 !requirements.txt
+
+
+# database backup
+dbms*
