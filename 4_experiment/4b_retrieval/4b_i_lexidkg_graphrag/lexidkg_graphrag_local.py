@@ -3,6 +3,7 @@
 # Local version: uses LM Studio (OpenAI-compatible API) for LLM calls and BAAI/bge-m3 for embeddings.
 
 import os, time, json, math, pickle, re, random
+import numpy as np
 import httpx
 from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 from pathlib import Path
@@ -39,7 +40,7 @@ LLM_REQUEST_TIMEOUT = float(os.getenv("LLM_REQUEST_TIMEOUT", "300"))
 
 # Number of questions that may be processed concurrently.
 # N=1 → fully sequential. N>1 → sliding window: as soon as one finishes, next starts.
-LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "2"))
+LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "10"))
 
 # Dataset folder for original chunk pickles
 DEFAULT_LANGCHAIN_DIR = (Path(__file__).resolve().parent / "../../../dataset/3_indexing/3a_langchain_results/").resolve()
@@ -82,11 +83,21 @@ print(f"[Init] Using LMStudio generation model: {LOCAL_GEN_MODEL}")
 print(f"[Init] LMStudio base URL: {LMSTUDIO_BASE_URL}")
 
 # BGE-M3 embedding model (loaded once, thread-safe for inference)
-print(f"[Init] Loading embedding model: {LOCAL_EMBED_MODEL} ...")
-_bge_model = SentenceTransformer(LOCAL_EMBED_MODEL, trust_remote_code=True)
+import torch as _torch
+_embed_device = "cuda" if _torch.cuda.is_available() else "cpu"
+print(f"[Init] Loading embedding model: {LOCAL_EMBED_MODEL} on device={_embed_device} ...")
+_bge_model = SentenceTransformer(LOCAL_EMBED_MODEL, trust_remote_code=True, device=_embed_device)
 print(f"[Init] Embedding model loaded.")
 
-driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+# Embedding batch size: larger batches saturate the GPU better.
+_EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "64"))
+
+driver = GraphDatabase.driver(
+    NEO4J_URI,
+    auth=(NEO4J_USER, NEO4J_PASS),
+    max_connection_pool_size=200,
+    connection_acquisition_timeout=60,
+)
 
 # ----------------- Logger -----------------
 def _now_ts() -> str:
@@ -181,19 +192,31 @@ def _rand_wait_seconds() -> float:
     return random.uniform(5.0, 15.0)
 
 def embed_text(text: str) -> List[float]:
-    """Embed using local BAAI/bge-m3 model via SentenceTransformer."""
-    vec = _bge_model.encode(text, normalize_embeddings=True)
+    """Embed a single text using local BAAI/bge-m3 model (GPU if available)."""
+    vec = _bge_model.encode(text, normalize_embeddings=True, batch_size=1, show_progress_bar=False)
     return _as_float_list(vec)
 
-def cos_sim(a: List[float], b: List[float]) -> float:
-    a = _as_float_list(a)
-    b = _as_float_list(b)
-    dot = sum(x*y for x,y in zip(a,b))
-    na = math.sqrt(sum(x*x for x in a))
-    nb = math.sqrt(sum(y*y for y in b))
-    if na == 0 or nb == 0:
+def embed_texts(texts: List[str]) -> List[List[float]]:
+    """Batch-encode a list of texts on GPU. Much faster than calling embed_text() in a loop."""
+    if not texts:
+        return []
+    vecs = _bge_model.encode(
+        texts,
+        normalize_embeddings=True,
+        batch_size=_EMBED_BATCH_SIZE,
+        show_progress_bar=False,
+    )
+    return [_as_float_list(v) for v in vecs]
+
+def cos_sim(a, b) -> float:
+    """Cosine similarity using numpy (much faster than pure Python)."""
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    na = np.linalg.norm(a)
+    nb = np.linalg.norm(b)
+    if na == 0.0 or nb == 0.0:
         return 0.0
-    return dot / (na * nb)
+    return float(np.dot(a, b) / (na * nb))
 
 # ----------------- Safe LLM helpers -----------------
 def safe_generate_json(prompt: str, schema: Dict[str, Any], temp: float = 0.0) -> Tuple[Dict[str, Any], float, float, float, str]:
@@ -451,11 +474,23 @@ def _vector_query_nodes(index_name: str, q_emb: List[float], k: int) -> Tuple[Li
     return rows, dur
 
 def search_similar_entities_by_embedding(q_emb: List[float], k: int) -> Tuple[List[Dict[str, Any]], float]:
-    """Returns (matched_entities, total_duration_s)."""
+    """Returns (matched_entities, total_duration_s).
+    The three index searches are submitted in parallel so they run concurrently.
+    """
+    # Capture the question_id from the calling thread so inner workers can log correctly.
+    _qid = getattr(_thread_local, "question_id", None)
+    index_names = ("document_vec", "content_vec", "expression_vec")
+    def _search_index(name: str) -> Tuple[List[Dict[str, Any]], float]:
+        _thread_local.question_id = _qid  # propagate into worker thread
+        return _vector_query_nodes(name, q_emb, k)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {name: pool.submit(_search_index, name) for name in index_names}
+        results = {name: futures[name].result() for name in index_names}
+
     candidates: List[Dict[str, Any]] = []
     total_dur = 0.0
-    for idx_name in ("document_vec", "content_vec", "expression_vec"):
-        rows, dur = _vector_query_nodes(idx_name, q_emb, k)
+    for name in index_names:
+        rows, dur = results[name]
         candidates.extend(rows)
         total_dur += dur
 
@@ -471,11 +506,12 @@ def search_similar_entities_by_embedding(q_emb: List[float], k: int) -> Tuple[Li
 
 def search_similar_triples_by_embedding(q_emb: List[float], k: int) -> Tuple[List[Dict[str, Any]], float]:
     q_emb = _as_float_list(q_emb)
+    # s_name/s_key/s_type and o_name/o_key/o_type are cached directly on Triple nodes
+    # by the post-indexing optimization script, so we no longer need to traverse
+    # [:SUBJECT] and [:OBJECT] edges — saving 2 hops per result node.
     cypher = """
     CALL db.index.vector.queryNodes('triple_vec', $k, $q_emb) YIELD node AS tr, score
-    OPTIONAL MATCH (tr)-[:SUBJECT]->(s)
-    OPTIONAL MATCH (tr)-[:OBJECT]->(o)
-    RETURN tr, s, o, score
+    RETURN tr, score
     ORDER BY score DESC
     LIMIT $k
     """
@@ -485,22 +521,22 @@ def search_similar_triples_by_embedding(q_emb: List[float], k: int) -> Tuple[Lis
     )
     rows = []
     for r in res:
-        tr = r["tr"]; s = r["s"]; o = r["o"]
+        tr = r["tr"]
         rows.append({
-            "triple_uid": tr.get("triple_uid"),
-            "predicate": tr.get("predicate"),
-            "uu_number": tr.get("uu_number"),
-            "evidence_quote": tr.get("evidence_quote"),
-            "subject": s.get("name") if s else None,
-            "subject_key": s.get("key") if s else None,
-            "subject_type": s.get("type") if s else None,
-            "object": o.get("name") if o else None,
-            "object_key": o.get("key") if o else None,
-            "object_type": o.get("type") if o else None,
-            "score": r["score"],
-            "embedding": tr.get("embedding"),
-            "document_id": tr.get("document_id"),
-            "chunk_id": tr.get("chunk_id"),
+            "triple_uid":           tr.get("triple_uid"),
+            "predicate":            tr.get("predicate"),
+            "uu_number":            tr.get("uu_number"),
+            "evidence_quote":       tr.get("evidence_quote"),
+            "subject":              tr.get("s_name"),
+            "subject_key":          tr.get("s_key"),
+            "subject_type":         tr.get("s_type"),
+            "object":               tr.get("o_name"),
+            "object_key":           tr.get("o_key"),
+            "object_type":          tr.get("o_type"),
+            "score":                r["score"],
+            "embedding":            tr.get("embedding"),
+            "document_id":          tr.get("document_id"),
+            "chunk_id":             tr.get("chunk_id"),
             "evidence_article_ref": tr.get("evidence_article_ref"),
         })
     return rows, dur
@@ -510,81 +546,69 @@ def expand_from_entities(
     entity_keys: List[str],
     hops: int,
     per_hop_limit: int,
-    entity_elem_ids: Optional[List[str]] = None
+    entity_elem_ids: Optional[List[str]] = None  # kept for API compatibility; no longer used
 ) -> Tuple[List[Dict[str, Any]], float]:
-    """Returns (triples, total_duration_s)."""
+    """Returns (triples, total_duration_s).
+
+    s_name/s_key/s_type and o_name/o_key/o_type are now cached directly on
+    Triple nodes (populated by the post-indexing optimization script), so we
+    skip the [:SUBJECT] and [:OBJECT] traversals entirely — saving 2 hops per
+    Triple per expansion hop.  The frontier is driven entirely by the cached
+    s_key/o_key values returned with the Triple, so element-id tracking is
+    also no longer needed.
+    """
     triples: Dict[str, Dict[str, Any]] = {}
-    current_ids: Set[str] = set(x for x in (entity_elem_ids or []) if x)
     current_keys: Set[str] = set(x for x in (entity_keys or []) if x)
     total_dur = 0.0
 
     for hop_idx in range(hops):
-        if not current_ids and not current_keys:
+        if not current_keys:
             break
 
         # Expose current hop number to run_cypher_with_retry via thread-local
         _thread_local.cypher_hop = hop_idx + 1
 
-        if current_ids:
-            cypher = """
-            UNWIND $ids AS eid
-            MATCH (e) WHERE elementId(e) = eid
-            MATCH (e)-[r:PREDICATE]->()
-            WITH DISTINCT r.triple_uid AS uid LIMIT $limit
-            MATCH (tr:Triple {triple_uid: uid})
-            OPTIONAL MATCH (tr)-[:SUBJECT]->(s)
-            OPTIONAL MATCH (tr)-[:OBJECT]->(o)
-            RETURN tr, s, o, elementId(s) AS s_id, elementId(o) AS o_id
-            """
-            params = {"ids": list(current_ids), "limit": per_hop_limit}
-        else:
-            cypher = """
-            UNWIND $keys AS k
-            MATCH (e:Entity {key:k})-[r:PREDICATE]->()
-            WITH DISTINCT r.triple_uid AS uid LIMIT $limit
-            MATCH (tr:Triple {triple_uid: uid})
-            OPTIONAL MATCH (tr)-[:SUBJECT]->(s)
-            OPTIONAL MATCH (tr)-[:OBJECT]->(o)
-            RETURN tr, s, o, elementId(s) AS s_id, elementId(o) AS o_id
-            """
-            params = {"keys": list(current_keys), "limit": per_hop_limit}
+        # Read s_key/o_key from cached Triple properties — no OPTIONAL MATCH.
+        cypher = """
+        UNWIND $keys AS k
+        MATCH (e:Entity {key: k})-[r:PREDICATE]->()
+        WITH DISTINCT r.triple_uid AS uid LIMIT $limit
+        MATCH (tr:Triple {triple_uid: uid})
+        RETURN tr, tr.s_key AS s_key, tr.o_key AS o_key
+        """
+        params = {"keys": list(current_keys), "limit": per_hop_limit}
 
         res, dur = run_cypher_with_retry(cypher, params, query_label="subgraph expansion hop")
         _thread_local.cypher_hop = None  # reset after each hop query
         total_dur += dur
 
-        next_ids: Set[str] = set()
         next_keys: Set[str] = set()
         for r in res:
-            tr = r["tr"]; s = r["s"]; o = r["o"]
+            tr = r["tr"]
             uid = tr.get("triple_uid")
             if uid not in triples:
                 triples[uid] = {
-                    "triple_uid": uid,
-                    "predicate": tr.get("predicate"),
-                    "uu_number": tr.get("uu_number"),
-                    "evidence_quote": tr.get("evidence_quote"),
-                    "embedding": tr.get("embedding"),
-                    "document_id": tr.get("document_id"),
-                    "chunk_id": tr.get("chunk_id"),
+                    "triple_uid":           uid,
+                    "predicate":            tr.get("predicate"),
+                    "uu_number":            tr.get("uu_number"),
+                    "evidence_quote":       tr.get("evidence_quote"),
+                    "embedding":            tr.get("embedding"),
+                    "document_id":          tr.get("document_id"),
+                    "chunk_id":             tr.get("chunk_id"),
                     "evidence_article_ref": tr.get("evidence_article_ref"),
-                    "subject": s.get("name") if s else None,
-                    "subject_key": s.get("key") if s else None,
-                    "subject_type": s.get("type") if s else None,
-                    "object": o.get("name") if o else None,
-                    "object_key": o.get("key") if o else None,
-                    "object_type": o.get("type") if o else None,
+                    "subject":              tr.get("s_name"),
+                    "subject_key":          tr.get("s_key"),
+                    "subject_type":         tr.get("s_type"),
+                    "object":               tr.get("o_name"),
+                    "object_key":           tr.get("o_key"),
+                    "object_type":          tr.get("o_type"),
                 }
-            if s:
-                if s.get("key"): next_keys.add(s.get("key"))
-            if o:
-                if o.get("key"): next_keys.add(o.get("key"))
-            s_id = r.get("s_id"); o_id = r.get("o_id")
-            if s_id: next_ids.add(s_id)
-            if o_id: next_ids.add(o_id)
+            # Advance frontier using cached keys (no elementId lookup needed)
+            s_key = r.get("s_key"); o_key = r.get("o_key")
+            if s_key: next_keys.add(s_key)
+            if o_key: next_keys.add(o_key)
 
-        current_ids = next_ids if next_ids else set()
-        current_keys = set() if next_ids else next_keys
+        current_keys = next_keys
 
     return list(triples.values()), total_dur
 
@@ -639,14 +663,23 @@ class ChunkStore:
 
 # ----------------- Scoring helpers -----------------
 def mean_similarity_to_query_triples(triple_emb: Optional[List[float]], q_trip_embs: List[List[float]]) -> float:
-    if not isinstance(triple_emb, list) and triple_emb is not None:
+    """Vectorized cosine similarity of one triple embedding vs a list of query-triple embeddings."""
+    if triple_emb is None:
+        return 0.0
+    if not isinstance(triple_emb, list):
         triple_emb = _as_float_list(triple_emb)
-    if not isinstance(triple_emb, list) or not q_trip_embs:
+    if not triple_emb or not q_trip_embs:
         return 0.0
-    sims = [cos_sim(triple_emb, q) for q in q_trip_embs]
-    if not sims:
+    a = np.asarray(triple_emb, dtype=np.float32)
+    na = np.linalg.norm(a)
+    if na == 0.0:
         return 0.0
-    return sum(sims) / len(sims)
+    a = a / na
+    B = np.asarray(q_trip_embs, dtype=np.float32)  # shape (N, D)
+    norms = np.linalg.norm(B, axis=1, keepdims=True)
+    norms = np.where(norms == 0.0, 1.0, norms)
+    B = B / norms
+    return float(np.mean(B @ a))
 
 # ----------------- Retrieval pipeline -----------------
 def entity_centric_retrieval(
@@ -658,18 +691,35 @@ def entity_centric_retrieval(
 ) -> List[Dict[str, Any]]:
     """
     Retrieves triples via entity->KG match->subgraph expansion.
+    Entity texts are batch-embedded in one GPU call; KG searches run in parallel.
     cypher_durations: accumulator dict for Cypher query durations.
     matched_entities_log: list to append matched entity info for logging.
     """
     all_matched_keys: Set[str] = set()
     all_matched_ids: Set[str] = set()
 
-    for e in query_entities:
-        text = (e.get("text") or "").strip()
-        if not text:
-            continue
-        e_emb = embed_text(text)
-        matches, sim_dur = search_similar_entities_by_embedding(e_emb, k=ENTITY_MATCH_TOP_K)
+    # Filter to non-empty entities first
+    active_entities = [e for e in query_entities if (e.get("text") or "").strip()]
+    if not active_entities:
+        return []
+
+    # Batch-embed all entity texts in a single GPU call
+    entity_texts = [(e.get("text") or "").strip() for e in active_entities]
+    entity_embs = embed_texts(entity_texts)
+
+    # Fan out: one KG search per entity, submitted concurrently
+    # Capture question_id so inner worker threads log [qN] correctly.
+    _qid = getattr(_thread_local, "question_id", None)
+    def _search_entity(e_emb: List[float]) -> Tuple[List[Dict[str, Any]], float]:
+        _thread_local.question_id = _qid
+        return search_similar_entities_by_embedding(e_emb, k=ENTITY_MATCH_TOP_K)
+
+    with ThreadPoolExecutor(max_workers=max(1, len(entity_embs))) as pool:
+        ent_futures = [pool.submit(_search_entity, emb) for emb in entity_embs]
+        ent_results = [f.result() for f in ent_futures]
+
+    for entity, (matches, sim_dur) in zip(active_entities, ent_results):
+        text = (entity.get("text") or "").strip()
         if cypher_durations is not None:
             cypher_durations["entity_vector_search"] = cypher_durations.get("entity_vector_search", 0.0) + sim_dur
         keys = [m.get("key") for m in matches if m.get("key")]
@@ -718,13 +768,26 @@ def triple_centric_retrieval(
     query_triples: List[Dict[str, Any]],
     cypher_durations: Optional[Dict[str, float]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[List[float]]]:
+    if not query_triples:
+        return [], []
+
+    # Batch-embed all query-triple texts in a single GPU call
+    texts = [query_triple_to_text(qt) for qt in query_triples]
+    q_trip_embs: List[List[float]] = embed_texts(texts)
+
+    # Submit all Cypher searches concurrently.
+    # Capture question_id so inner worker threads log [qN] correctly.
+    _qid = getattr(_thread_local, "question_id", None)
+    def _search(emb: List[float]) -> Tuple[List[Dict[str, Any]], float]:
+        _thread_local.question_id = _qid
+        return search_similar_triples_by_embedding(emb, k=QUERY_TRIPLE_MATCH_TOP_K_PER)
+
+    with ThreadPoolExecutor(max_workers=len(q_trip_embs)) as pool:
+        futures = [pool.submit(_search, emb) for emb in q_trip_embs]
+        search_results = [f.result() for f in futures]
+
     triples_map: Dict[str, Dict[str, Any]] = {}
-    q_trip_embs: List[List[float]] = []
-    for qt in query_triples:
-        txt = query_triple_to_text(qt)
-        emb = embed_text(txt)
-        q_trip_embs.append(emb)
-        matches, dur = search_similar_triples_by_embedding(emb, k=QUERY_TRIPLE_MATCH_TOP_K_PER)
+    for matches, dur in search_results:
         if cypher_durations is not None:
             cypher_durations["triple_vector_search"] = cypher_durations.get("triple_vector_search", 0.0) + dur
         for m in matches:
@@ -776,10 +839,22 @@ def rerank_chunks_by_query(
     top_k: int
 ) -> List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]]:
     cand = chunk_records[:CHUNK_RERANK_CAND_LIMIT]
+    if not cand:
+        return []
+    # Batch-encode all chunk texts in a single GPU call
+    texts = [text for _, text, _ in cand]
+    embs = embed_texts(texts)
+    q = np.asarray(q_emb_query, dtype=np.float32)
+    qn = np.linalg.norm(q)
+    if qn > 0.0:
+        q = q / qn
     scored: List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]] = []
-    for key, text, t in cand:
-        emb = embed_text(text)
-        s = cos_sim(q_emb_query, emb)
+    for (key, text, t), emb in zip(cand, embs):
+        e = np.asarray(emb, dtype=np.float32)
+        en = np.linalg.norm(e)
+        if en > 0.0:
+            e = e / en
+        s = float(np.dot(q, e))
         scored.append((key, text, t, s))
     scored.sort(key=lambda x: x[3], reverse=True)
     return scored[:top_k]
@@ -1121,22 +1196,19 @@ if __name__ == "__main__":
 
     with ThreadPoolExecutor(max_workers=LLM_CONCURRENCY) as executor:
         global_idx = skipped_count  # already-processed count
-        # Submit questions one sliding-window batch at a time so we don't
-        # queue thousands of futures before detecting an error.
-        # With LLM_CONCURRENCY=1 this is fully sequential.
-        chunk_size = max(1, LLM_CONCURRENCY)
-        for batch_start in range(0, len(pending_pairs), chunk_size):
-            batch = pending_pairs[batch_start : batch_start + chunk_size]
-            futures: List[Future] = []
-            for qa in batch:
-                global_idx += 1
-                fut = executor.submit(process_one, qa, global_idx)
-                futures.append(fut)
-            for fut in as_completed(futures):
-                exc = fut.exception()
-                if exc:
-                    driver.close()
-                    raise exc
+        # Submit ALL questions at once. ThreadPoolExecutor enforces max_workers so
+        # at most LLM_CONCURRENCY tasks run simultaneously; as soon as any
+        # question finishes the next pending one starts immediately.
+        all_futures: List[Future] = []
+        for qa in pending_pairs:
+            global_idx += 1
+            fut = executor.submit(process_one, qa, global_idx)
+            all_futures.append(fut)
+        for fut in as_completed(all_futures):
+            exc = fut.exception()
+            if exc:
+                driver.close()
+                raise exc
 
     driver.close()
     print(f"[Done] Results saved to: {OUTPUT_FILE}")
