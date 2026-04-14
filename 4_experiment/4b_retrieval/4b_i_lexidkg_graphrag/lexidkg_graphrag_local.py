@@ -96,6 +96,14 @@ _EMBED_SEMAPHORE = threading.Semaphore(3)
 # exhausting the pool and retrying indefinitely.
 _NEO4J_QUERY_SEMAPHORE = threading.Semaphore(120)
 
+# Global semaphore to bound how many questions can be in-flight simultaneously.
+# This replaces the ThreadPoolExecutor max_workers as the primary backpressure
+# mechanism — it gates the entire question lifecycle (LLM + Neo4j), not just
+# individual Neo4j queries. Without this, fast questions finish their Neo4j
+# steps, free their executor threads, and pull in more questions before the
+# slower ones have finished, overwhelming LM Studio.
+_QUESTION_SEMAPHORE = threading.Semaphore(LLM_CONCURRENCY)
+
 driver = GraphDatabase.driver(
     NEO4J_URI,
     auth=(NEO4J_USER, NEO4J_PASS),
@@ -1230,21 +1238,28 @@ if __name__ == "__main__":
     def process_one(qa: Dict[str, Any], idx: int) -> None:
         qid = qa.get("question_id")
         question = qa.get("question", "").strip()
-        print(f"[Processing] ({idx}/{len(qa_pairs)}) question_id={qid}: {question[:80]}...")
-        result = agentic_graph_rag(
-            query_original=question,
-            question_id=qid,
-            log_dir=LOG_DIR,
-        )
-        output_record = {
-            "question_id": qid,
-            "question": question,
-            "final_answer": result.get("final_answer", ""),
-        }
-        with _write_lock:
-            with open(OUTPUT_FILE, "a", encoding="utf-8") as f_out:
-                f_out.write(json.dumps(output_record, ensure_ascii=False) + "\n")
-            processed_ids.add(qid)
+        # Gate each question through the global question semaphore so that at most
+        # LLM_CONCURRENCY questions are in-flight at any time — covering the full
+        # lifecycle (LLM extraction, Neo4j retrieval, LLM answer generation).
+        _QUESTION_SEMAPHORE.acquire()
+        try:
+            print(f"[Processing] ({idx}/{len(qa_pairs)}) question_id={qid}: {question[:80]}...")
+            result = agentic_graph_rag(
+                query_original=question,
+                question_id=qid,
+                log_dir=LOG_DIR,
+            )
+            output_record = {
+                "question_id": qid,
+                "question": question,
+                "final_answer": result.get("final_answer", ""),
+            }
+            with _write_lock:
+                with open(OUTPUT_FILE, "a", encoding="utf-8") as f_out:
+                    f_out.write(json.dumps(output_record, ensure_ascii=False) + "\n")
+                processed_ids.add(qid)
+        finally:
+            _QUESTION_SEMAPHORE.release()
 
     with ThreadPoolExecutor(max_workers=LLM_CONCURRENCY) as executor:
         global_idx = skipped_count  # already-processed count
