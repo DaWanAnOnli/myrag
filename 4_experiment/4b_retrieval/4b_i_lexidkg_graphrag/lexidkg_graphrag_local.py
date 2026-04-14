@@ -26,7 +26,7 @@ NEO4J_PASS = os.getenv("NEO4J_PASS", "password")
 
 # Neo4j retry/timeout controls
 NEO4J_TX_TIMEOUT_S = float(os.getenv("NEO4J_TX_TIMEOUT_S", "60"))
-NEO4J_MAX_ATTEMPTS = int(os.getenv("NEO4J_MAX_ATTEMPTS", "100000"))
+NEO4J_MAX_ATTEMPTS = int(os.getenv("NEO4J_MAX_ATTEMPTS", "5"))
 
 # LM Studio local server
 LMSTUDIO_BASE_URL = os.getenv("LMSTUDIO_BASE_URL", "http://localhost:1234/v1")
@@ -40,7 +40,7 @@ LLM_REQUEST_TIMEOUT = float(os.getenv("LLM_REQUEST_TIMEOUT", "300"))
 
 # Number of questions that may be processed concurrently.
 # N=1 → fully sequential. N>1 → sliding window: as soon as one finishes, next starts.
-LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "10"))
+LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "15"))
 
 # ----------------- Retrieval parameters -----------------
 ENTITY_MATCH_TOP_K           = 10    # top similar KG entities per extracted query entity
@@ -89,6 +89,12 @@ _EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "64"))
 
 # Limit concurrent GPU embedding calls so batches don't oversubscribe the GPU.
 _EMBED_SEMAPHORE = threading.Semaphore(3)
+
+# Global semaphore to bound total concurrent Neo4j query operations.
+# Set to 60% of max_connection_pool_size (200) to leave headroom for
+# connection overhead and other clients. Threads block here rather than
+# exhausting the pool and retrying indefinitely.
+_NEO4J_QUERY_SEMAPHORE = threading.Semaphore(120)
 
 driver = GraphDatabase.driver(
     NEO4J_URI,
@@ -440,9 +446,18 @@ def run_cypher_with_retry(cypher: str, params: Dict[str, Any], query_label: str 
         attempts += 1
         t0 = now_ms()
         try:
-            with driver.session() as session:
-                res = session.run(cypher, **params, timeout=NEO4J_TX_TIMEOUT_S)
-                records = list(res)
+            acquired = _NEO4J_QUERY_SEMAPHORE.acquire(timeout=60)
+            if not acquired:
+                raise RuntimeError(
+                    f"Could not acquire Neo4j query semaphore within 60s (qid={qid}). "
+                    "Consider increasing NEO4J_QUERY_CONCURRENCY or reducing LLM_CONCURRENCY."
+                )
+            try:
+                with driver.session() as session:
+                    res = session.run(cypher, **params, timeout=NEO4J_TX_TIMEOUT_S)
+                    records = list(res)
+            finally:
+                _NEO4J_QUERY_SEMAPHORE.release()
             cypher_dur = dur_s(t_cypher_start)
             print(f"{prefix} [CYPHER FINISH] qid={qid}{hop_info} | {query_label} | duration={cypher_dur:.3f}s", flush=True)
             return records, dur_s(t0)
