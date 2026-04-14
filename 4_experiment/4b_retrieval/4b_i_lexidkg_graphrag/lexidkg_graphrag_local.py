@@ -92,6 +92,9 @@ print(f"[Init] Embedding model loaded.")
 # Embedding batch size: larger batches saturate the GPU better.
 _EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "64"))
 
+# Limit concurrent GPU embedding calls so batches don't oversubscribe the GPU.
+_EMBED_SEMAPHORE = threading.Semaphore(3)
+
 driver = GraphDatabase.driver(
     NEO4J_URI,
     auth=(NEO4J_USER, NEO4J_PASS),
@@ -193,20 +196,28 @@ def _rand_wait_seconds() -> float:
 
 def embed_text(text: str) -> List[float]:
     """Embed a single text using local BAAI/bge-m3 model (GPU if available)."""
-    vec = _bge_model.encode(text, normalize_embeddings=True, batch_size=1, show_progress_bar=False)
-    return _as_float_list(vec)
+    _EMBED_SEMAPHORE.acquire()
+    try:
+        vec = _bge_model.encode(text, normalize_embeddings=True, batch_size=1, show_progress_bar=False)
+        return _as_float_list(vec)
+    finally:
+        _EMBED_SEMAPHORE.release()
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
     """Batch-encode a list of texts on GPU. Much faster than calling embed_text() in a loop."""
     if not texts:
         return []
-    vecs = _bge_model.encode(
-        texts,
-        normalize_embeddings=True,
-        batch_size=_EMBED_BATCH_SIZE,
-        show_progress_bar=False,
-    )
-    return [_as_float_list(v) for v in vecs]
+    _EMBED_SEMAPHORE.acquire()
+    try:
+        vecs = _bge_model.encode(
+            texts,
+            normalize_embeddings=True,
+            batch_size=_EMBED_BATCH_SIZE,
+            show_progress_bar=False,
+        )
+        return [_as_float_list(v) for v in vecs]
+    finally:
+        _EMBED_SEMAPHORE.release()
 
 def cos_sim(a, b) -> float:
     """Cosine similarity using numpy (much faster than pure Python)."""
