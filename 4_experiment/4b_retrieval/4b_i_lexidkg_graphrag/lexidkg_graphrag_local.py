@@ -2,7 +2,7 @@
 # Single-pass GraphRAG (Agent 1b + Agent 2 only), with structured per-question logging.
 # Local version: uses LM Studio (OpenAI-compatible API) for LLM calls and BAAI/bge-m3 for embeddings.
 
-import os, time, json, math, pickle, re, random
+import os, time, json, math, re, random
 import numpy as np
 import httpx
 from concurrent.futures import ThreadPoolExecutor, Future, as_completed
@@ -41,11 +41,6 @@ LLM_REQUEST_TIMEOUT = float(os.getenv("LLM_REQUEST_TIMEOUT", "300"))
 # Number of questions that may be processed concurrently.
 # N=1 → fully sequential. N>1 → sliding window: as soon as one finishes, next starts.
 LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "10"))
-
-# Dataset folder for original chunk pickles
-DEFAULT_LANGCHAIN_DIR = (Path(__file__).resolve().parent / "../../../dataset/3_indexing/3a_langchain_results/").resolve()
-LANGCHAIN_DIR = Path(os.getenv("LANGCHAIN_DIR") or str(DEFAULT_LANGCHAIN_DIR))
-SKIP_FILES = {"all_langchain_documents.pkl"}
 
 # ----------------- Retrieval parameters -----------------
 ENTITY_MATCH_TOP_K           = 10    # top similar KG entities per extracted query entity
@@ -623,54 +618,53 @@ def expand_from_entities(
 
     return list(triples.values()), total_dur
 
-# ----------------- Chunk store -----------------
-class ChunkStore:
-    def __init__(self, root: Path, skip: Set[str]):
-        self.root = root
-        self.skip = skip
-        self._index: Dict[Tuple[str, str], str] = {}
-        self._by_chunk: Dict[str, List[Tuple[str, str]]] = {}
-        self._loaded_files: Set[Path] = set()
-        self._built = False
+# ----------------- Chunk fetching from Neo4j (avoids GPU calls) -----------------
+def fetch_chunks_from_neo4j(
+    pairs: List[Tuple[Any, Any]]
+) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """
+    Batch-fetch TextChunk nodes from Neo4j by (document_id, chunk_id).
+    Returns a dict mapping (norm_doc_id, norm_chunk_id) -> {content, embedding, uu_number, pages}.
+    Embeddings are pre-stored from naive_pipeline indexing — no GPU call needed.
+    """
+    if not pairs:
+        return {}
 
-    def _build_index(self):
-        if self._built:
-            return
-        pkls = [p for p in self.root.glob("*.pkl") if p.name not in self.skip]
-        for pkl in pkls:
-            with open(pkl, "rb") as f:
-                chunks = pickle.load(f)
-            for ch in chunks:
-                meta = getattr(ch, "metadata", {}) if hasattr(ch, "metadata") else {}
-                doc_id = _norm_id(meta.get("document_id"))
-                chunk_id = _norm_id(meta.get("chunk_id"))
-                text = getattr(ch, "page_content", None)
-                if doc_id and chunk_id and isinstance(text, str):
-                    self._index[(doc_id, chunk_id)] = text
-                    self._by_chunk.setdefault(chunk_id, []).append((doc_id, chunk_id))
-            self._loaded_files.add(pkl)
-        self._built = True
+    # Deduplicate and normalize
+    seen: Set[Tuple[str, str]] = set()
+    unique_pairs: List[Tuple[str, str]] = []
+    for doc_id, chunk_id in pairs:
+        k = (_norm_id(doc_id), _norm_id(chunk_id))
+        if k not in seen:
+            seen.add(k)
+            unique_pairs.append(k)
 
-    def get_chunk(self, document_id: Any, chunk_id: Any) -> Optional[str]:
-        if not self._built:
-            self._build_index()
-        doc_id_s = _norm_id(document_id)
-        chunk_id_s = _norm_id(chunk_id)
-        val = self._index.get((doc_id_s, chunk_id_s))
-        if val is not None:
-            return val
-        if "::" in chunk_id_s:
-            base_id = chunk_id_s.split("::", 1)[0]
-            val = self._index.get((doc_id_s, base_id))
-            if val is not None:
-                return val
-        matches = self._by_chunk.get(chunk_id_s)
-        if matches:
-            chosen_doc, chosen_chunk = matches[0]
-            val = self._index.get((chosen_doc, chosen_chunk))
-            if val is not None:
-                return val
-        return None
+    cypher = """
+    UNWIND $pairs AS p
+    OPTIONAL MATCH (c:TextChunk {chunk_id: p.chunk_id, document_id: p.doc_id})
+    RETURN p.chunk_id AS chunk_id, p.doc_id AS doc_id,
+           c.content AS content, c.embedding AS embedding,
+           c.uu_number AS uu_number, c.pages AS pages
+    """
+
+    params = {
+        "pairs": [{"doc_id": doc_id, "chunk_id": chunk_id} for doc_id, chunk_id in unique_pairs]
+    }
+
+    res, _ = run_cypher_with_retry(
+        cypher, params, query_label=f"fetch {len(unique_pairs)} TextChunks from Neo4j"
+    )
+
+    out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for r in res:
+        k = (_norm_id(r["doc_id"]), _norm_id(r["chunk_id"]))
+        out[k] = {
+            "content": r["content"],
+            "embedding": r["embedding"],
+            "uu_number": r["uu_number"],
+            "pages": r["pages"],
+        }
+    return out
 
 # ----------------- Scoring helpers -----------------
 def mean_similarity_to_query_triples(triple_emb: Optional[List[float]], q_trip_embs: List[List[float]]) -> float:
@@ -813,11 +807,17 @@ def triple_centric_retrieval(
     return list(triples_map.values()), q_trip_embs
 
 def collect_chunks_for_triples(
-    triples: List[Dict[str, Any]],
-    chunk_store: ChunkStore
+    triples: List[Dict[str, Any]]
 ) -> List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]]:
+    """Fetch chunk text and pre-stored embeddings from Neo4j TextChunk nodes.
+
+    Embeddings were stored by naive_pipeline_local.py during indexing — no GPU call needed.
+    Returns list of (norm_key, content, triple_dict) with the triple dict enriched with
+    the stored embedding under key "_chunk_embedding".
+    """
     seen_pairs: Set[Tuple[Any, Any]] = set()
-    out: List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]] = []
+    pairs_to_fetch: List[Tuple[Any, Any]] = []
+    ordered_triples: List[Dict[str, Any]] = []
 
     for t in triples:
         doc_id = t.get("document_id")
@@ -829,18 +829,39 @@ def collect_chunks_for_triples(
             )
 
         norm_key = (_norm_id(doc_id), _norm_id(chunk_id))
-        if norm_key in seen_pairs:
-            continue
+        if norm_key not in seen_pairs:
+            seen_pairs.add(norm_key)
+            pairs_to_fetch.append((doc_id, chunk_id))
+            ordered_triples.append(t)
 
-        text = chunk_store.get_chunk(doc_id, chunk_id)
-        if text is None:
+    if not pairs_to_fetch:
+        return []
+
+    # Batch-fetch all chunks from Neo4j in one query
+    chunk_data = fetch_chunks_from_neo4j(pairs_to_fetch)
+
+    out: List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]] = []
+    for doc_id, chunk_id, t in zip(
+        [p[0] for p in pairs_to_fetch],
+        [p[1] for p in pairs_to_fetch],
+        ordered_triples
+    ):
+        norm_key = (_norm_id(doc_id), _norm_id(chunk_id))
+        data = chunk_data.get(norm_key)
+        if data is None:
             raise RuntimeError(
-                f"Chunk not found for triple {t.get('triple_uid')!r}: "
+                f"Chunk not found in Neo4j for triple {t.get('triple_uid')!r}: "
+                f"document_id={doc_id!r}, chunk_id={chunk_id!r}."
+            )
+        content = data["content"]
+        if content is None:
+            raise RuntimeError(
+                f"Chunk content is null in Neo4j for triple {t.get('triple_uid')!r}: "
                 f"document_id={doc_id!r}, chunk_id={chunk_id!r}."
             )
         t["_is_quote_fallback"] = False
-        out.append((norm_key, text, t))
-        seen_pairs.add(norm_key)
+        t["_chunk_embedding"] = data["embedding"]  # pre-stored, no GPU needed
+        out.append((norm_key, content, t))
 
     return out
 
@@ -849,18 +870,25 @@ def rerank_chunks_by_query(
     q_emb_query: List[float],
     top_k: int
 ) -> List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]]:
+    """Rerank chunks by cosine similarity to query embedding.
+
+    Chunk embeddings are pre-stored on TextChunk nodes in Neo4j (from naive_pipeline indexing).
+    We read them from the triple dict (key "_chunk_embedding") — no GPU call needed.
+    """
     cand = chunk_records[:CHUNK_RERANK_CAND_LIMIT]
     if not cand:
         return []
-    # Batch-encode all chunk texts in a single GPU call
-    texts = [text for _, text, _ in cand]
-    embs = embed_texts(texts)
+
+    # Use pre-stored embeddings from Neo4j — no embed_texts() call needed
     q = np.asarray(q_emb_query, dtype=np.float32)
     qn = np.linalg.norm(q)
     if qn > 0.0:
         q = q / qn
     scored: List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]] = []
-    for (key, text, t), emb in zip(cand, embs):
+    for (key, text, t) in cand:
+        emb = t.get("_chunk_embedding")
+        if not emb:
+            continue
         e = np.asarray(emb, dtype=np.float32)
         en = np.linalg.norm(e)
         if en > 0.0:
@@ -959,8 +987,6 @@ def agentic_graph_rag(
 
     t_all_start = now_ms()
     try:
-        chunk_store = ChunkStore(LANGCHAIN_DIR, set(SKIP_FILES))
-
         # Accumulators
         cypher_durations: Dict[str, float] = {}
         llm_durations: Dict[str, float] = {}
@@ -1034,7 +1060,7 @@ def agentic_graph_rag(
         # Step 7: Collect chunks, rerank
         # ------------------------------------------------------------------
         _t7 = _step_start(7, "Collect and rerank chunks")
-        chunk_records = collect_chunks_for_triples(merged_triples, chunk_store)
+        chunk_records = collect_chunks_for_triples(merged_triples)
         chunks_ranked = rerank_chunks_by_query(chunk_records, q_emb_query, top_k=MAX_CHUNKS_FINAL)
         _step_finish(7, "Collect and rerank chunks", _t7)
 
