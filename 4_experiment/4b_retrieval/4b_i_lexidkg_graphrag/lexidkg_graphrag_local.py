@@ -3,6 +3,7 @@
 # Local version: uses LM Studio (OpenAI-compatible API) for LLM calls and BAAI/bge-m3 for embeddings.
 
 import os, time, json, math, pickle, re, random
+import httpx
 from concurrent.futures import ThreadPoolExecutor, Future, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional, Set
@@ -32,7 +33,9 @@ LOCAL_GEN_MODEL   = os.getenv("LOCAL_GEN_MODEL",   "qwen/qwen3.5-9b")
 LOCAL_EMBED_MODEL = os.getenv("LOCAL_EMBED_MODEL",  "BAAI/bge-m3")
 
 # Per-request timeout in seconds for LMStudio LLM calls.
-LLM_REQUEST_TIMEOUT = float(os.getenv("LLM_REQUEST_TIMEOUT", "12000"))
+# Default 300 s – long enough for a large generation, short enough to detect
+# dead connections before the process hangs indefinitely.
+LLM_REQUEST_TIMEOUT = float(os.getenv("LLM_REQUEST_TIMEOUT", "300"))
 
 # Number of questions that may be processed concurrently.
 # N=1 → fully sequential. N>1 → sliding window: as soon as one finishes, next starts.
@@ -44,22 +47,37 @@ LANGCHAIN_DIR = Path(os.getenv("LANGCHAIN_DIR") or str(DEFAULT_LANGCHAIN_DIR))
 SKIP_FILES = {"all_langchain_documents.pkl"}
 
 # ----------------- Retrieval parameters -----------------
-ENTITY_MATCH_TOP_K           = 15    # top similar KG entities per extracted query entity
+ENTITY_MATCH_TOP_K           = 10    # top similar KG entities per extracted query entity
 ENTITY_SUBGRAPH_HOPS         = 4    # hop-depth for subgraph expansion
 ENTITY_SUBGRAPH_PER_HOP_LIMIT = 2000
-SUBGRAPH_TRIPLES_TOP_K       = 30   # top triples from subgraph after triple-vs-triple similarity
+SUBGRAPH_TRIPLES_TOP_K       = 10   # top triples from subgraph after triple-vs-triple similarity
 
-QUERY_TRIPLE_MATCH_TOP_K_PER = 20   # per query-triple, top similar KG triples
+QUERY_TRIPLE_MATCH_TOP_K_PER = 10   # per query-triple, top similar KG triples
 
-MAX_TRIPLES_FINAL      = 60
-MAX_CHUNKS_FINAL       = 40
-CHUNK_RERANK_CAND_LIMIT = 200
+MAX_TRIPLES_FINAL      = 20
+MAX_CHUNKS_FINAL       = 20
+CHUNK_RERANK_CAND_LIMIT = 20
 
 ANSWER_MAX_TOKENS = 4096
 
 # ----------------- Initialize SDKs -----------------
 # LM Studio client (OpenAI-compatible)
-lmstudio_client = OpenAI(base_url=LMSTUDIO_BASE_URL, api_key="lm-studio", timeout=LLM_REQUEST_TIMEOUT)
+# Use a custom httpx transport with keep-alive disabled so every request
+# gets a fresh TCP connection.  LM Studio silently drops keep-alive connections
+# after a few requests which causes the OpenAI client to hang indefinitely on
+# a socket that will never respond.
+_http_transport = httpx.HTTPTransport(retries=0)
+_http_client = httpx.Client(
+    transport=_http_transport,
+    timeout=httpx.Timeout(LLM_REQUEST_TIMEOUT),
+    headers={"Connection": "close"},  # disable HTTP keep-alive
+)
+lmstudio_client = OpenAI(
+    base_url=LMSTUDIO_BASE_URL,
+    api_key="lm-studio",
+    timeout=LLM_REQUEST_TIMEOUT,
+    http_client=_http_client,
+)
 print(f"[Init] Using LMStudio generation model: {LOCAL_GEN_MODEL}")
 print(f"[Init] LMStudio base URL: {LMSTUDIO_BASE_URL}")
 
@@ -107,6 +125,27 @@ def log(msg: Any = ""):
     else:
         print(msg, flush=True)
 
+def _tl_qid() -> str:
+    """Return a question-id prefix string for terminal logs, e.g. '[q42]'."""
+    qid = getattr(_thread_local, "question_id", None)
+    return f"[q{qid}]" if qid is not None else "[q?]"
+
+def _tl_hop() -> str:
+    """Return current hop label, e.g. 'hop=2', or '' if not inside expansion."""
+    hop = getattr(_thread_local, "cypher_hop", None)
+    return f" hop={hop}/{ENTITY_SUBGRAPH_HOPS}" if hop is not None else ""
+
+def _step_start(step_num: int, label: str) -> float:
+    """Print a step-start banner and return the start timestamp."""
+    t0 = now_ms()
+    print(f"{_tl_qid()} [STEP {step_num} START] {label}", flush=True)
+    return t0
+
+def _step_finish(step_num: int, label: str, t0: float) -> None:
+    """Print a step-finish banner with duration."""
+    elapsed = dur_s(t0)
+    print(f"{_tl_qid()} [STEP {step_num} FINISH] {label} | duration={elapsed:.3f}s", flush=True)
+
 def make_timestamp_name() -> str:
     t = time.time()
     base = time.strftime("%Y%m%d-%H%M%S", time.localtime(t))
@@ -127,7 +166,7 @@ def _norm_id(x) -> str:
     return str(x).strip() if x is not None else ""
 
 def count_tokens(text: str) -> int:
-    """Heuristic: ~4 characters per token."""
+    """Heuristic fallback: ~4 characters per token. Prefer completion.usage fields when available."""
     return max(1, int(len(text) / 4))
 
 def _as_float_list(vec) -> List[float]:
@@ -160,8 +199,8 @@ def cos_sim(a: List[float], b: List[float]) -> float:
 def safe_generate_json(prompt: str, schema: Dict[str, Any], temp: float = 0.0) -> Tuple[Dict[str, Any], float, float, float, str]:
     """Returns (result_dict, prompt_tokens, response_tokens, duration_s, raw_text).
     Uses LM Studio (OpenAI-compatible). Schema is ignored at API level; we parse JSON from response.
+    prompt_tokens / response_tokens come from completion.usage when available.
     """
-    prompt_tokens = count_tokens(prompt)
     t0 = now_ms()
     completion = lmstudio_client.chat.completions.create(
         model=LOCAL_GEN_MODEL,
@@ -169,6 +208,9 @@ def safe_generate_json(prompt: str, schema: Dict[str, Any], temp: float = 0.0) -
         temperature=temp,
     )
     duration_s = dur_s(t0)
+    # Use server-reported token counts (accurate, includes chat-template overhead)
+    usage = getattr(completion, "usage", None)
+    prompt_tokens = (usage.prompt_tokens if usage and usage.prompt_tokens is not None else count_tokens(prompt))
     raw_text = ""
     result = {}
     try:
@@ -207,14 +249,14 @@ def safe_generate_json(prompt: str, schema: Dict[str, Any], temp: float = 0.0) -
         result = json.loads(clean)
     except Exception:
         raise Exception(f"Failed to parse JSON from response: {raw_text}")
-    response_tokens = count_tokens(raw_text)
+    response_tokens = (usage.completion_tokens if usage and usage.completion_tokens is not None else count_tokens(raw_text))
     return result, prompt_tokens, response_tokens, duration_s, raw_text
 
 def safe_generate_text(prompt: str, max_tokens: int, temperature: float = 0.2) -> Tuple[str, float, float, float]:
     """Returns (text, prompt_tokens, response_tokens, duration_s).
     Uses LM Studio (OpenAI-compatible).
+    prompt_tokens / response_tokens come from completion.usage when available.
     """
-    prompt_tokens = count_tokens(prompt)
     t0 = now_ms()
     completion = lmstudio_client.chat.completions.create(
         model=LOCAL_GEN_MODEL,
@@ -223,10 +265,14 @@ def safe_generate_text(prompt: str, max_tokens: int, temperature: float = 0.2) -
         max_tokens=max_tokens,
     )
     duration_s = dur_s(t0)
+    # Use server-reported token counts (accurate, includes chat-template overhead)
+    usage = getattr(completion, "usage", None)
+    prompt_tokens = (usage.prompt_tokens if usage and usage.prompt_tokens is not None else count_tokens(prompt))
     text = (completion.choices[0].message.content or "").strip()
     if not text:
         raise RuntimeError("LLM returned an empty response.")
-    return text, prompt_tokens, count_tokens(text), duration_s  # text itself is the response content
+    response_tokens = (usage.completion_tokens if usage and usage.completion_tokens is not None else count_tokens(text))
+    return text, prompt_tokens, response_tokens, duration_s
 
 # ----------------- Agent 1b: triple extraction from query -----------------
 QUERY_TRIPLES_SCHEMA = {
@@ -275,7 +321,7 @@ Rules:
 - Predicates should be concise (lowercase, snake_case if multiword).
 - If type is unknown, leave it blank.
 - Do not invent or speculate; extract only what is clearly suggested by the question.
-- If partial triples are available, e.g. subject-predicate or predicate-object, extract what is available and leave the rest as empty strings.
+-  If partial triples are available (at least two out of subject, predicate, and object), e.g. subject-predicate, predicate-object or subject-object, extract what is available and leave the rest as empty strings.
 
 Return JSON with a key "triples" as specified.
 
@@ -293,11 +339,13 @@ User question:
             s = {"text": s, "type": ""}
         if isinstance(o, str):
             o = {"text": o, "type": ""}
-        if s.get("text") and o.get("text") and p:
+        s_text = s.get("text", "").strip()
+        o_text = o.get("text", "").strip()
+        if s_text or p or o_text:  # accept any partial triple with at least one non-empty component
             clean.append({
-                "subject": {"text": s.get("text", "").strip(), "type": (s.get("type") or "").strip()},
+                "subject": {"text": s_text, "type": (s.get("type") or "").strip()},
                 "predicate": p,
-                "object":  {"text": o.get("text", "").strip(), "type": (o.get("type") or "").strip()},
+                "object":  {"text": o_text, "type": (o.get("type") or "").strip()},
             })
     return clean, prompt_tokens, response_tokens, duration_s, raw_response_text
 
@@ -355,6 +403,10 @@ def run_cypher_with_retry(cypher: str, params: Dict[str, Any], query_label: str 
     attempts = 0
     last_e: Optional[Exception] = None
     qid = _next_query_id()
+    hop_info = _tl_hop()
+    prefix = _tl_qid()
+    print(f"{prefix} [CYPHER START] qid={qid}{hop_info} | {query_label}", flush=True)
+    t_cypher_start = now_ms()
     while attempts < max(1, NEO4J_MAX_ATTEMPTS):
         attempts += 1
         t0 = now_ms()
@@ -362,6 +414,8 @@ def run_cypher_with_retry(cypher: str, params: Dict[str, Any], query_label: str 
             with driver.session() as session:
                 res = session.run(cypher, **params, timeout=NEO4J_TX_TIMEOUT_S)
                 records = list(res)
+            cypher_dur = dur_s(t_cypher_start)
+            print(f"{prefix} [CYPHER FINISH] qid={qid}{hop_info} | {query_label} | duration={cypher_dur:.3f}s", flush=True)
             return records, dur_s(t0)
         except Exception as e:
             last_e = e
@@ -464,9 +518,12 @@ def expand_from_entities(
     current_keys: Set[str] = set(x for x in (entity_keys or []) if x)
     total_dur = 0.0
 
-    for _ in range(hops):
+    for hop_idx in range(hops):
         if not current_ids and not current_keys:
             break
+
+        # Expose current hop number to run_cypher_with_retry via thread-local
+        _thread_local.cypher_hop = hop_idx + 1
 
         if current_ids:
             cypher = """
@@ -493,6 +550,7 @@ def expand_from_entities(
             params = {"keys": list(current_keys), "limit": per_hop_limit}
 
         res, dur = run_cypher_with_retry(cypher, params, query_label="subgraph expansion hop")
+        _thread_local.cypher_hop = None  # reset after each hop query
         total_dur += dur
 
         next_ids: Set[str] = set()
@@ -810,6 +868,8 @@ def agentic_graph_rag(
     else:
         log_file = Path.cwd() / f"{qid_str}{ts_name}.txt"
     _thread_local.logger = FileLogger(log_file, also_console=True)
+    _thread_local.question_id = question_id
+    _thread_local.cypher_hop = None
 
     t_all_start = now_ms()
     try:
@@ -822,8 +882,10 @@ def agentic_graph_rag(
         # ------------------------------------------------------------------
         # Step 1: Agent 1b – extract triples from query
         # ------------------------------------------------------------------
+        _t1 = _step_start(1, "Agent 1b – extract triples from query")
         query_triples, a1b_prompt_tok, a1b_resp_tok, a1b_dur, a1b_raw_response = agent1b_extract_query_triples(query_original)
         llm_durations["agent1b"] = a1b_dur
+        _step_finish(1, "Agent 1b – extract triples from query", _t1)
 
         # Entities = subjects + objects from Agent 1b triples
         query_entities = entities_from_triples(query_triples)
@@ -831,17 +893,22 @@ def agentic_graph_rag(
         # ------------------------------------------------------------------
         # Step 2: Embed whole query (for chunk reranking / fallback scoring)
         # ------------------------------------------------------------------
+        _t2 = _step_start(2, "Embed whole query")
         q_emb_query = embed_text(query_original)
+        _step_finish(2, "Embed whole query", _t2)
 
         # ------------------------------------------------------------------
         # Step 3: Triple-centric retrieval
         # ------------------------------------------------------------------
+        _t3 = _step_start(3, "Triple-centric retrieval")
         matched_entities_log: List[Dict[str, Any]] = []
         ctx2_triples, q_trip_embs = triple_centric_retrieval(query_triples, cypher_durations=cypher_durations)
+        _step_finish(3, "Triple-centric retrieval", _t3)
 
         # ------------------------------------------------------------------
         # Step 4: Entity-centric retrieval
         # ------------------------------------------------------------------
+        _t4 = _step_start(4, "Entity-centric retrieval")
         ctx1_triples = entity_centric_retrieval(
             query_entities,
             q_trip_embs=q_trip_embs,
@@ -849,6 +916,7 @@ def agentic_graph_rag(
             cypher_durations=cypher_durations,
             matched_entities_log=matched_entities_log,
         )
+        _step_finish(4, "Entity-centric retrieval", _t4)
 
         # Collect subgraph triples for logging (top k from entity-centric before merge)
         subgraph_triples_log = ctx1_triples  # already top-SUBGRAPH_TRIPLES_TOP_K
@@ -856,6 +924,7 @@ def agentic_graph_rag(
         # ------------------------------------------------------------------
         # Step 5: Merge and dedupe triples
         # ------------------------------------------------------------------
+        _t5 = _step_start(5, "Merge and dedupe triples")
         triple_map: Dict[str, Dict[str, Any]] = {}
         for t in ctx1_triples + ctx2_triples:
             uid = t.get("triple_uid")
@@ -864,27 +933,34 @@ def agentic_graph_rag(
                 if prev is None or (t.get("score", 0.0) > prev.get("score", 0.0)):
                     triple_map[uid] = t
         merged_triples = list(triple_map.values())
+        _step_finish(5, "Merge and dedupe triples", _t5)
 
         # ------------------------------------------------------------------
         # Step 6: Rerank triples
         # ------------------------------------------------------------------
+        _t6 = _step_start(6, "Rerank triples")
         triples_ranked, triple_scores = rerank_triples_by_query_triples(
             merged_triples, q_trip_embs=q_trip_embs, q_emb_fallback=q_emb_query, top_k=MAX_TRIPLES_FINAL
         )
+        _step_finish(6, "Rerank triples", _t6)
 
         # ------------------------------------------------------------------
         # Step 7: Collect chunks, rerank
         # ------------------------------------------------------------------
+        _t7 = _step_start(7, "Collect and rerank chunks")
         chunk_records = collect_chunks_for_triples(merged_triples, chunk_store)
         chunks_ranked = rerank_chunks_by_query(chunk_records, q_emb_query, top_k=MAX_CHUNKS_FINAL)
+        _step_finish(7, "Collect and rerank chunks", _t7)
 
         # ------------------------------------------------------------------
         # Step 8: Build context and generate answer (Agent 2)
         # ------------------------------------------------------------------
+        _t8 = _step_start(8, "Build context and generate answer (Agent 2)")
         context_text, _, _ = build_combined_context_text(triples_ranked, chunks_ranked)
 
         answer, a2_prompt_tok, a2_resp_tok, a2_dur = agent2_answer(query_original, context_text)
         llm_durations["agent2"] = a2_dur
+        _step_finish(8, "Build context and generate answer (Agent 2)", _t8)
 
         total_dur_s = dur_s(t_all_start)
         total_cypher_s = sum(cypher_durations.values())
@@ -967,6 +1043,8 @@ def agentic_graph_rag(
         if _local_logger is not None:
             _local_logger.close()
         _thread_local.logger = None
+        _thread_local.question_id = None
+        _thread_local.cypher_hop = None
 
 # ----------------- Main -----------------
 if __name__ == "__main__":
@@ -1042,17 +1120,23 @@ if __name__ == "__main__":
             processed_ids.add(qid)
 
     with ThreadPoolExecutor(max_workers=LLM_CONCURRENCY) as executor:
-        futures: List[Future] = []
         global_idx = skipped_count  # already-processed count
-        for qa in pending_pairs:
-            global_idx += 1
-            fut = executor.submit(process_one, qa, global_idx)
-            futures.append(fut)
-        for fut in as_completed(futures):
-            exc = fut.exception()
-            if exc:
-                driver.close()
-                raise exc
+        # Submit questions one sliding-window batch at a time so we don't
+        # queue thousands of futures before detecting an error.
+        # With LLM_CONCURRENCY=1 this is fully sequential.
+        chunk_size = max(1, LLM_CONCURRENCY)
+        for batch_start in range(0, len(pending_pairs), chunk_size):
+            batch = pending_pairs[batch_start : batch_start + chunk_size]
+            futures: List[Future] = []
+            for qa in batch:
+                global_idx += 1
+                fut = executor.submit(process_one, qa, global_idx)
+                futures.append(fut)
+            for fut in as_completed(futures):
+                exc = fut.exception()
+                if exc:
+                    driver.close()
+                    raise exc
 
     driver.close()
     print(f"[Done] Results saved to: {OUTPUT_FILE}")
