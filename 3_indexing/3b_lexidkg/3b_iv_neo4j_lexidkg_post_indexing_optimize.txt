@@ -1,0 +1,80 @@
+// ============================================================
+// 3b_iv_neo4j_lexidkg_post_indexing_optimize.txt
+// Run AFTER 3b_iii_neo4j_lexidkg_post_indexing.txt.
+// Purpose: speed up GraphRAG context-building (steps 2-8)
+//          WITHOUT re-indexing the graph.
+// ============================================================
+
+// ----------------------------------------------------------
+// 1.  Cache subject/object name, key, type on every Triple node.
+//     This eliminates 2 OPTIONAL MATCH traversals per Triple
+//     in search_similar_triples_by_embedding and
+//     expand_from_entities (every hop).
+//
+//     Option A — with APOC (batched, memory-safe, recommended):
+// ----------------------------------------------------------
+CALL apoc.periodic.iterate(
+  'MATCH (tr:Triple) RETURN tr',
+  'OPTIONAL MATCH (tr)-[:SUBJECT]->(s)
+   OPTIONAL MATCH (tr)-[:OBJECT]->(o)
+   SET tr.s_name = s.name,
+       tr.s_key  = s.key,
+       tr.s_type = s.type,
+       tr.o_name = o.name,
+       tr.o_key  = o.key,
+       tr.o_type = o.type',
+  {batchSize: 500, parallel: false}
+) YIELD batches, total RETURN batches, total;
+
+// ----------------------------------------------------------
+//     Option B — without APOC (runs as a single transaction;
+//     safe for graphs up to ~1 M triples, may be slow):
+// ----------------------------------------------------------
+// MATCH (tr:Triple)
+// OPTIONAL MATCH (tr)-[:SUBJECT]->(s)
+// OPTIONAL MATCH (tr)-[:OBJECT]->(o)
+// SET tr.s_name = s.name, tr.s_key = s.key, tr.s_type = s.type,
+//     tr.o_name = o.name, tr.o_key = o.key, tr.o_type = o.type;
+
+// ----------------------------------------------------------
+// 2.  Verify that every Triple was cached (expect 0).
+// ----------------------------------------------------------
+// MATCH (tr:Triple)
+// WHERE tr.s_name IS NULL OR tr.o_name IS NULL
+// RETURN count(tr) AS uncached_triples;
+
+// ----------------------------------------------------------
+// 3.  Composite range index on Triple — acts as a covering
+//     index in Neo4j 5.x so property reads skip the heap.
+// ----------------------------------------------------------
+CREATE INDEX triple_uid_covering IF NOT EXISTS
+FOR (t:Triple)
+ON (t.triple_uid, t.predicate, t.document_id, t.chunk_id,
+    t.uu_number, t.evidence_quote, t.evidence_article_ref,
+    t.s_name, t.s_key, t.s_type,
+    t.o_name, t.o_key, t.o_type);
+
+// ----------------------------------------------------------
+// 4.  Relationship property index on PREDICATE(triple_uid).
+//     The hop-expand query reads r.triple_uid from all
+//     outgoing PREDICATE relationships; this index avoids a
+//     full relationship scan.
+// ----------------------------------------------------------
+CREATE INDEX predicate_triple_uid_idx IF NOT EXISTS
+FOR ()-[r:PREDICATE]-()
+ON (r.triple_uid);
+
+// ----------------------------------------------------------
+// 5.  Composite range index on Entity(key, name, type).
+//     The three vector searches return Entity nodes and then
+//     read key/name/type; this index lets Neo4j serve those
+//     properties without extra heap reads.
+// ----------------------------------------------------------
+CREATE INDEX entity_key_name_type_idx IF NOT EXISTS
+FOR (n:Entity)
+ON (n.key, n.name, n.type);
+
+// ----------------------------------------------------------
+// 6.  Wait for all indexes to come ONLINE before proceeding.
+// ----------------------------------------------------------
+CALL db.awaitIndexes();

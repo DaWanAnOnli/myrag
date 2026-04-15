@@ -86,7 +86,15 @@ print(f"[Init] Loading embedding model: {LOCAL_EMBED_MODEL} ...")
 _bge_model = SentenceTransformer(LOCAL_EMBED_MODEL, trust_remote_code=True)
 print(f"[Init] Embedding model loaded.")
 
-driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+# BGE-M3 embedding lock -- SentenceTransformer.encode is NOT thread-safe
+_bge_lock = threading.Lock()
+
+driver = GraphDatabase.driver(
+    NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS),
+    max_connection_lifetime=3600,
+    max_connection_pool_size=LLM_CONCURRENCY + 10,
+    connection_acquisition_timeout=60,
+)
 
 # ----------------- Logger -----------------
 def _now_ts() -> str:
@@ -181,9 +189,24 @@ def _rand_wait_seconds() -> float:
     return random.uniform(5.0, 15.0)
 
 def embed_text(text: str) -> List[float]:
-    """Embed using local BAAI/bge-m3 model via SentenceTransformer."""
-    vec = _bge_model.encode(text, normalize_embeddings=True)
+    """Embed using local BAAI/bge-m3 model via SentenceTransformer.
+    Thread-safe: encodes one text at a time under a lock.
+    For batch encoding, use embed_texts_batch() instead.
+    """
+    with _bge_lock:
+        vec = _bge_model.encode(text, normalize_embeddings=True)
     return _as_float_list(vec)
+
+def embed_texts_batch(texts: List[str]) -> List[List[float]]:
+    """Batch encode multiple texts via BGE-M3 in a single model call.
+    Thread-safe (uses the shared _bge_lock).
+    Returns list of embedding vectors in the same order as input texts.
+    """
+    if not texts:
+        return []
+    with _bge_lock:
+        vecs = _bge_model.encode(texts, batch_size=32, normalize_embeddings=True)
+    return [_as_float_list(v) for v in vecs]
 
 def cos_sim(a: List[float], b: List[float]) -> float:
     a = _as_float_list(a)
@@ -451,31 +474,51 @@ def _vector_query_nodes(index_name: str, q_emb: List[float], k: int) -> Tuple[Li
     return rows, dur
 
 def search_similar_entities_by_embedding(q_emb: List[float], k: int) -> Tuple[List[Dict[str, Any]], float]:
-    """Returns (matched_entities, total_duration_s)."""
-    candidates: List[Dict[str, Any]] = []
-    total_dur = 0.0
-    for idx_name in ("document_vec", "content_vec", "expression_vec"):
-        rows, dur = _vector_query_nodes(idx_name, q_emb, k)
-        candidates.extend(rows)
-        total_dur += dur
-
+    """Returns (matched_entities, total_duration_s).
+    Parallelizes 3 vector index searches for ~3x wall-clock speedup.
+    """
+    idx_names = ("document_vec", "content_vec", "expression_vec")
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {
+            executor.submit(_vector_query_nodes, idx_name, q_emb, k): idx_name
+            for idx_name in idx_names
+        }
+        candidates: List[Dict[str, Any]] = []
+        total_dur = 0.0
+        for fut in as_completed(futures):
+            rows, dur = fut.result()
+            candidates.extend(rows)
+            total_dur += dur
     best: Dict[str, Dict[str, Any]] = {}
     for row in candidates:
         dedup_key = row.get("elem_id") or f"{row.get('key')}|{row.get('type')}"
         if dedup_key not in best or (row.get("score", -1) > best[dedup_key].get("score", -1)):
             best[dedup_key] = row
-
     merged = list(best.values())
     merged.sort(key=lambda x: x.get("score", 0.0), reverse=True)
     return merged[:k], total_dur
 
 def search_similar_triples_by_embedding(q_emb: List[float], k: int) -> Tuple[List[Dict[str, Any]], float]:
     q_emb = _as_float_list(q_emb)
+    # Use cached s_name/o_name/etc. from the composite covering index
+    # instead of OPTIONAL MATCH traversals (2 per result row).
     cypher = """
     CALL db.index.vector.queryNodes('triple_vec', $k, $q_emb) YIELD node AS tr, score
-    OPTIONAL MATCH (tr)-[:SUBJECT]->(s)
-    OPTIONAL MATCH (tr)-[:OBJECT]->(o)
-    RETURN tr, s, o, score
+    RETURN tr.triple_uid             AS triple_uid,
+           tr.predicate               AS predicate,
+           tr.uu_number               AS uu_number,
+           tr.evidence_quote          AS evidence_quote,
+           tr.document_id             AS document_id,
+           tr.chunk_id               AS chunk_id,
+           tr.evidence_article_ref   AS evidence_article_ref,
+           tr.s_name                 AS subject,
+           tr.s_key                  AS subject_key,
+           tr.s_type                 AS subject_type,
+           tr.o_name                 AS object,
+           tr.o_key                  AS object_key,
+           tr.o_type                 AS object_type,
+           tr.embedding              AS embedding,
+           score
     ORDER BY score DESC
     LIMIT $k
     """
@@ -485,23 +528,22 @@ def search_similar_triples_by_embedding(q_emb: List[float], k: int) -> Tuple[Lis
     )
     rows = []
     for r in res:
-        tr = r["tr"]; s = r["s"]; o = r["o"]
         rows.append({
-            "triple_uid": tr.get("triple_uid"),
-            "predicate": tr.get("predicate"),
-            "uu_number": tr.get("uu_number"),
-            "evidence_quote": tr.get("evidence_quote"),
-            "subject": s.get("name") if s else None,
-            "subject_key": s.get("key") if s else None,
-            "subject_type": s.get("type") if s else None,
-            "object": o.get("name") if o else None,
-            "object_key": o.get("key") if o else None,
-            "object_type": o.get("type") if o else None,
+            "triple_uid": r["triple_uid"],
+            "predicate": r["predicate"],
+            "uu_number": r["uu_number"],
+            "evidence_quote": r["evidence_quote"],
+            "subject": r["subject"],
+            "subject_key": r["subject_key"],
+            "subject_type": r["subject_type"],
+            "object": r["object"],
+            "object_key": r["object_key"],
+            "object_type": r["object_type"],
             "score": r["score"],
-            "embedding": tr.get("embedding"),
-            "document_id": tr.get("document_id"),
-            "chunk_id": tr.get("chunk_id"),
-            "evidence_article_ref": tr.get("evidence_article_ref"),
+            "embedding": r["embedding"],
+            "document_id": r["document_id"],
+            "chunk_id": r["chunk_id"],
+            "evidence_article_ref": r["evidence_article_ref"],
         })
     return rows, dur
 
@@ -510,9 +552,15 @@ def expand_from_entities(
     entity_keys: List[str],
     hops: int,
     per_hop_limit: int,
-    entity_elem_ids: Optional[List[str]] = None
+    entity_elem_ids: Optional[List[str]] = None,
+    entity_emb_cache: Optional[Dict[str, List[float]]] = None,
+    q_trip_embs: Optional[List[List[float]]] = None,
+    q_emb_fallback: Optional[List[float]] = None,
 ) -> Tuple[List[Dict[str, Any]], float]:
-    """Returns (triples, total_duration_s)."""
+    """Returns (triples, total_duration_s).
+    Uses cached s_name/o_name/etc. properties instead of OPTIONAL MATCH traversals.
+    Scores and returns top SUBGRAPH_TRIPLES_TOP_K triples.
+    """
     triples: Dict[str, Dict[str, Any]] = {}
     current_ids: Set[str] = set(x for x in (entity_elem_ids or []) if x)
     current_keys: Set[str] = set(x for x in (entity_keys or []) if x)
@@ -526,26 +574,51 @@ def expand_from_entities(
         _thread_local.cypher_hop = hop_idx + 1
 
         if current_ids:
+            # Use cached properties from covering index; no OPTIONAL MATCH traversals
             cypher = """
             UNWIND $ids AS eid
             MATCH (e) WHERE elementId(e) = eid
-            MATCH (e)-[r:PREDICATE]->()
-            WITH DISTINCT r.triple_uid AS uid LIMIT $limit
+            MATCH (e)-[r:PREDICATE]->(tr:Triple)
+            WITH r.triple_uid AS uid
+            LIMIT $limit
             MATCH (tr:Triple {triple_uid: uid})
-            OPTIONAL MATCH (tr)-[:SUBJECT]->(s)
-            OPTIONAL MATCH (tr)-[:OBJECT]->(o)
-            RETURN tr, s, o, elementId(s) AS s_id, elementId(o) AS o_id
+            RETURN tr.triple_uid             AS triple_uid,
+                   tr.predicate               AS predicate,
+                   tr.uu_number               AS uu_number,
+                   tr.evidence_quote          AS evidence_quote,
+                   tr.embedding               AS embedding,
+                   tr.document_id             AS document_id,
+                   tr.chunk_id               AS chunk_id,
+                   tr.evidence_article_ref   AS evidence_article_ref,
+                   tr.s_name                 AS subject,
+                   tr.s_key                  AS subject_key,
+                   tr.s_type                 AS subject_type,
+                   tr.o_name                 AS object,
+                   tr.o_key                  AS object_key,
+                   tr.o_type                 AS object_type
             """
             params = {"ids": list(current_ids), "limit": per_hop_limit}
         else:
             cypher = """
             UNWIND $keys AS k
-            MATCH (e:Entity {key:k})-[r:PREDICATE]->()
-            WITH DISTINCT r.triple_uid AS uid LIMIT $limit
+            MATCH (e:Entity {key:k})-[r:PREDICATE]->(tr:Triple)
+            WITH r.triple_uid AS uid
+            LIMIT $limit
             MATCH (tr:Triple {triple_uid: uid})
-            OPTIONAL MATCH (tr)-[:SUBJECT]->(s)
-            OPTIONAL MATCH (tr)-[:OBJECT]->(o)
-            RETURN tr, s, o, elementId(s) AS s_id, elementId(o) AS o_id
+            RETURN tr.triple_uid             AS triple_uid,
+                   tr.predicate               AS predicate,
+                   tr.uu_number               AS uu_number,
+                   tr.evidence_quote          AS evidence_quote,
+                   tr.embedding               AS embedding,
+                   tr.document_id             AS document_id,
+                   tr.chunk_id               AS chunk_id,
+                   tr.evidence_article_ref   AS evidence_article_ref,
+                   tr.s_name                 AS subject,
+                   tr.s_key                  AS subject_key,
+                   tr.s_type                 AS subject_type,
+                   tr.o_name                 AS object,
+                   tr.o_key                  AS object_key,
+                   tr.o_type                 AS object_type
             """
             params = {"keys": list(current_keys), "limit": per_hop_limit}
 
@@ -553,40 +626,53 @@ def expand_from_entities(
         _thread_local.cypher_hop = None  # reset after each hop query
         total_dur += dur
 
-        next_ids: Set[str] = set()
         next_keys: Set[str] = set()
         for r in res:
-            tr = r["tr"]; s = r["s"]; o = r["o"]
-            uid = tr.get("triple_uid")
+            uid = r["triple_uid"]
             if uid not in triples:
                 triples[uid] = {
                     "triple_uid": uid,
-                    "predicate": tr.get("predicate"),
-                    "uu_number": tr.get("uu_number"),
-                    "evidence_quote": tr.get("evidence_quote"),
-                    "embedding": tr.get("embedding"),
-                    "document_id": tr.get("document_id"),
-                    "chunk_id": tr.get("chunk_id"),
-                    "evidence_article_ref": tr.get("evidence_article_ref"),
-                    "subject": s.get("name") if s else None,
-                    "subject_key": s.get("key") if s else None,
-                    "subject_type": s.get("type") if s else None,
-                    "object": o.get("name") if o else None,
-                    "object_key": o.get("key") if o else None,
-                    "object_type": o.get("type") if o else None,
+                    "predicate": r["predicate"],
+                    "uu_number": r["uu_number"],
+                    "evidence_quote": r["evidence_quote"],
+                    "embedding": r["embedding"],
+                    "document_id": r["document_id"],
+                    "chunk_id": r["chunk_id"],
+                    "evidence_article_ref": r["evidence_article_ref"],
+                    "subject": r["subject"],
+                    "subject_key": r["subject_key"],
+                    "subject_type": r["subject_type"],
+                    "object": r["object"],
+                    "object_key": r["object_key"],
+                    "object_type": r["object_type"],
                 }
-            if s:
-                if s.get("key"): next_keys.add(s.get("key"))
-            if o:
-                if o.get("key"): next_keys.add(o.get("key"))
-            s_id = r.get("s_id"); o_id = r.get("o_id")
-            if s_id: next_ids.add(s_id)
-            if o_id: next_ids.add(o_id)
+            sk = r.get("subject_key")
+            ok = r.get("object_key")
+            if sk: next_keys.add(sk)
+            if ok: next_keys.add(ok)
 
-        current_ids = next_ids if next_ids else set()
-        current_keys = set() if next_ids else next_keys
+        # Cap entity frontier to prevent exponential growth
+        ENTITY_SUBGRAPH_UNIQUE_ENTITIES_PER_HOP = 500
+        if len(next_keys) > ENTITY_SUBGRAPH_UNIQUE_ENTITIES_PER_HOP:
+            next_keys = set(list(next_keys)[:ENTITY_SUBGRAPH_UNIQUE_ENTITIES_PER_HOP])
 
-    return list(triples.values()), total_dur
+        current_ids = set()
+        current_keys = next_keys
+
+    # Score and return top-K triples
+    if not triples:
+        return [], total_dur
+
+    def score(t: Dict[str, Any]) -> float:
+        emb = t.get("embedding")
+        if q_trip_embs:
+            return mean_similarity_to_query_triples(emb, q_trip_embs)
+        if q_emb_fallback and isinstance(emb, list):
+            return cos_sim(q_emb_fallback, emb)
+        return 0.0
+
+    ranked = sorted(triples.values(), key=score, reverse=True)
+    return ranked[:SUBGRAPH_TRIPLES_TOP_K], total_dur
 
 # ----------------- Chunk store -----------------
 class ChunkStore:
@@ -655,11 +741,13 @@ def entity_centric_retrieval(
     q_emb_fallback: Optional[List[float]] = None,
     cypher_durations: Optional[Dict[str, float]] = None,
     matched_entities_log: Optional[List[Dict[str, Any]]] = None,
+    entity_emb_cache: Optional[Dict[str, List[float]]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Retrieves triples via entity->KG match->subgraph expansion.
     cypher_durations: accumulator dict for Cypher query durations.
     matched_entities_log: list to append matched entity info for logging.
+    entity_emb_cache: pre-computed embeddings for query entities (from batch encoding).
     """
     all_matched_keys: Set[str] = set()
     all_matched_ids: Set[str] = set()
@@ -668,7 +756,11 @@ def entity_centric_retrieval(
         text = (e.get("text") or "").strip()
         if not text:
             continue
-        e_emb = embed_text(text)
+        # Use pre-computed batch embedding if available
+        if entity_emb_cache and text in entity_emb_cache:
+            e_emb = entity_emb_cache[text]
+        else:
+            e_emb = embed_text(text)
         matches, sim_dur = search_similar_entities_by_embedding(e_emb, k=ENTITY_MATCH_TOP_K)
         if cypher_durations is not None:
             cypher_durations["entity_vector_search"] = cypher_durations.get("entity_vector_search", 0.0) + sim_dur
@@ -691,39 +783,33 @@ def entity_centric_retrieval(
     if not (all_matched_keys or all_matched_ids):
         return []
 
+    # expand_from_entities now scores and returns top-K directly
     expanded_triples, expand_dur = expand_from_entities(
         list(all_matched_keys),
         hops=ENTITY_SUBGRAPH_HOPS,
         per_hop_limit=ENTITY_SUBGRAPH_PER_HOP_LIMIT,
-        entity_elem_ids=list(all_matched_ids) if all_matched_ids else None
+        entity_elem_ids=list(all_matched_ids) if all_matched_ids else None,
+        entity_emb_cache=entity_emb_cache,
+        q_trip_embs=q_trip_embs,
+        q_emb_fallback=q_emb_fallback,
     )
     if cypher_durations is not None:
         cypher_durations["subgraph_expansion"] = cypher_durations.get("subgraph_expansion", 0.0) + expand_dur
 
-    if not expanded_triples:
-        return []
-
-    def score(t: Dict[str, Any]) -> float:
-        emb = t.get("embedding")
-        if q_trip_embs:
-            return mean_similarity_to_query_triples(emb, q_trip_embs)
-        if q_emb_fallback and isinstance(emb, list):
-            return cos_sim(q_emb_fallback, emb)
-        return 0.0
-
-    ranked = sorted(expanded_triples, key=score, reverse=True)
-    return ranked[:SUBGRAPH_TRIPLES_TOP_K]
+    return expanded_triples
 
 def triple_centric_retrieval(
     query_triples: List[Dict[str, Any]],
     cypher_durations: Optional[Dict[str, float]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[List[float]]]:
     triples_map: Dict[str, Dict[str, Any]] = {}
-    q_trip_embs: List[List[float]] = []
-    for qt in query_triples:
-        txt = query_triple_to_text(qt)
-        emb = embed_text(txt)
-        q_trip_embs.append(emb)
+    if not query_triples:
+        return [], []
+    # Batch embed all query triple texts first (much faster than sequential)
+    query_texts = [query_triple_to_text(qt) for qt in query_triples]
+    q_trip_embs = embed_texts_batch(query_texts)
+    # Vector searches run sequentially (I/O bound to Neo4j)
+    for emb in q_trip_embs:
         matches, dur = search_similar_triples_by_embedding(emb, k=QUERY_TRIPLE_MATCH_TOP_K_PER)
         if cypher_durations is not None:
             cypher_durations["triple_vector_search"] = cypher_durations.get("triple_vector_search", 0.0) + dur
@@ -735,7 +821,6 @@ def triple_centric_retrieval(
                 else:
                     if m.get("score", 0.0) > triples_map[uid].get("score", 0.0):
                         triples_map[uid] = m
-
     return list(triples_map.values()), q_trip_embs
 
 def collect_chunks_for_triples(
@@ -776,10 +861,14 @@ def rerank_chunks_by_query(
     top_k: int
 ) -> List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]]:
     cand = chunk_records[:CHUNK_RERANK_CAND_LIMIT]
+    if not cand:
+        return []
+    # Batch encode all candidate chunk texts in one model call (thread-safe via _bge_lock)
+    texts = [text for _, text, _ in cand]
+    emb_batch = embed_texts_batch(texts)
     scored: List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]] = []
-    for key, text, t in cand:
-        emb = embed_text(text)
-        s = cos_sim(q_emb_query, emb)
+    for i, (key, text, t) in enumerate(cand):
+        s = cos_sim(q_emb_query, emb_batch[i])
         scored.append((key, text, t, s))
     scored.sort(key=lambda x: x[3], reverse=True)
     return scored[:top_k]
@@ -891,11 +980,22 @@ def agentic_graph_rag(
         query_entities = entities_from_triples(query_triples)
 
         # ------------------------------------------------------------------
-        # Step 2: Embed whole query (for chunk reranking / fallback scoring)
+        # Step 2: Embed whole query + pre-compute entity embeddings (overlaps with Step 3)
         # ------------------------------------------------------------------
-        _t2 = _step_start(2, "Embed whole query")
+        _t2 = _step_start(2, "Embed whole query + entity embeddings")
         q_emb_query = embed_text(query_original)
-        _step_finish(2, "Embed whole query", _t2)
+        # Pre-compute entity embeddings in batch while Step 3 runs
+        if query_entities:
+            _entity_texts = [e.get("text", "").strip() for e in query_entities]
+            _entity_texts = [t for t in _entity_texts if t]
+            if _entity_texts:
+                _entity_embs_batch = embed_texts_batch(_entity_texts)
+                _entity_emb_cache_local: Dict[str, List[float]] = dict(zip(_entity_texts, _entity_embs_batch))
+            else:
+                _entity_emb_cache_local = {}
+        else:
+            _entity_emb_cache_local = {}
+        _step_finish(2, "Embed whole query + entity embeddings", _t2)
 
         # ------------------------------------------------------------------
         # Step 3: Triple-centric retrieval
@@ -906,7 +1006,7 @@ def agentic_graph_rag(
         _step_finish(3, "Triple-centric retrieval", _t3)
 
         # ------------------------------------------------------------------
-        # Step 4: Entity-centric retrieval
+        # Step 4: Entity-centric retrieval (entity embeddings already computed)
         # ------------------------------------------------------------------
         _t4 = _step_start(4, "Entity-centric retrieval")
         ctx1_triples = entity_centric_retrieval(
@@ -915,6 +1015,7 @@ def agentic_graph_rag(
             q_emb_fallback=q_emb_query,
             cypher_durations=cypher_durations,
             matched_entities_log=matched_entities_log,
+            entity_emb_cache=_entity_emb_cache_local,
         )
         _step_finish(4, "Entity-centric retrieval", _t4)
 
