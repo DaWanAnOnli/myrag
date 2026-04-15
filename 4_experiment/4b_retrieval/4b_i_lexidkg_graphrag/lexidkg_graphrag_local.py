@@ -4,7 +4,7 @@
 
 import os, time, json, math, pickle, re, random
 import httpx
-from concurrent.futures import ThreadPoolExecutor, Future, as_completed
+from concurrent.futures import Future
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional, Set
 from threading import Lock
@@ -474,21 +474,14 @@ def _vector_query_nodes(index_name: str, q_emb: List[float], k: int) -> Tuple[Li
     return rows, dur
 
 def search_similar_entities_by_embedding(q_emb: List[float], k: int) -> Tuple[List[Dict[str, Any]], float]:
-    """Returns (matched_entities, total_duration_s).
-    Parallelizes 3 vector index searches for ~3x wall-clock speedup.
-    """
+    """Returns (matched_entities, total_duration_s)."""
     idx_names = ("document_vec", "content_vec", "expression_vec")
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {
-            executor.submit(_vector_query_nodes, idx_name, q_emb, k): idx_name
-            for idx_name in idx_names
-        }
-        candidates: List[Dict[str, Any]] = []
-        total_dur = 0.0
-        for fut in as_completed(futures):
-            rows, dur = fut.result()
-            candidates.extend(rows)
-            total_dur += dur
+    candidates: List[Dict[str, Any]] = []
+    total_dur = 0.0
+    for idx_name in idx_names:
+        rows, dur = _vector_query_nodes(idx_name, q_emb, k)
+        candidates.extend(rows)
+        total_dur += dur
     best: Dict[str, Dict[str, Any]] = {}
     for row in candidates:
         dedup_key = row.get("elem_id") or f"{row.get('key')}|{row.get('type')}"
@@ -574,7 +567,7 @@ def expand_from_entities(
         _thread_local.cypher_hop = hop_idx + 1
 
         if current_ids:
-            # Use cached properties from covering index; no OPTIONAL MATCH traversals
+            # Use cached properties from covering index; collect elementIds for next hop
             cypher = """
             UNWIND $ids AS eid
             MATCH (e) WHERE elementId(e) = eid
@@ -582,6 +575,9 @@ def expand_from_entities(
             WITH r.triple_uid AS uid
             LIMIT $limit
             MATCH (tr:Triple {triple_uid: uid})
+            OPTIONAL MATCH (s:Entity) WHERE s.name = tr.s_name AND s.type = tr.s_type
+            OPTIONAL MATCH (o:Entity) WHERE o.name = tr.o_name AND o.type = tr.o_type
+            WITH tr, elementId(s) AS s_eid, elementId(o) AS o_eid
             RETURN tr.triple_uid             AS triple_uid,
                    tr.predicate               AS predicate,
                    tr.uu_number               AS uu_number,
@@ -595,7 +591,8 @@ def expand_from_entities(
                    tr.s_type                 AS subject_type,
                    tr.o_name                 AS object,
                    tr.o_key                  AS object_key,
-                   tr.o_type                 AS object_type
+                   tr.o_type                 AS object_type,
+                   s_eid, o_eid
             """
             params = {"ids": list(current_ids), "limit": per_hop_limit}
         else:
@@ -605,6 +602,9 @@ def expand_from_entities(
             WITH r.triple_uid AS uid
             LIMIT $limit
             MATCH (tr:Triple {triple_uid: uid})
+            OPTIONAL MATCH (s:Entity) WHERE s.name = tr.s_name AND s.type = tr.s_type
+            OPTIONAL MATCH (o:Entity) WHERE o.name = tr.o_name AND o.type = tr.o_type
+            WITH tr, elementId(s) AS s_eid, elementId(o) AS o_eid
             RETURN tr.triple_uid             AS triple_uid,
                    tr.predicate               AS predicate,
                    tr.uu_number               AS uu_number,
@@ -618,7 +618,8 @@ def expand_from_entities(
                    tr.s_type                 AS subject_type,
                    tr.o_name                 AS object,
                    tr.o_key                  AS object_key,
-                   tr.o_type                 AS object_type
+                   tr.o_type                 AS object_type,
+                   s_eid, o_eid
             """
             params = {"keys": list(current_keys), "limit": per_hop_limit}
 
@@ -627,6 +628,7 @@ def expand_from_entities(
         total_dur += dur
 
         next_keys: Set[str] = set()
+        next_ids: Set[str] = set()
         for r in res:
             uid = r["triple_uid"]
             if uid not in triples:
@@ -651,12 +653,19 @@ def expand_from_entities(
             if sk: next_keys.add(sk)
             if ok: next_keys.add(ok)
 
+            s_eid = r.get("s_eid")
+            o_eid = r.get("o_eid")
+            if s_eid: next_ids.add(s_eid)
+            if o_eid: next_ids.add(o_eid)
+
         # Cap entity frontier to prevent exponential growth
         ENTITY_SUBGRAPH_UNIQUE_ENTITIES_PER_HOP = 500
         if len(next_keys) > ENTITY_SUBGRAPH_UNIQUE_ENTITIES_PER_HOP:
             next_keys = set(list(next_keys)[:ENTITY_SUBGRAPH_UNIQUE_ENTITIES_PER_HOP])
+        if len(next_ids) > ENTITY_SUBGRAPH_UNIQUE_ENTITIES_PER_HOP:
+            next_ids = set(list(next_ids)[:ENTITY_SUBGRAPH_UNIQUE_ENTITIES_PER_HOP])
 
-        current_ids = set()
+        current_ids = next_ids
         current_keys = next_keys
 
     # Score and return top-K triples
