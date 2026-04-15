@@ -569,14 +569,21 @@ def expand_from_entities(
         log(f"{_tl_qid()}   [hop {hop_idx+1}/{hops}] subgraph expansion query | current_ids={len(current_ids)}, current_keys={len(current_keys)}")
 
         if current_ids:
-            # Use cached properties from covering index; collect elementIds for next hop
+            # PREDICATE goes Entity->Entity (with triple_uid on the rel), not Entity->Triple.
+            # Step 1: collect triple_uids from PREDICATE rels of current entities.
+            # Step 2: look up Triple nodes by uid and traverse :SUBJECT/:OBJECT to
+            #         collect all entity keys for the next hop.
             cypher = """
             UNWIND $ids AS eid
             MATCH (e) WHERE elementId(e) = eid
-            MATCH (e)-[r:PREDICATE]->(tr:Triple)
+            MATCH (e)-[r:PREDICATE]->(other)
             WITH r.triple_uid AS uid
             LIMIT $limit
+            WITH collect(DISTINCT uid) AS uids
+            UNWIND uids AS uid
             MATCH (tr:Triple {triple_uid: uid})
+            OPTIONAL MATCH (tr)-[:SUBJECT]->(s)
+            OPTIONAL MATCH (tr)-[:OBJECT]->(o)
             RETURN tr.triple_uid             AS triple_uid,
                    tr.predicate               AS predicate,
                    tr.uu_number               AS uu_number,
@@ -590,17 +597,23 @@ def expand_from_entities(
                    tr.s_type                 AS subject_type,
                    tr.o_name                 AS object,
                    tr.o_key                  AS object_key,
-                   tr.o_type                 AS object_type
+                   tr.o_type                 AS object_type,
+                   coalesce(s.key, '')        AS subj_key,
+                   coalesce(o.key, '')        AS obj_key
             """
             params = {"ids": list(current_ids), "limit": per_hop_limit}
         else:
             cypher = """
             UNWIND $keys AS k
-            MATCH (e)-[r:PREDICATE]->(tr:Triple)
-            WHERE e.key = k
+            MATCH (e) WHERE e.key = k
+            MATCH (e)-[r:PREDICATE]->(other)
             WITH r.triple_uid AS uid
             LIMIT $limit
+            WITH collect(DISTINCT uid) AS uids
+            UNWIND uids AS uid
             MATCH (tr:Triple {triple_uid: uid})
+            OPTIONAL MATCH (tr)-[:SUBJECT]->(s)
+            OPTIONAL MATCH (tr)-[:OBJECT]->(o)
             RETURN tr.triple_uid             AS triple_uid,
                    tr.predicate               AS predicate,
                    tr.uu_number               AS uu_number,
@@ -614,7 +627,9 @@ def expand_from_entities(
                    tr.s_type                 AS subject_type,
                    tr.o_name                 AS object,
                    tr.o_key                  AS object_key,
-                   tr.o_type                 AS object_type
+                   tr.o_type                 AS object_type,
+                   coalesce(s.key, '')        AS subj_key,
+                   coalesce(o.key, '')        AS obj_key
             """
             params = {"keys": list(current_keys), "limit": per_hop_limit}
 
@@ -642,8 +657,9 @@ def expand_from_entities(
                     "object_key": r["object_key"],
                     "object_type": r["object_type"],
                 }
-            sk = r.get("subject_key")
-            ok = r.get("object_key")
+            # Use subj_key/obj_key from the OPTIONAL MATCH traversal (coalesced to '' if missing)
+            sk = r.get("subj_key", "")
+            ok = r.get("obj_key", "")
             if sk: next_keys.add(sk)
             if ok: next_keys.add(ok)
 
@@ -652,7 +668,7 @@ def expand_from_entities(
         if len(next_keys) > ENTITY_SUBGRAPH_UNIQUE_ENTITIES_PER_HOP:
             next_keys = set(list(next_keys)[:ENTITY_SUBGRAPH_UNIQUE_ENTITIES_PER_HOP])
 
-        # Look up elementIds of all subject/object entities by key (batch query)
+        # Build next_ids from next_keys via elementId lookup (needed for the ids-based branch on next hop)
         next_ids: Set[str] = set()
         elem_res_count = 0
         if next_keys:
