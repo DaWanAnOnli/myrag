@@ -1011,21 +1011,20 @@ def extract_triples_from_chunks_batch(items: List[Dict[str, Any]], prompt: str) 
     return results_map, gemini_duration, attempt_id, json_path
 
 # ----------------- Embeddings -----------------
-# BGE-M3 embedding lock (FlagEmbedding model is NOT thread-safe for encode; serialize calls)
-_bge_lock = threading.Lock()
+# BGE-M3 via SentenceTransformer is thread-safe for inference (read-only model).
+# The global lock was removed to allow parallel embedding calls with LLM_CONCURRENCY > 1.
 
 def embed_text(text: str) -> Tuple[List[float], float]:
     if not API_BUDGET.will_allow("embed", 1):
         raise RuntimeError("API budget would be exceeded by another embedding call; stopping embedding.")
     start = time.time()
-    with _bge_lock:
-        vec = _bge_model.encode(
-            [text],
-            batch_size=1,
-            convert_to_numpy=True,
-            normalize_embeddings=False,
-            show_progress_bar=False
-        )[0].tolist()
+    vec = _bge_model.encode(
+        [text],
+        batch_size=1,
+        convert_to_numpy=True,
+        normalize_embeddings=False,
+        show_progress_bar=False
+    )[0].tolist()
     dur = time.time() - start
     API_BUDGET.register("embed", 1)
     return vec, dur

@@ -4,7 +4,7 @@
 
 import os, time, json, math, pickle, re, random
 import httpx
-from concurrent.futures import ThreadPoolExecutor, Future, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, Future, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional, Set
 from threading import Lock
@@ -368,6 +368,24 @@ def entities_from_triples(triples: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 ents.append({"text": text, "type": (node.get("type") or "").strip()})
     return ents
 
+# ----------------- Parallel embedding helpers -----------------
+def _parallel_embed_texts(
+    texts: List[str],
+    max_workers: int
+) -> List[Tuple[List[float], float]]:
+    """Embed multiple texts in parallel using a thread pool.
+
+    Returns list of (embedding, duration) tuples in the same order as inputs.
+    """
+    if not texts:
+        return []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(embed_text, txt): i for i, txt in enumerate(texts)}
+        results: List[Optional[Tuple[List[float], float]]] = [None] * len(texts)
+        for fut in as_completed(futures):
+            results[futures[fut]] = fut.result()
+    return results  # type: ignore[return-value]
+
 # ----------------- Neo4j vector search helpers -----------------
 _NEO4J_QUERY_SEQ = 0
 _NEO4J_QUERY_LOCK = Lock()
@@ -452,15 +470,20 @@ def _vector_query_nodes(index_name: str, q_emb: List[float], k: int) -> Tuple[Li
 
 def search_similar_entities_by_embedding(q_emb: List[float], k: int) -> Tuple[List[Dict[str, Any]], float]:
     """Returns (matched_entities, total_duration_s)."""
-    candidates: List[Dict[str, Any]] = []
-    total_dur = 0.0
-    for idx_name in ("document_vec", "content_vec", "expression_vec"):
-        rows, dur = _vector_query_nodes(idx_name, q_emb, k)
-        candidates.extend(rows)
-        total_dur += dur
+    idx_names = ("document_vec", "content_vec", "expression_vec")
+
+    # Run all 3 index searches in parallel
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(_vector_query_nodes, idx_name, q_emb, k): idx_name for idx_name in idx_names}
+        all_rows: List[Dict[str, Any]] = []
+        total_dur = 0.0
+        for fut in as_completed(futures):
+            rows, dur = fut.result()
+            all_rows.extend(rows)
+            total_dur += dur
 
     best: Dict[str, Dict[str, Any]] = {}
-    for row in candidates:
+    for row in all_rows:
         dedup_key = row.get("elem_id") or f"{row.get('key')}|{row.get('type')}"
         if dedup_key not in best or (row.get("score", -1) > best[dedup_key].get("score", -1)):
             best[dedup_key] = row
@@ -473,8 +496,8 @@ def search_similar_triples_by_embedding(q_emb: List[float], k: int) -> Tuple[Lis
     q_emb = _as_float_list(q_emb)
     cypher = """
     CALL db.index.vector.queryNodes('triple_vec', $k, $q_emb) YIELD node AS tr, score
-    OPTIONAL MATCH (tr)-[:SUBJECT]->(s)
-    OPTIONAL MATCH (tr)-[:OBJECT]->(o)
+    MATCH (tr)-[:SUBJECT]->(s)
+    MATCH (tr)-[:OBJECT]->(o)
     RETURN tr, s, o, score
     ORDER BY score DESC
     LIMIT $k
@@ -532,8 +555,8 @@ def expand_from_entities(
             MATCH (e)-[r:PREDICATE]->()
             WITH DISTINCT r.triple_uid AS uid LIMIT $limit
             MATCH (tr:Triple {triple_uid: uid})
-            OPTIONAL MATCH (tr)-[:SUBJECT]->(s)
-            OPTIONAL MATCH (tr)-[:OBJECT]->(o)
+            MATCH (tr)-[:SUBJECT]->(s)
+            MATCH (tr)-[:OBJECT]->(o)
             RETURN tr, s, o, elementId(s) AS s_id, elementId(o) AS o_id
             """
             params = {"ids": list(current_ids), "limit": per_hop_limit}
@@ -543,8 +566,8 @@ def expand_from_entities(
             MATCH (e:Entity {key:k})-[r:PREDICATE]->()
             WITH DISTINCT r.triple_uid AS uid LIMIT $limit
             MATCH (tr:Triple {triple_uid: uid})
-            OPTIONAL MATCH (tr)-[:SUBJECT]->(s)
-            OPTIONAL MATCH (tr)-[:OBJECT]->(o)
+            MATCH (tr)-[:SUBJECT]->(s)
+            MATCH (tr)-[:OBJECT]->(o)
             RETURN tr, s, o, elementId(s) AS s_id, elementId(o) AS o_id
             """
             params = {"keys": list(current_keys), "limit": per_hop_limit}
@@ -596,45 +619,79 @@ class ChunkStore:
         self._index: Dict[Tuple[str, str], str] = {}
         self._by_chunk: Dict[str, List[Tuple[str, str]]] = {}
         self._loaded_files: Set[Path] = set()
-        self._built = False
+        self._lock = threading.Lock()
+        # Discover all pickle files once (not on every get_chunk call)
+        self._all_pkls: Optional[List[Path]] = None
 
-    def _build_index(self):
-        if self._built:
+    def _discover_pkls(self) -> List[Path]:
+        """Lazily discover all pickle files once."""
+        if self._all_pkls is None:
+            with self._lock:
+                if self._all_pkls is None:
+                    self._all_pkls = [p for p in self.root.glob("*.pkl") if p.name not in self.skip]
+        return self._all_pkls
+
+    def _ensure_file_loaded(self, pkl: Path):
+        """Lazily load a single pickle file if not already loaded."""
+        if pkl in self._loaded_files:
             return
-        pkls = [p for p in self.root.glob("*.pkl") if p.name not in self.skip]
-        for pkl in pkls:
-            with open(pkl, "rb") as f:
-                chunks = pickle.load(f)
-            for ch in chunks:
-                meta = getattr(ch, "metadata", {}) if hasattr(ch, "metadata") else {}
-                doc_id = _norm_id(meta.get("document_id"))
-                chunk_id = _norm_id(meta.get("chunk_id"))
-                text = getattr(ch, "page_content", None)
-                if doc_id and chunk_id and isinstance(text, str):
-                    self._index[(doc_id, chunk_id)] = text
-                    self._by_chunk.setdefault(chunk_id, []).append((doc_id, chunk_id))
-            self._loaded_files.add(pkl)
-        self._built = True
+        with self._lock:
+            if pkl in self._loaded_files:
+                return
+            try:
+                with open(pkl, "rb") as f:
+                    chunks = pickle.load(f)
+                for ch in chunks:
+                    meta = getattr(ch, "metadata", {}) if hasattr(ch, "metadata") else {}
+                    doc_id = _norm_id(meta.get("document_id"))
+                    chunk_id = _norm_id(meta.get("chunk_id"))
+                    text = getattr(ch, "page_content", None)
+                    if doc_id and chunk_id and isinstance(text, str):
+                        self._index[(doc_id, chunk_id)] = text
+                        self._by_chunk.setdefault(chunk_id, []).append((doc_id, chunk_id))
+                self._loaded_files.add(pkl)
+            except Exception:
+                self._loaded_files.add(pkl)
 
     def get_chunk(self, document_id: Any, chunk_id: Any) -> Optional[str]:
-        if not self._built:
-            self._build_index()
         doc_id_s = _norm_id(document_id)
         chunk_id_s = _norm_id(chunk_id)
+
+        # Fast path: already in memory
         val = self._index.get((doc_id_s, chunk_id_s))
         if val is not None:
             return val
+
+        # Try base_id fallback without loading a file
         if "::" in chunk_id_s:
             base_id = chunk_id_s.split("::", 1)[0]
             val = self._index.get((doc_id_s, base_id))
             if val is not None:
                 return val
+
+        # Need to search by chunk_id — check if we have matches already loaded
         matches = self._by_chunk.get(chunk_id_s)
         if matches:
             chosen_doc, chosen_chunk = matches[0]
             val = self._index.get((chosen_doc, chosen_chunk))
             if val is not None:
                 return val
+
+        # Not found — try lazy loading every unloaded pickle file
+        for pkl in self._discover_pkls():
+            if pkl in self._loaded_files:
+                continue
+            self._ensure_file_loaded(pkl)
+            # Check again after loading
+            val = self._index.get((doc_id_s, chunk_id_s))
+            if val is not None:
+                return val
+            if "::" in chunk_id_s:
+                base_id = chunk_id_s.split("::", 1)[0]
+                val = self._index.get((doc_id_s, base_id))
+                if val is not None:
+                    return val
+
         return None
 
 # ----------------- Scoring helpers -----------------
@@ -658,35 +715,54 @@ def entity_centric_retrieval(
 ) -> List[Dict[str, Any]]:
     """
     Retrieves triples via entity->KG match->subgraph expansion.
+    All entity embedding + search operations run in parallel.
     cypher_durations: accumulator dict for Cypher query durations.
     matched_entities_log: list to append matched entity info for logging.
     """
-    all_matched_keys: Set[str] = set()
-    all_matched_ids: Set[str] = set()
-
+    # Prepare entity texts, skipping empty ones
+    entity_work: List[Tuple[str, str]] = []  # (original_text, stripped_text)
     for e in query_entities:
         text = (e.get("text") or "").strip()
-        if not text:
-            continue
+        if text:
+            entity_work.append((e.get("text", "").strip(), text))
+
+    if not entity_work:
+        return []
+
+    # Each entity task: embed + 3-index search
+    def process_entity(item: Tuple[str, str]) -> Tuple[List[Dict[str, Any]], float]:
+        _, text = item
         e_emb = embed_text(text)
         matches, sim_dur = search_similar_entities_by_embedding(e_emb, k=ENTITY_MATCH_TOP_K)
-        if cypher_durations is not None:
-            cypher_durations["entity_vector_search"] = cypher_durations.get("entity_vector_search", 0.0) + sim_dur
-        keys = [m.get("key") for m in matches if m.get("key")]
-        ids  = [m.get("elem_id") for m in matches if m.get("elem_id")]
-        all_matched_keys.update(keys)
-        all_matched_ids.update(ids)
-        # Log matched entities
-        if matched_entities_log is not None:
-            for m in matches:
-                matched_entities_log.append({
-                    "query_entity": text,
-                    "kg_entity": m.get("name") or m.get("key"),
-                    "type": m.get("type"),
-                    "score": m.get("score"),
-                    "elem_id": m.get("elem_id"),
-                    "chunk_id": m.get("chunk_id"),
-                })
+        return matches, sim_dur
+
+    all_matched_keys: Set[str] = set()
+    all_matched_ids: Set[str] = set()
+    total_entity_dur = 0.0
+
+    with ThreadPoolExecutor(max_workers=LLM_CONCURRENCY) as executor:
+        futures = {executor.submit(process_entity, item): item for item in entity_work}
+        for fut in as_completed(futures):
+            matches, sim_dur = fut.result()
+            total_entity_dur += sim_dur
+            keys = [m.get("key") for m in matches if m.get("key")]
+            ids  = [m.get("elem_id") for m in matches if m.get("elem_id")]
+            all_matched_keys.update(keys)
+            all_matched_ids.update(ids)
+            if matched_entities_log is not None:
+                orig_text = futures[fut][0]
+                for m in matches:
+                    matched_entities_log.append({
+                        "query_entity": orig_text,
+                        "kg_entity": m.get("name") or m.get("key"),
+                        "type": m.get("type"),
+                        "score": m.get("score"),
+                        "elem_id": m.get("elem_id"),
+                        "chunk_id": m.get("chunk_id"),
+                    })
+
+    if cypher_durations is not None:
+        cypher_durations["entity_vector_search"] = cypher_durations.get("entity_vector_search", 0.0) + total_entity_dur
 
     if not (all_matched_keys or all_matched_ids):
         return []
@@ -718,23 +794,47 @@ def triple_centric_retrieval(
     query_triples: List[Dict[str, Any]],
     cypher_durations: Optional[Dict[str, float]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[List[float]]]:
-    triples_map: Dict[str, Dict[str, Any]] = {}
-    q_trip_embs: List[List[float]] = []
+    # Prepare texts for all query triples
+    triple_work: List[Tuple[Dict[str, Any], str]] = []
     for qt in query_triples:
         txt = query_triple_to_text(qt)
+        triple_work.append((qt, txt))
+
+    if not triple_work:
+        return [], []
+
+    # Each triple task: embed + vector search
+    def process_triple(item: Tuple[Dict[str, Any], str]) -> Tuple[List[float], List[Dict[str, Any]], float]:
+        qt, txt = item
         emb = embed_text(txt)
-        q_trip_embs.append(emb)
         matches, dur = search_similar_triples_by_embedding(emb, k=QUERY_TRIPLE_MATCH_TOP_K_PER)
-        if cypher_durations is not None:
-            cypher_durations["triple_vector_search"] = cypher_durations.get("triple_vector_search", 0.0) + dur
-        for m in matches:
-            uid = m.get("triple_uid")
-            if uid:
-                if uid not in triples_map:
-                    triples_map[uid] = m
-                else:
-                    if m.get("score", 0.0) > triples_map[uid].get("score", 0.0):
+        return emb, matches, dur
+
+    triples_map: Dict[str, Dict[str, Any]] = {}
+    emb_results: List[Tuple[int, List[float]]] = []  # (index, embedding)
+    total_dur = 0.0
+
+    with ThreadPoolExecutor(max_workers=LLM_CONCURRENCY) as executor:
+        futures = {executor.submit(process_triple, item): idx for idx, item in enumerate(triple_work)}
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            emb, matches, dur = fut.result()
+            emb_results.append((idx, emb))
+            total_dur += dur
+            for m in matches:
+                uid = m.get("triple_uid")
+                if uid:
+                    if uid not in triples_map:
                         triples_map[uid] = m
+                    elif m.get("score", 0.0) > triples_map[uid].get("score", 0.0):
+                        triples_map[uid] = m
+
+    # Restore original order
+    emb_results.sort(key=lambda x: x[0])
+    q_trip_embs = [emb for _, emb in emb_results]
+
+    if cypher_durations is not None:
+        cypher_durations["triple_vector_search"] = cypher_durations.get("triple_vector_search", 0.0) + total_dur
 
     return list(triples_map.values()), q_trip_embs
 
@@ -776,11 +876,31 @@ def rerank_chunks_by_query(
     top_k: int
 ) -> List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]]:
     cand = chunk_records[:CHUNK_RERANK_CAND_LIMIT]
+    if not cand:
+        return []
+
+    # Parallelize embedding of all candidate chunks
+    cand_texts = [(i, text) for i, (key, text, t) in enumerate(cand)]
+    emb_results: List[Tuple[int, List[float]]] = []
+
+    def embed_one(item: Tuple[int, str]) -> Tuple[int, List[float]]:
+        idx, text = item
+        emb, _ = embed_text(text)
+        return idx, emb
+
+    with ThreadPoolExecutor(max_workers=LLM_CONCURRENCY) as executor:
+        futures = {executor.submit(embed_one, item): item for item in cand_texts}
+        for fut in as_completed(futures):
+            idx, emb = fut.result()
+            s = cos_sim(q_emb_query, emb)
+            emb_results.append((idx, s))
+
+    # Map back to original records and sort
     scored: List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]] = []
-    for key, text, t in cand:
-        emb = embed_text(text)
-        s = cos_sim(q_emb_query, emb)
-        scored.append((key, text, t, s))
+    for orig_idx, score_val in emb_results:
+        key, text, t = cand[orig_idx]
+        scored.append((key, text, t, score_val))
+
     scored.sort(key=lambda x: x[3], reverse=True)
     return scored[:top_k]
 
