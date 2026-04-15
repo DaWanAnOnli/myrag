@@ -566,6 +566,8 @@ def expand_from_entities(
         # Expose current hop number to run_cypher_with_retry via thread-local
         _thread_local.cypher_hop = hop_idx + 1
 
+        log(f"{_tl_qid()}   [hop {hop_idx+1}/{hops}] subgraph expansion query | current_ids={len(current_ids)}, current_keys={len(current_keys)}")
+
         if current_ids:
             # Use cached properties from covering index; collect elementIds for next hop
             cypher = """
@@ -617,8 +619,8 @@ def expand_from_entities(
             params = {"keys": list(current_keys), "limit": per_hop_limit}
 
         res, dur = run_cypher_with_retry(cypher, params, query_label="subgraph expansion hop")
-        _thread_local.cypher_hop = None  # reset after each hop query
         total_dur += dur
+        log(f"{_tl_qid()}   [hop {hop_idx+1}/{hops}] returned {len(res)} triples, building next_keys...")
 
         next_keys: Set[str] = set()
         for r in res:
@@ -652,6 +654,7 @@ def expand_from_entities(
 
         # Look up elementIds of all subject/object entities by key (batch query)
         next_ids: Set[str] = set()
+        elem_res_count = 0
         if next_keys:
             elem_id_query = """
             UNWIND $ekeys AS k
@@ -660,12 +663,18 @@ def expand_from_entities(
             RETURN elementId(e) AS eid
             """
             elem_res, _ = run_cypher_with_retry(elem_id_query, {"ekeys": list(next_keys)}, query_label="elementId lookup for next hop")
+            elem_res_count = len(elem_res)
             for er in elem_res:
                 eid = er["eid"]
                 if eid: next_ids.add(eid)
 
+        log(f"{_tl_qid()}   [hop {hop_idx+1}/{hops}] elementId lookup: {elem_res_count} results, next_ids={len(next_ids)}, next_keys={len(next_keys)}")
+
         current_ids = next_ids
         current_keys = next_keys
+
+        log(f"{_tl_qid()}   [hop {hop_idx+1}/{hops}] advancing — current_ids={len(current_ids)}, current_keys={len(current_keys)}, triples_total={len(triples)}")
+    _thread_local.cypher_hop = None  # reset after all hop queries for this expansion
 
     # Score and return top-K triples
     if not triples:
