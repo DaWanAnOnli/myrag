@@ -103,32 +103,38 @@ class FileLogger:
         self.file_path = file_path
         self.also_console = also_console
         self._fh = open(file_path, "w", encoding="utf-8")
+        self._lock = threading.Lock()
 
     def log(self, msg: str = ""):
-        self._fh.write(msg + "\n")
-        self._fh.flush()
+        with self._lock:
+            self._fh.write(msg + "\n")
+            self._fh.flush()
         if self.also_console:
             print(msg, flush=True)
 
     def close(self):
-        self._fh.flush()
-        self._fh.close()
+        with self._lock:
+            self._fh.flush()
+            self._fh.close()
 
 _thread_local = threading.local()
+_log_file_logger: Optional[FileLogger] = None  # module-level, thread-safe for workers
 
 def log(msg: Any = ""):
+    """Write to the per-question log file. Also prints to console when in the main thread."""
     if not isinstance(msg, str):
         msg = json.dumps(msg, ensure_ascii=False, default=str)
-    logger: Optional[FileLogger] = getattr(_thread_local, "logger", None)
-    if logger is not None:
-        logger.log(msg)
-    else:
+    # Always write to the log file (thread-safe via FileLogger._lock)
+    if _log_file_logger is not None:
+        _log_file_logger.log(msg)
+    # Only print to console when in the main thread (has logger on thread-local)
+    if getattr(_thread_local, "logger", None) is not None:
         print(msg, flush=True)
 
 def _tl_qid() -> str:
     """Return a question-id prefix string for terminal logs, e.g. '[q42]'."""
     qid = getattr(_thread_local, "question_id", None)
-    return f"[q{qid}]" if qid is not None else "[q?]"
+    return f"[q{qid}]" if qid is not None else "[q]"
 
 def _tl_hop() -> str:
     """Return current hop label, e.g. 'hop=2', or '' if not inside expansion."""
@@ -988,7 +994,10 @@ def agentic_graph_rag(
         log_file = log_dir / f"{qid_str}{ts_name}.txt"
     else:
         log_file = Path.cwd() / f"{qid_str}{ts_name}.txt"
-    _thread_local.logger = FileLogger(log_file, also_console=True)
+    global _log_file_logger
+    logger = FileLogger(log_file, also_console=True)
+    _thread_local.logger = logger
+    _log_file_logger = logger
     _thread_local.question_id = question_id
     _thread_local.cypher_hop = None
 
@@ -1163,6 +1172,8 @@ def agentic_graph_rag(
         _local_logger: Optional[FileLogger] = getattr(_thread_local, "logger", None)
         if _local_logger is not None:
             _local_logger.close()
+        global _log_file_logger
+        _log_file_logger = None
         _thread_local.logger = None
         _thread_local.question_id = None
         _thread_local.cypher_hop = None
