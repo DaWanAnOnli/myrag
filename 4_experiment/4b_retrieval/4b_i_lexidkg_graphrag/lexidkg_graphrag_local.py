@@ -103,38 +103,32 @@ class FileLogger:
         self.file_path = file_path
         self.also_console = also_console
         self._fh = open(file_path, "w", encoding="utf-8")
-        self._lock = threading.Lock()
 
     def log(self, msg: str = ""):
-        with self._lock:
-            self._fh.write(msg + "\n")
-            self._fh.flush()
+        self._fh.write(msg + "\n")
+        self._fh.flush()
         if self.also_console:
             print(msg, flush=True)
 
     def close(self):
-        with self._lock:
-            self._fh.flush()
-            self._fh.close()
+        self._fh.flush()
+        self._fh.close()
 
 _thread_local = threading.local()
-_log_file_logger: Optional[FileLogger] = None  # module-level, thread-safe for workers
 
 def log(msg: Any = ""):
-    """Write to the per-question log file. Also prints to console when in the main thread."""
     if not isinstance(msg, str):
         msg = json.dumps(msg, ensure_ascii=False, default=str)
-    # Always write to the log file (thread-safe via FileLogger._lock)
-    if _log_file_logger is not None:
-        _log_file_logger.log(msg)
-    # Only print to console when in the main thread (has logger on thread-local)
-    if getattr(_thread_local, "logger", None) is not None:
+    logger: Optional[FileLogger] = getattr(_thread_local, "logger", None)
+    if logger is not None:
+        logger.log(msg)
+    else:
         print(msg, flush=True)
 
 def _tl_qid() -> str:
     """Return a question-id prefix string for terminal logs, e.g. '[q42]'."""
     qid = getattr(_thread_local, "question_id", None)
-    return f"[q{qid}]" if qid is not None else "[q]"
+    return f"[q{qid}]" if qid is not None else "[q?]"
 
 def _tl_hop() -> str:
     """Return current hop label, e.g. 'hop=2', or '' if not inside expansion."""
@@ -737,7 +731,12 @@ def entity_centric_retrieval(
         return []
 
     # Each entity task: embed + 3-index search
+    # Capture the actual question_id from _thread_local so worker threads can log correctly
+    # (ThreadPoolExecutor workers don't inherit _thread_local from the main thread)
+    _captured_qid = getattr(_thread_local, "question_id", None)
+
     def process_entity(item: Tuple[str, str]) -> Tuple[List[Dict[str, Any]], float]:
+        _thread_local.question_id = _captured_qid
         _, text = item
         e_emb = embed_text(text)
         matches, sim_dur = search_similar_entities_by_embedding(e_emb, k=ENTITY_MATCH_TOP_K)
@@ -811,7 +810,11 @@ def triple_centric_retrieval(
         return [], []
 
     # Each triple task: embed + vector search
+    # Capture the actual question_id so worker threads log correctly
+    _captured_qid = getattr(_thread_local, "question_id", None)
+
     def process_triple(item: Tuple[Dict[str, Any], str]) -> Tuple[List[float], List[Dict[str, Any]], float]:
+        _thread_local.question_id = _captured_qid
         qt, txt = item
         emb = embed_text(txt)
         matches, dur = search_similar_triples_by_embedding(emb, k=QUERY_TRIPLE_MATCH_TOP_K_PER)
@@ -994,10 +997,7 @@ def agentic_graph_rag(
         log_file = log_dir / f"{qid_str}{ts_name}.txt"
     else:
         log_file = Path.cwd() / f"{qid_str}{ts_name}.txt"
-    global _log_file_logger
-    logger = FileLogger(log_file, also_console=True)
-    _thread_local.logger = logger
-    _log_file_logger = logger
+    _thread_local.logger = FileLogger(log_file, also_console=True)
     _thread_local.question_id = question_id
     _thread_local.cypher_hop = None
 
@@ -1172,8 +1172,6 @@ def agentic_graph_rag(
         _local_logger: Optional[FileLogger] = getattr(_thread_local, "logger", None)
         if _local_logger is not None:
             _local_logger.close()
-        global _log_file_logger
-        _log_file_logger = None
         _thread_local.logger = None
         _thread_local.question_id = None
         _thread_local.cypher_hop = None
