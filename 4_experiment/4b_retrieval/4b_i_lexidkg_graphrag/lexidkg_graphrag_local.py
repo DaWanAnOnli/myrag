@@ -372,16 +372,17 @@ def entities_from_triples(triples: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 def _parallel_embed_texts(
     texts: List[str],
     max_workers: int
-) -> List[Tuple[List[float], float]]:
+) -> List[List[float]]:
     """Embed multiple texts in parallel using a thread pool.
 
-    Returns list of (embedding, duration) tuples in the same order as inputs.
+    Returns list of embeddings in the same order as inputs.
+    Note: embed_text() returns List[float] directly (no duration).
     """
     if not texts:
         return []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(embed_text, txt): i for i, txt in enumerate(texts)}
-        results: List[Optional[Tuple[List[float], float]]] = [None] * len(texts)
+        results: List[Optional[List[float]]] = [None] * len(texts)
         for fut in as_completed(futures):
             results[futures[fut]] = fut.result()
     return results  # type: ignore[return-value]
@@ -885,7 +886,7 @@ def rerank_chunks_by_query(
 
     def embed_one(item: Tuple[int, str]) -> Tuple[int, List[float]]:
         idx, text = item
-        emb, _ = embed_text(text)
+        emb = embed_text(text)
         return idx, emb
 
     with ThreadPoolExecutor(max_workers=LLM_CONCURRENCY) as executor:
