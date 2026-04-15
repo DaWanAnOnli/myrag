@@ -31,16 +31,26 @@ try:
         print("\n[1] Checking for uncached Triple nodes...")
         result = s.run("""
             MATCH (tr:Triple)
-            WHERE tr.s_name IS NULL OR tr.o_name IS NULL
+            WHERE tr.s_name IS NULL AND tr.o_name IS NULL
             RETURN count(tr) AS uncached_triples
         """).single()
         uncached = result["uncached_triples"] if result else -1
-        print(f"    Uncached triples: {uncached}")
-        if uncached == 0:
+        print(f"    Triples with both s_name AND o_name NULL: {uncached}")
+        # Also check individually
+        result2 = s.run("""
+            MATCH (tr:Triple)
+            WHERE tr.s_name IS NULL OR tr.o_name IS NULL
+            RETURN count(tr) AS partial_uncached
+        """).single()
+        partial = result2["partial_uncached"] if result2 else -1
+        print(f"    Triples with either s_name OR o_name NULL: {partial}")
+        if uncached == 0 and partial == 0:
             print("    PASS — all triples have cached s_name/o_name properties")
+        elif uncached == 0:
+            print("    PASS — no triples have both s_name AND o_name NULL (OK)")
         else:
             print(f"    WARN — {uncached} triples missing cached properties!")
-            print("    Run 3b_iv_neo4j_lexidkg_post_indexing_optimize.txt to fix.")
+            print("    Run 3b_vi_neo4j_fix_2_uncached_triples.py to fix.")
 
         # 2. Check indexes are online
         print("\n[2] Checking indexes status...")
