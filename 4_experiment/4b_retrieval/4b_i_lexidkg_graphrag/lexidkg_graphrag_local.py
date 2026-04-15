@@ -434,7 +434,7 @@ def run_cypher_with_retry(cypher: str, params: Dict[str, Any], query_label: str 
                 res = session.run(cypher, **params, timeout=NEO4J_TX_TIMEOUT_S)
                 records = list(res)
             cypher_dur = dur_s(t_cypher_start)
-            print(f"{prefix} [CYPHER FINISH] qid={qid}{hop_info} | {query_label} | duration={cypher_dur:.3f}s", flush=True)
+            print(f"{prefix} [CYPHER FINISH] qid={qid}{hop_info} | {query_label} | retrieved={len(records)} records | duration={cypher_dur:.3f}s", flush=True)
             return records, dur_s(t0)
         except Exception as e:
             last_e = e
