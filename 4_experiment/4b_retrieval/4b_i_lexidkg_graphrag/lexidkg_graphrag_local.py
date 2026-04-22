@@ -55,7 +55,7 @@ DEFAULT_ANSWERS_DIR = (_REPO_ROOT / "dataset" / "4_experiment" / "4b_experiment_
 ANSWERS_DIR = Path(os.getenv("ANSWERS_DIR") or str(DEFAULT_ANSWERS_DIR))
 
 # Log directory for per-question logs
-DEFAULT_LOGS_DIR = (Path(__file__).resolve().parent / "logs")
+DEFAULT_LOGS_DIR = (DEFAULT_ANSWERS_DIR / "logs")
 LOGS_DIR = Path(os.getenv("LOGS_DIR") or str(DEFAULT_LOGS_DIR))
 
 # ----------------- Retrieval/agent parameters (unchanged from original) -----------------
@@ -66,8 +66,8 @@ SUBGRAPH_TRIPLES_TOP_K = 30
 
 QUERY_TRIPLE_MATCH_TOP_K_PER = 20
 
-MAX_TRIPLES_FINAL = 60
-MAX_CHUNKS_FINAL = 40
+MAX_TRIPLES_FINAL = 30
+MAX_CHUNKS_FINAL = 20
 CHUNK_RERANK_CAND_LIMIT = 200
 
 ANSWER_MAX_TOKENS = 4096
