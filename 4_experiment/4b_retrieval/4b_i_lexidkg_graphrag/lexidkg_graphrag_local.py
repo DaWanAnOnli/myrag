@@ -225,6 +225,12 @@ def cos_sim(a: List[float], b: List[float]) -> float:
         return 0.0
     return dot / (na * nb)
 
+def normalize_vector(v: List[float]) -> List[float]:
+    mag = math.sqrt(sum(x*x for x in v))
+    if mag == 0:
+        return v
+    return [x/mag for x in v]
+
 # ----------------- Language detection (ID vs EN) -----------------
 def detect_user_language(text: str) -> str:
     t = (text or "").lower()
@@ -802,20 +808,100 @@ def collect_chunks_for_triples(
                     seen_pairs.add(key2)
     return out
 
-def rerank_chunks_by_query(
+def query_chunk_embeddings_from_neo4j(
     chunk_records: List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]],
     q_emb_query: List[float],
     top_k: int
 ) -> List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]]:
-    cand = chunk_records[:CHUNK_RERANK_CAND_LIMIT]
+    """
+    Score chunk candidates by cosine similarity to the query using Neo4j's
+    chunk_embedding_index (pre-stored BGE-M3 embeddings, 1024-dim, unit-normalized).
+    Falls back to local embed_text() if the index is unavailable.
+    """
+    t0 = now_ms()
+
+    # Build lookup: (doc_id, chunk_id) -> (key, text, triple)
+    cand_lookup: Dict[Tuple[str, str], Tuple[Tuple[Any, Any], str, Dict[str, Any]]] = {}
+    for key, text, t in chunk_records:
+        if t.get("_is_quote_fallback"):
+            continue
+        doc_id = _norm_id(t.get("document_id"))
+        chunk_id = _norm_id(t.get("chunk_id"))
+        if doc_id and chunk_id:
+            cand_lookup[(doc_id, chunk_id)] = (key, text, t)
+
+    if not cand_lookup:
+        _log(f"[ChunkRerank] No non-fallback candidates, returning empty.")
+        return []
+
+    # Normalize query so dot product == cosine similarity (stored chunks are unit vectors)
+    q_emb_norm = normalize_vector(q_emb_query)
+
+    # Query vector index with safety margin on k
+    cypher = """
+    CALL db.index.vector.queryNodes('chunk_embedding_index', $k, $q_emb)
+    YIELD node AS c, score
+    RETURN c.document_id AS doc_id, c.chunk_id AS chunk_id, score AS vec_score
+    ORDER BY score DESC
+    LIMIT $k
+    """
+    try:
+        rows = run_cypher_with_retry(cypher, {"k": top_k * 10, "q_emb": q_emb_norm})
+    except Exception as ex:
+        _log(f"[ChunkRerank] Vector index query failed: {ex}. Falling back to embed_text.")
+        return _rerank_chunks_by_query_legacy(chunk_records, q_emb_query, top_k)
+
+    # Match index results back to our candidates
     scored: List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]] = []
-    for key, text, t in cand:
+    scored_keys: Set[Tuple[Any, Any]] = set()
+    for row in rows:
+        doc_id = _norm_id(row.get("doc_id"))
+        chunk_id = _norm_id(row.get("chunk_id"))
+        if (doc_id, chunk_id) in cand_lookup:
+            key, text, t = cand_lookup[(doc_id, chunk_id)]
+            scored.append((key, text, t, float(row.get("vec_score", 0.0))))
+            scored_keys.add(key)
+
+    # Supplement with any remaining candidates via embed_text fallback
+    remaining = [
+        c for c in chunk_records
+        if not c[2].get("_is_quote_fallback") and c[0] not in scored_keys
+    ]
+    for key, text, t in remaining[:CHUNK_RERANK_CAND_LIMIT - len(scored)]:
         try:
             emb = embed_text(text)
-            s = cos_sim(q_emb_query, emb)
+            emb_norm = normalize_vector(emb)
+            s = sum(q * e for q, e in zip(q_emb_norm, emb_norm))
             scored.append((key, text, t, s))
         except Exception as ex:
-            _log(f"[ChunkRerank] Embedding failed for chunk {key}: {ex}")
+            _log(f"[ChunkRerank] Embed fallback failed for {key}: {ex}")
+            continue
+
+    scored.sort(key=lambda x: x[3], reverse=True)
+    took = dur_ms(t0)
+    _log(f"[ChunkRerank] Scored {len(scored)} candidates in {took:.0f} ms | picked top {min(top_k, len(scored))}")
+    return scored[:top_k]
+
+
+def _rerank_chunks_by_query_legacy(
+    chunk_records: List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]],
+    q_emb_query: List[float],
+    top_k: int
+) -> List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]]:
+    """
+    Fallback: embed each chunk locally and compute cosine similarity.
+    Used when the Neo4j chunk_embedding_index is unavailable.
+    """
+    q_emb_norm = normalize_vector(q_emb_query)
+    scored = []
+    for key, text, t in chunk_records[:CHUNK_RERANK_CAND_LIMIT]:
+        try:
+            emb = embed_text(text)
+            emb_norm = normalize_vector(emb)
+            s = sum(q * e for q, e in zip(q_emb_norm, emb_norm))
+            scored.append((key, text, t, s))
+        except Exception as ex:
+            _log(f"[ChunkRerank] Embed failed for {key}: {ex}")
             continue
     scored.sort(key=lambda x: x[3], reverse=True)
     return scored[:top_k]
@@ -951,7 +1037,7 @@ def process_question(qid: int, question_text: str, answers_file: Path):
         t5 = now_ms()
         chunk_records = collect_chunks_for_triples(merged_triples, chunk_store)
         _log(f"[Step 5] Collected {len(chunk_records)} chunk candidates (pre-rerank)")
-        chunks_ranked = rerank_chunks_by_query(chunk_records, q_emb_query, top_k=MAX_CHUNKS_FINAL)
+        chunks_ranked = query_chunk_embeddings_from_neo4j(chunk_records, q_emb_query, top_k=MAX_CHUNKS_FINAL)
         t_step5 = dur_ms(t5)
         chunk_ids_sent = [str(k[1]) for k, _, _ in chunk_records]
         _log(f"[Step 5] Chunk rerank | duration_ms={t_step5:.0f} | selected={len(chunks_ranked)}")
