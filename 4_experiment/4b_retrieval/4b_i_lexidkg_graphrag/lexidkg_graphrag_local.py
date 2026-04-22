@@ -36,10 +36,10 @@ LLM_REQUEST_TIMEOUT = float(os.getenv("LLM_REQUEST_TIMEOUT", "1200"))
 LOCAL_EMBED_MODEL = os.getenv("LOCAL_EMBED_MODEL", "BAAI/bge-m3")
 
 # LLM Concurrency (sliding window: N questions processed simultaneously)
-LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "24"))
+LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "15"))
 
 # Dataset folders
-_REPO_ROOT = (Path(__file__).resolve().parent / ".." / ".." / ".." / "..").resolve()
+_REPO_ROOT = (Path(__file__).resolve().parent / ".." / ".." / ".." ).resolve()
 DEFAULT_LANGCHAIN_DIR = (_REPO_ROOT / "dataset" / "3_indexing" / "3a_langchain_results").resolve()
 LANGCHAIN_DIR = Path(os.getenv("LANGCHAIN_DIR") or str(DEFAULT_LANGCHAIN_DIR))
 SKIP_FILES = {"all_langchain_documents.pkl"}
