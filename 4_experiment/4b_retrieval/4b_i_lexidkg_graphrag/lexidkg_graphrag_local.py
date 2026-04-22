@@ -376,7 +376,7 @@ User question:
             else:
                 o_text = ""
                 o_type = ""
-            if s_text and o_text and p:
+            if (s_text or o_text) and p:
 
                 triples.append({
                     "subject": {"text": s_text, "type": s_type},
