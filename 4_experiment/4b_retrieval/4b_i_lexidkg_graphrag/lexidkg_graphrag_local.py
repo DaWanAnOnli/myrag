@@ -36,7 +36,7 @@ LLM_REQUEST_TIMEOUT = float(os.getenv("LLM_REQUEST_TIMEOUT", "1200"))
 LOCAL_EMBED_MODEL = os.getenv("LOCAL_EMBED_MODEL", "BAAI/bge-m3")
 
 # LLM Concurrency (sliding window: N questions processed simultaneously)
-LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "15"))
+LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "1"))
 
 # Dataset folders
 _REPO_ROOT = (Path(__file__).resolve().parent / ".." / ".." / ".." ).resolve()
@@ -59,10 +59,10 @@ DEFAULT_LOGS_DIR = (DEFAULT_ANSWERS_DIR / "logs")
 LOGS_DIR = Path(os.getenv("LOGS_DIR") or str(DEFAULT_LOGS_DIR))
 
 # ----------------- Retrieval/agent parameters (unchanged from original) -----------------
-ENTITY_MATCH_TOP_K = 15
+ENTITY_MATCH_TOP_K = 10
 ENTITY_SUBGRAPH_HOPS = 4
 ENTITY_SUBGRAPH_PER_HOP_LIMIT = 2000
-SUBGRAPH_TRIPLES_TOP_K = 30
+SUBGRAPH_TRIPLES_TOP_K = 20
 
 QUERY_TRIPLE_MATCH_TOP_K_PER = 20
 
