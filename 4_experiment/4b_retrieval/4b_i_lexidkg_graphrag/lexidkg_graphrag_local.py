@@ -352,14 +352,31 @@ User question:
 
     for t in triples_raw:
         try:
-            s = t.get("subject", {}) or {}
-            o = t.get("object", {}) or {}
+            raw_s = t.get("subject")
+            raw_o = t.get("object")
             p = (t.get("predicate") or "").strip()
-            if s.get("text") and o.get("text") and p:
-                s_text = s.get("text", "").strip()
-                o_text = o.get("text", "").strip()
+            # Handle both flat strings and nested dicts
+            if isinstance(raw_s, dict):
+                s = raw_s or {}
+                s_text = (s.get("text") or "").strip()
                 s_type = (s.get("type") or "").strip()
+            elif isinstance(raw_s, str):
+                s_text = raw_s.strip()
+                s_type = ""
+            else:
+                s_text = ""
+                s_type = ""
+            if isinstance(raw_o, dict):
+                o = raw_o or {}
+                o_text = (o.get("text") or "").strip()
                 o_type = (o.get("type") or "").strip()
+            elif isinstance(raw_o, str):
+                o_text = raw_o.strip()
+                o_type = ""
+            else:
+                o_text = ""
+                o_type = ""
+            if s_text and o_text and p:
 
                 triples.append({
                     "subject": {"text": s_text, "type": s_type},
