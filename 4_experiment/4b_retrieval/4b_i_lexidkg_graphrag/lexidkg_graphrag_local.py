@@ -5,7 +5,7 @@
 # - Processes all questions from qa_pairs_local_filtered_sampled_2000.jsonl with LLM_CONCURRENCY
 # - Real-time answers JSONL + per-question log files
 
-import os, time, json, math, random, shutil, threading, concurrent.futures
+import os, time, json, math, pickle, random, shutil, threading, concurrent.futures
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional, Set
 from threading import Lock
@@ -40,6 +40,9 @@ LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "1"))
 
 # Dataset folders
 _REPO_ROOT = (Path(__file__).resolve().parent / ".." / ".." / ".." ).resolve()
+DEFAULT_LANGCHAIN_DIR = (_REPO_ROOT / "dataset" / "3_indexing" / "3a_langchain_results").resolve()
+LANGCHAIN_DIR = Path(os.getenv("LANGCHAIN_DIR") or str(DEFAULT_LANGCHAIN_DIR))
+SKIP_FILES = {"all_langchain_documents.pkl"}
 
 # Input QA pairs file (produced by filter_sample_qa_pairs_local.py)
 DEFAULT_QA_FILE = (_REPO_ROOT / "dataset" / "4_experiment" / "4a_qa_generation" /
@@ -65,6 +68,7 @@ QUERY_TRIPLE_MATCH_TOP_K_PER = 20
 
 MAX_TRIPLES_FINAL = 30
 MAX_CHUNKS_FINAL = 20
+CHUNK_RERANK_CAND_LIMIT = 200
 
 ANSWER_MAX_TOKENS = 4096
 
@@ -79,6 +83,16 @@ _bge_lock = threading.Lock()  # BGE-M3 encode is NOT thread-safe
 driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
 
 # ----------------- Shared state (per-process) -----------------
+# ChunkStore is built once per process and shared across all questions
+_shared_chunk_store: Optional["ChunkStore"] = None
+_shared_chunk_store_lock = Lock()
+
+def _get_shared_chunk_store() -> "ChunkStore":
+    global _shared_chunk_store
+    with _shared_chunk_store_lock:
+        if _shared_chunk_store is None:
+            _shared_chunk_store = ChunkStore(LANGCHAIN_DIR, set(SKIP_FILES))
+        return _shared_chunk_store
 
 # LLM concurrency: ThreadPoolExecutor + semaphore
 _semaphore = threading.Semaphore(LLM_CONCURRENCY)
@@ -556,24 +570,68 @@ def expand_from_entities(
     return list(triples.values()), hop_entity_counts
 
 # ----------------- Neo4j chunk retrieval -----------------
-def _get_chunks_by_ids(
-    chunk_ids: List[Tuple[str, str]]
-) -> Dict[Tuple[str, str], str]:
-    """
-    Query TextChunk nodes from Neo4j by (document_id, chunk_id) pairs.
-    Returns dict mapping (doc_id, chunk_id) -> content text.
-    """
-    if not chunk_ids:
-        return {}
-    cypher = """
-    UNWIND $pairs AS p
-    MATCH (c:TextChunk {document_id: p.doc_id, chunk_id: p.chunk_id})
-    RETURN c.document_id AS doc_id, c.chunk_id AS chunk_id, c.content AS content
-    """
-    pairs = [{"doc_id": doc_id, "chunk_id": chunk_id} for doc_id, chunk_id in chunk_ids]
-    with driver.session() as session:
-        res = session.run(cypher, pairs=pairs)
-        return {(r["doc_id"], r["chunk_id"]): r["content"] for r in res}
+# ----------------- Chunk store -----------------
+class ChunkStore:
+    def __init__(self, root: Path, skip: Set[str]):
+        self.root = root
+        self.skip = skip
+        self._index: Dict[Tuple[str, str], str] = {}
+        self._by_chunk: Dict[str, List[Tuple[str, str]]] = {}
+        self._loaded_files: Set[Path] = set()
+        self._built = False
+        self._build_lock = Lock()
+
+    def _build_index(self):
+        if self._built:
+            return
+        with self._build_lock:
+            if self._built:
+                return
+            start = time.monotonic()
+            pkls = [p for p in self.root.glob("*.pkl") if p.name not in self.skip]
+            total_chunks_indexed = 0
+            for pkl in pkls:
+                try:
+                    with open(pkl, "rb") as f:
+                        chunks = pickle.load(f)
+                    loaded_count = 0
+                    for ch in chunks:
+                        meta = getattr(ch, "metadata", {}) if hasattr(ch, "metadata") else {}
+                        doc_id = _norm_id(meta.get("document_id"))
+                        chunk_id = _norm_id(meta.get("chunk_id"))
+                        text = getattr(ch, "page_content", None)
+                        if doc_id and chunk_id and isinstance(text, str):
+                            self._index[(doc_id, chunk_id)] = text
+                            self._by_chunk.setdefault(chunk_id, []).append((doc_id, chunk_id))
+                            loaded_count += 1
+                    self._loaded_files.add(pkl)
+                    total_chunks_indexed += loaded_count
+                except Exception:
+                    continue
+            elapsed = time.monotonic() - start
+            _log(f"[ChunkStore] Indexed {total_chunks_indexed} chunks from {len(self._loaded_files)} files in {elapsed:.3f}s.")
+            self._built = True
+
+    def get_chunk(self, document_id: Any, chunk_id: Any) -> Optional[str]:
+        if not self._built:
+            self._build_index()
+        doc_id_s = _norm_id(document_id)
+        chunk_id_s = _norm_id(chunk_id)
+        val = self._index.get((doc_id_s, chunk_id_s))
+        if val is not None:
+            return val
+        if "::" in chunk_id_s:
+            base_id = chunk_id_s.split("::", 1)[0]
+            val = self._index.get((doc_id_s, base_id))
+            if val is not None:
+                return val
+        matches = self._by_chunk.get(chunk_id_s)
+        if matches:
+            chosen_doc, chosen_chunk = matches[0]
+            val = self._index.get((chosen_doc, chosen_chunk))
+            if val is not None:
+                return val
+        return None
 
 # ----------------- Scoring helpers -----------------
 def mean_similarity_to_query_triples(triple_emb: Optional[List[float]], q_trip_embs: List[List[float]]) -> float:
@@ -658,63 +716,66 @@ def triple_centric_retrieval(query_triples: List[Dict[str, Any]]) -> Tuple[List[
     return merged, q_trip_embs
 
 def collect_chunks_for_triples(
-    triples: List[Dict[str, Any]]
-) -> List[Tuple[Tuple[str, str], str, Dict[str, Any]]]:
-    seen_pairs: Set[Tuple[str, str]] = set()
-    out: List[Tuple[Tuple[str, str], str, Dict[str, Any]]] = []
-
-    # Collect all (doc_id, chunk_id) pairs that have both fields
-    pairs_to_fetch: List[Tuple[str, str]] = []
+    triples: List[Dict[str, Any]],
+    chunk_store: ChunkStore
+) -> List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]]:
+    seen_pairs: Set[Tuple[Any, Any]] = set()
+    out: List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]] = []
     for t in triples:
-        doc_id = _norm_id(t.get("document_id"))
-        chunk_id = _norm_id(t.get("chunk_id"))
-        if doc_id and chunk_id:
-            pair = (doc_id, chunk_id)
-            if pair not in seen_pairs:
-                pairs_to_fetch.append(pair)
-                seen_pairs.add(pair)
-
-    # Batch-fetch chunk texts from Neo4j
-    chunk_texts = _get_chunks_by_ids(pairs_to_fetch)
-
-    # Reset seen_pairs for output building
-    seen_pairs.clear()
-    for t in triples:
-        doc_id = _norm_id(t.get("document_id"))
-        chunk_id = _norm_id(t.get("chunk_id"))
-        if not doc_id or not chunk_id:
+        doc_id = t.get("document_id")
+        chunk_id = t.get("chunk_id")
+        if doc_id is None or chunk_id is None:
+            quote = t.get("evidence_quote")
+            if quote:
+                key = (t.get("triple_uid"), "quote")
+                if key not in seen_pairs:
+                    t["_is_quote_fallback"] = True
+                    out.append((key, quote, t))
+                    seen_pairs.add(key)
             continue
-        pair = (doc_id, chunk_id)
-        if pair in seen_pairs:
+        norm_key = (_norm_id(doc_id), _norm_id(chunk_id))
+        if norm_key in seen_pairs:
             continue
-        text = chunk_texts.get(pair)
+        text = chunk_store.get_chunk(doc_id, chunk_id)
         if text:
-            out.append((pair, text, t))
-            seen_pairs.add(pair)
-
+            t["_is_quote_fallback"] = False
+            out.append((norm_key, text, t))
+            seen_pairs.add(norm_key)
+        else:
+            quote = t.get("evidence_quote")
+            if quote:
+                key2 = (t.get("triple_uid"), "quote")
+                if key2 not in seen_pairs:
+                    t["_is_quote_fallback"] = True
+                    out.append((key2, quote, t))
+                    seen_pairs.add(key2)
     return out
 
 def query_chunk_embeddings_from_neo4j(
-    chunk_records: List[Tuple[Tuple[str, str], str, Dict[str, Any]]],
+    chunk_records: List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]],
     q_emb_query: List[float],
     top_k: int
-) -> List[Tuple[Tuple[str, str], str, Dict[str, Any], float]]:
+) -> List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]]:
     """
     Score chunk candidates by cosine similarity to the query using Neo4j's
     chunk_embedding_index (pre-stored BGE-M3 embeddings, 1024-dim, unit-normalized).
+    Falls back to local embed_text() if the index is unavailable.
     """
     t0 = now_ms()
 
-    if not chunk_records:
-        raise RuntimeError("No chunk candidates available for reranking.")
-
     # Build lookup: (doc_id, chunk_id) -> (key, text, triple)
-    cand_lookup: Dict[Tuple[str, str], Tuple[Tuple[str, str], str, Dict[str, Any]]] = {}
+    cand_lookup: Dict[Tuple[str, str], Tuple[Tuple[Any, Any], str, Dict[str, Any]]] = {}
     for key, text, t in chunk_records:
+        if t.get("_is_quote_fallback"):
+            continue
         doc_id = _norm_id(t.get("document_id"))
         chunk_id = _norm_id(t.get("chunk_id"))
         if doc_id and chunk_id:
             cand_lookup[(doc_id, chunk_id)] = (key, text, t)
+
+    if not cand_lookup:
+        _log(f"[ChunkRerank] No non-fallback candidates, returning empty.")
+        return []
 
     # Normalize query so dot product == cosine similarity (stored chunks are unit vectors)
     q_emb_norm = normalize_vector(q_emb_query)
@@ -727,20 +788,65 @@ def query_chunk_embeddings_from_neo4j(
     ORDER BY score DESC
     LIMIT $k
     """
-    rows = run_cypher_with_retry(cypher, {"k": top_k * 10, "q_emb": q_emb_norm})
+    try:
+        rows = run_cypher_with_retry(cypher, {"k": top_k * 10, "q_emb": q_emb_norm})
+    except Exception as ex:
+        _log(f"[ChunkRerank] Vector index query failed: {ex}. Falling back to embed_text.")
+        return _rerank_chunks_by_query_legacy(chunk_records, q_emb_query, top_k)
 
     # Match index results back to our candidates
-    scored: List[Tuple[Tuple[str, str], str, Dict[str, Any], float]] = []
+    scored: List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]] = []
+    scored_keys: Set[Tuple[Any, Any]] = set()
     for row in rows:
         doc_id = _norm_id(row.get("doc_id"))
         chunk_id = _norm_id(row.get("chunk_id"))
         if (doc_id, chunk_id) in cand_lookup:
             key, text, t = cand_lookup[(doc_id, chunk_id)]
             scored.append((key, text, t, float(row.get("vec_score", 0.0))))
+            scored_keys.add(key)
+
+    # Supplement with any remaining candidates via embed_text fallback
+    remaining = [
+        c for c in chunk_records
+        if not c[2].get("_is_quote_fallback") and c[0] not in scored_keys
+    ]
+    for key, text, t in remaining[:CHUNK_RERANK_CAND_LIMIT - len(scored)]:
+        try:
+            emb = embed_text(text)
+            emb_norm = normalize_vector(emb)
+            s = sum(q * e for q, e in zip(q_emb_norm, emb_norm))
+            scored.append((key, text, t, s))
+        except Exception as ex:
+            _log(f"[ChunkRerank] Embed fallback failed for {key}: {ex}")
+            continue
 
     scored.sort(key=lambda x: x[3], reverse=True)
     took = dur_ms(t0)
     _log(f"[ChunkRerank] Scored {len(scored)} candidates in {took:.0f} ms | picked top {min(top_k, len(scored))}")
+    return scored[:top_k]
+
+
+def _rerank_chunks_by_query_legacy(
+    chunk_records: List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]],
+    q_emb_query: List[float],
+    top_k: int
+) -> List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]]:
+    """
+    Fallback: embed each chunk locally and compute cosine similarity.
+    Used when the Neo4j chunk_embedding_index is unavailable.
+    """
+    q_emb_norm = normalize_vector(q_emb_query)
+    scored = []
+    for key, text, t in chunk_records[:CHUNK_RERANK_CAND_LIMIT]:
+        try:
+            emb = embed_text(text)
+            emb_norm = normalize_vector(emb)
+            s = sum(q * e for q, e in zip(q_emb_norm, emb_norm))
+            scored.append((key, text, t, s))
+        except Exception as ex:
+            _log(f"[ChunkRerank] Embed failed for {key}: {ex}")
+            continue
+    scored.sort(key=lambda x: x[3], reverse=True)
     return scored[:top_k]
 
 
@@ -779,7 +885,8 @@ def build_combined_context_text(
         doc_id = t.get("document_id")
         chunk_id = t.get("chunk_id")
         uu = t.get("uu_number") or ""
-        lines.append(f"[Chunk {idx}] doc={doc_id} chunk={chunk_id} | {uu} | score={score:.3f}\n{text}")
+        fb = " | quote-fallback" if t.get("_is_quote_fallback") else ""
+        lines.append(f"[Chunk {idx}] doc={doc_id} chunk={chunk_id} | {uu} | score={score:.3f}{fb}\n{text}")
     context = "\n".join(lines)
     chunk_records = [{"key": key, "text": text, "triple": t, "score": score} for key, text, t, score in chunks_ranked]
     return context, summary_text, chunk_records
@@ -819,11 +926,13 @@ Context:
 
 # ----------------- Per-question processing -----------------
 def process_question(qid: int, question_text: str, answers_file: Path):
+    global _shared_chunk_store
     _reset_cypher_cumulative()
     set_question_logger(qid, LOGS_DIR)
 
     try:
         _log(f"=== Question processing started ===")
+        chunk_store = _get_shared_chunk_store()
 
 
         # Step 0: Embed whole user query
@@ -867,7 +976,7 @@ def process_question(qid: int, question_text: str, answers_file: Path):
 
         # Step 5: Gather chunks and rerank
         t5 = now_ms()
-        chunk_records = collect_chunks_for_triples(merged_triples)
+        chunk_records = collect_chunks_for_triples(merged_triples, chunk_store)
         _log(f"[Step 5] Collected {len(chunk_records)} chunk candidates (pre-rerank)")
         chunks_ranked = query_chunk_embeddings_from_neo4j(chunk_records, q_emb_query, top_k=MAX_CHUNKS_FINAL)
         t_step5 = dur_ms(t5)
