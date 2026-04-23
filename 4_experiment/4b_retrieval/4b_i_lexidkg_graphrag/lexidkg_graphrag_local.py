@@ -79,7 +79,12 @@ _bge_model = SentenceTransformer(LOCAL_EMBED_MODEL, trust_remote_code=True)
 _bge_lock = threading.Lock()  # BGE-M3 encode is NOT thread-safe
 
 # ----------------- Neo4j driver -----------------
-driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASS))
+driver = GraphDatabase.driver(
+    NEO4J_URI,
+    auth=(NEO4J_USER, NEO4J_PASS),
+    max_connection_pool_size=200,
+    connection_acquisition_timeout=120,
+)
 
 # ----------------- Shared state (per-process) -----------------
 # ChunkStore is built once per process and shared across all questions
@@ -686,20 +691,30 @@ def entity_centric_retrieval(
 def triple_centric_retrieval(query_triples: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[List[float]]]:
     triples_map: Dict[str, Dict[str, Any]] = {}
     q_trip_embs: List[List[float]] = []
-    for qt in query_triples:
-        txt = query_triple_to_text(qt)
-        emb = embed_text(txt)
-        q_trip_embs.append(emb)
 
-        matches = search_similar_triples_by_embedding(emb, k=QUERY_TRIPLE_MATCH_TOP_K_PER)
-        for m in matches:
-            uid = m.get("triple_uid")
-            if uid:
-                if uid not in triples_map:
-                    triples_map[uid] = m
-                else:
-                    if m.get("score", 0.0) > triples_map[uid].get("score", 0.0):
+    triple_texts = [query_triple_to_text(qt) for qt in query_triples]
+    if triple_texts:
+        with _bge_lock:
+            all_embs = _bge_model.encode(
+                triple_texts,
+                batch_size=len(triple_texts),
+                convert_to_numpy=True,
+                normalize_embeddings=False,
+                show_progress_bar=False
+            )
+        for qt, emb in zip(query_triples, all_embs):
+            emb_list = emb.tolist()
+            q_trip_embs.append(emb_list)
+
+            matches = search_similar_triples_by_embedding(emb_list, k=QUERY_TRIPLE_MATCH_TOP_K_PER)
+            for m in matches:
+                uid = m.get("triple_uid")
+                if uid:
+                    if uid not in triples_map:
                         triples_map[uid] = m
+                    else:
+                        if m.get("score", 0.0) > triples_map[uid].get("score", 0.0):
+                            triples_map[uid] = m
 
     merged = list(triples_map.values())
     _log(f"[TripleRetrieval] Collected {len(merged)} unique KG triples across {len(q_trip_embs)} query triple(s)")
