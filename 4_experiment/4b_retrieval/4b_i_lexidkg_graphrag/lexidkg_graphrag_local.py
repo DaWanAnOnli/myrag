@@ -914,7 +914,7 @@ def process_question(qid: int, question_text: str, answers_file: Path):
 
         # Build combined context text
         context_text, context_summary, _ = build_combined_context_text(triples_ranked, chunks_ranked)
-        _log(f"[Agent 2] Triples sent to LLM: {['{} [{}] {}'.format(x.get('subject'), x.get('predicate'), x.get('object')) for x in triples_ranked]}")
+        _log(f"[Agent 2] Triples sent to LLM: {['{} [{}] {}'.format(x.get('subject'), x.get('predicate'), x.get('object')) for x in triples_ranked[:5]]}")
 
         # Step 7: Agent 2 – Answer
         t7 = now_ms()
