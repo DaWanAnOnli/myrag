@@ -632,7 +632,6 @@ def mean_similarity_to_query_triples(triple_emb: Optional[List[float]], q_trip_e
 def entity_centric_retrieval(
     query_entities: List[Dict[str, Any]],
     q_trip_embs: List[List[float]],
-    q_emb_fallback: Optional[List[float]] = None
 ) -> Tuple[List[Dict[str, Any]], Dict[int, int]]:
     all_matched_keys: Set[str] = set()
     all_matched_ids: Set[str] = set()
@@ -668,9 +667,7 @@ def entity_centric_retrieval(
         emb = t.get("embedding")
         if q_trip_embs:
             return mean_similarity_to_query_triples(emb, q_trip_embs)
-        if q_emb_fallback and isinstance(emb, list):
-            return cos_sim(q_emb_fallback, emb)
-        return 0.0
+        raise RuntimeError("q_trip_embs is empty -- cannot score triples without query triple embeddings")
 
     ranked = sorted(expanded_triples, key=score, reverse=True)
     top = ranked[:SUBGRAPH_TRIPLES_TOP_K]
@@ -780,16 +777,13 @@ def query_chunk_embeddings_from_neo4j(
 def rerank_triples_by_query_triples(
     triples: List[Dict[str, Any]],
     q_trip_embs: List[List[float]],
-    q_emb_fallback: Optional[List[float]],
     top_k: int
 ) -> List[Dict[str, Any]]:
     def score(t: Dict[str, Any]) -> float:
         emb = t.get("embedding")
         if q_trip_embs:
             return mean_similarity_to_query_triples(emb, q_trip_embs)
-        if q_emb_fallback and isinstance(emb, list):
-            return cos_sim(q_emb_fallback, emb)
-        return 0.0
+        raise RuntimeError("q_trip_embs is empty -- cannot rerank triples without query triple embeddings")
     ranked = sorted(triples, key=score, reverse=True)
     return ranked[:top_k]
 
@@ -881,7 +875,7 @@ def process_question(qid: int, question_text: str, answers_file: Path):
 
         # Step 3: Entity-centric retrieval
         t3 = now_ms()
-        ctx1_triples, hop_counts = entity_centric_retrieval(ents, q_trip_embs=q_trip_embs, q_emb_fallback=q_emb_query)
+        ctx1_triples, hop_counts = entity_centric_retrieval(ents, q_trip_embs=q_trip_embs)
         t_step3 = dur_ms(t3)
         for hop_num, count in sorted(hop_counts.items()):
             _log(f"[Step 3] Entity-centric hop {hop_num}: {count} entities")
@@ -913,7 +907,7 @@ def process_question(qid: int, question_text: str, answers_file: Path):
         # Step 6: Rerank triples
         t6 = now_ms()
         triples_ranked = rerank_triples_by_query_triples(
-            merged_triples, q_trip_embs=q_trip_embs, q_emb_fallback=q_emb_query, top_k=MAX_TRIPLES_FINAL
+            merged_triples, q_trip_embs=q_trip_embs, top_k=MAX_TRIPLES_FINAL
         )
         t_step6 = dur_ms(t6)
         _log(f"[Step 6] Triple rerank | duration_ms={t_step6:.0f} | selected={len(triples_ranked)}")
