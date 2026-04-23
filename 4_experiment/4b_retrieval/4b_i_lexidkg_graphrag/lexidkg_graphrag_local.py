@@ -68,7 +68,6 @@ QUERY_TRIPLE_MATCH_TOP_K_PER = 20
 
 MAX_TRIPLES_FINAL = 30
 MAX_CHUNKS_FINAL = 20
-CHUNK_RERANK_CAND_LIMIT = 200
 
 ANSWER_MAX_TOKENS = 4096
 
@@ -576,7 +575,6 @@ class ChunkStore:
         self.root = root
         self.skip = skip
         self._index: Dict[Tuple[str, str], str] = {}
-        self._by_chunk: Dict[str, List[Tuple[str, str]]] = {}
         self._loaded_files: Set[Path] = set()
         self._built = False
         self._build_lock = Lock()
@@ -591,23 +589,23 @@ class ChunkStore:
             pkls = [p for p in self.root.glob("*.pkl") if p.name not in self.skip]
             total_chunks_indexed = 0
             for pkl in pkls:
-                try:
-                    with open(pkl, "rb") as f:
-                        chunks = pickle.load(f)
-                    loaded_count = 0
-                    for ch in chunks:
-                        meta = getattr(ch, "metadata", {}) if hasattr(ch, "metadata") else {}
-                        doc_id = _norm_id(meta.get("document_id"))
-                        chunk_id = _norm_id(meta.get("chunk_id"))
-                        text = getattr(ch, "page_content", None)
-                        if doc_id and chunk_id and isinstance(text, str):
-                            self._index[(doc_id, chunk_id)] = text
-                            self._by_chunk.setdefault(chunk_id, []).append((doc_id, chunk_id))
-                            loaded_count += 1
-                    self._loaded_files.add(pkl)
-                    total_chunks_indexed += loaded_count
-                except Exception:
-                    continue
+                with open(pkl, "rb") as f:
+                    chunks = pickle.load(f)
+                loaded_count = 0
+                for ch in chunks:
+                    meta = getattr(ch, "metadata", {}) if hasattr(ch, "metadata") else {}
+                    raw_doc_id = meta.get("document_id")
+                    raw_chunk_id = meta.get("chunk_id")
+                    if raw_doc_id is None or raw_chunk_id is None:
+                        continue
+                    doc_id = _norm_id(raw_doc_id)
+                    chunk_id = _norm_id(raw_chunk_id)
+                    text = getattr(ch, "page_content", None)
+                    if isinstance(text, str):
+                        self._index[(doc_id, chunk_id)] = text
+                        loaded_count += 1
+                self._loaded_files.add(pkl)
+                total_chunks_indexed += loaded_count
             elapsed = time.monotonic() - start
             _log(f"[ChunkStore] Indexed {total_chunks_indexed} chunks from {len(self._loaded_files)} files in {elapsed:.3f}s.")
             self._built = True
@@ -617,21 +615,7 @@ class ChunkStore:
             self._build_index()
         doc_id_s = _norm_id(document_id)
         chunk_id_s = _norm_id(chunk_id)
-        val = self._index.get((doc_id_s, chunk_id_s))
-        if val is not None:
-            return val
-        if "::" in chunk_id_s:
-            base_id = chunk_id_s.split("::", 1)[0]
-            val = self._index.get((doc_id_s, base_id))
-            if val is not None:
-                return val
-        matches = self._by_chunk.get(chunk_id_s)
-        if matches:
-            chosen_doc, chosen_chunk = matches[0]
-            val = self._index.get((chosen_doc, chosen_chunk))
-            if val is not None:
-                return val
-        return None
+        return self._index.get((doc_id_s, chunk_id_s))
 
 # ----------------- Scoring helpers -----------------
 def mean_similarity_to_query_triples(triple_emb: Optional[List[float]], q_trip_embs: List[List[float]]) -> float:
@@ -718,64 +702,46 @@ def triple_centric_retrieval(query_triples: List[Dict[str, Any]]) -> Tuple[List[
 def collect_chunks_for_triples(
     triples: List[Dict[str, Any]],
     chunk_store: ChunkStore
-) -> List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]]:
-    seen_pairs: Set[Tuple[Any, Any]] = set()
-    out: List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]] = []
+) -> List[Tuple[Tuple[str, str], str, Dict[str, Any]]]:
+    seen_pairs: Set[Tuple[str, str]] = set()
+    out: List[Tuple[Tuple[str, str], str, Dict[str, Any]]] = []
     for t in triples:
-        doc_id = t.get("document_id")
-        chunk_id = t.get("chunk_id")
-        if doc_id is None or chunk_id is None:
-            quote = t.get("evidence_quote")
-            if quote:
-                key = (t.get("triple_uid"), "quote")
-                if key not in seen_pairs:
-                    t["_is_quote_fallback"] = True
-                    out.append((key, quote, t))
-                    seen_pairs.add(key)
+        raw_doc_id = t.get("document_id")
+        raw_chunk_id = t.get("chunk_id")
+        if raw_doc_id is None or raw_chunk_id is None:
             continue
-        norm_key = (_norm_id(doc_id), _norm_id(chunk_id))
-        if norm_key in seen_pairs:
+        doc_id_s = _norm_id(raw_doc_id)
+        chunk_id_s = _norm_id(raw_chunk_id)
+        pair = (doc_id_s, chunk_id_s)
+        if pair in seen_pairs:
             continue
-        text = chunk_store.get_chunk(doc_id, chunk_id)
+        text = chunk_store.get_chunk(raw_doc_id, raw_chunk_id)
         if text:
-            t["_is_quote_fallback"] = False
-            out.append((norm_key, text, t))
-            seen_pairs.add(norm_key)
-        else:
-            quote = t.get("evidence_quote")
-            if quote:
-                key2 = (t.get("triple_uid"), "quote")
-                if key2 not in seen_pairs:
-                    t["_is_quote_fallback"] = True
-                    out.append((key2, quote, t))
-                    seen_pairs.add(key2)
+            out.append((pair, text, t))
+            seen_pairs.add(pair)
     return out
 
 def query_chunk_embeddings_from_neo4j(
-    chunk_records: List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]],
+    chunk_records: List[Tuple[Tuple[str, str], str, Dict[str, Any]]],
     q_emb_query: List[float],
     top_k: int
-) -> List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]]:
+) -> List[Tuple[Tuple[str, str], str, Dict[str, Any], float]]:
     """
     Score chunk candidates by cosine similarity to the query using Neo4j's
     chunk_embedding_index (pre-stored BGE-M3 embeddings, 1024-dim, unit-normalized).
-    Falls back to local embed_text() if the index is unavailable.
     """
     t0 = now_ms()
 
+    if not chunk_records:
+        raise RuntimeError("No chunk candidates available for reranking.")
+
     # Build lookup: (doc_id, chunk_id) -> (key, text, triple)
-    cand_lookup: Dict[Tuple[str, str], Tuple[Tuple[Any, Any], str, Dict[str, Any]]] = {}
+    cand_lookup: Dict[Tuple[str, str], Tuple[Tuple[str, str], str, Dict[str, Any]]] = {}
     for key, text, t in chunk_records:
-        if t.get("_is_quote_fallback"):
-            continue
         doc_id = _norm_id(t.get("document_id"))
         chunk_id = _norm_id(t.get("chunk_id"))
         if doc_id and chunk_id:
             cand_lookup[(doc_id, chunk_id)] = (key, text, t)
-
-    if not cand_lookup:
-        _log(f"[ChunkRerank] No non-fallback candidates, returning empty.")
-        return []
 
     # Normalize query so dot product == cosine similarity (stored chunks are unit vectors)
     q_emb_norm = normalize_vector(q_emb_query)
@@ -788,65 +754,20 @@ def query_chunk_embeddings_from_neo4j(
     ORDER BY score DESC
     LIMIT $k
     """
-    try:
-        rows = run_cypher_with_retry(cypher, {"k": top_k * 10, "q_emb": q_emb_norm})
-    except Exception as ex:
-        _log(f"[ChunkRerank] Vector index query failed: {ex}. Falling back to embed_text.")
-        return _rerank_chunks_by_query_legacy(chunk_records, q_emb_query, top_k)
+    rows = run_cypher_with_retry(cypher, {"k": top_k * 10, "q_emb": q_emb_norm})
 
     # Match index results back to our candidates
-    scored: List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]] = []
-    scored_keys: Set[Tuple[Any, Any]] = set()
+    scored: List[Tuple[Tuple[str, str], str, Dict[str, Any], float]] = []
     for row in rows:
         doc_id = _norm_id(row.get("doc_id"))
         chunk_id = _norm_id(row.get("chunk_id"))
         if (doc_id, chunk_id) in cand_lookup:
             key, text, t = cand_lookup[(doc_id, chunk_id)]
             scored.append((key, text, t, float(row.get("vec_score", 0.0))))
-            scored_keys.add(key)
-
-    # Supplement with any remaining candidates via embed_text fallback
-    remaining = [
-        c for c in chunk_records
-        if not c[2].get("_is_quote_fallback") and c[0] not in scored_keys
-    ]
-    for key, text, t in remaining[:CHUNK_RERANK_CAND_LIMIT - len(scored)]:
-        try:
-            emb = embed_text(text)
-            emb_norm = normalize_vector(emb)
-            s = sum(q * e for q, e in zip(q_emb_norm, emb_norm))
-            scored.append((key, text, t, s))
-        except Exception as ex:
-            _log(f"[ChunkRerank] Embed fallback failed for {key}: {ex}")
-            continue
 
     scored.sort(key=lambda x: x[3], reverse=True)
     took = dur_ms(t0)
     _log(f"[ChunkRerank] Scored {len(scored)} candidates in {took:.0f} ms | picked top {min(top_k, len(scored))}")
-    return scored[:top_k]
-
-
-def _rerank_chunks_by_query_legacy(
-    chunk_records: List[Tuple[Tuple[Any, Any], str, Dict[str, Any]]],
-    q_emb_query: List[float],
-    top_k: int
-) -> List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]]:
-    """
-    Fallback: embed each chunk locally and compute cosine similarity.
-    Used when the Neo4j chunk_embedding_index is unavailable.
-    """
-    q_emb_norm = normalize_vector(q_emb_query)
-    scored = []
-    for key, text, t in chunk_records[:CHUNK_RERANK_CAND_LIMIT]:
-        try:
-            emb = embed_text(text)
-            emb_norm = normalize_vector(emb)
-            s = sum(q * e for q, e in zip(q_emb_norm, emb_norm))
-            scored.append((key, text, t, s))
-        except Exception as ex:
-            _log(f"[ChunkRerank] Embed failed for {key}: {ex}")
-            continue
-    scored.sort(key=lambda x: x[3], reverse=True)
     return scored[:top_k]
 
 
@@ -868,7 +789,7 @@ def rerank_triples_by_query_triples(
 
 def build_combined_context_text(
     triples_ranked: List[Dict[str, Any]],
-    chunks_ranked: List[Tuple[Tuple[Any, Any], str, Dict[str, Any], float]]
+    chunks_ranked: List[Tuple[Tuple[str, str], str, Dict[str, Any], float]]
 ) -> Tuple[str, str, List[Dict[str, Any]]]:
     summary_lines = []
     summary_lines.append("Ringkasan triple yang relevan:")
@@ -885,8 +806,7 @@ def build_combined_context_text(
         doc_id = t.get("document_id")
         chunk_id = t.get("chunk_id")
         uu = t.get("uu_number") or ""
-        fb = " | quote-fallback" if t.get("_is_quote_fallback") else ""
-        lines.append(f"[Chunk {idx}] doc={doc_id} chunk={chunk_id} | {uu} | score={score:.3f}{fb}\n{text}")
+        lines.append(f"[Chunk {idx}] doc={doc_id} chunk={chunk_id} | {uu} | score={score:.3f}\n{text}")
     context = "\n".join(lines)
     chunk_records = [{"key": key, "text": text, "triple": t, "score": score} for key, text, t, score in chunks_ranked]
     return context, summary_text, chunk_records
