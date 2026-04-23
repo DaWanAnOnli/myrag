@@ -727,15 +727,16 @@ def query_chunk_embeddings_from_neo4j(
     top_k: int
 ) -> List[Tuple[Tuple[str, str], str, Dict[str, Any], float]]:
     """
-    Score chunk candidates by cosine similarity to the query using Neo4j's
-    chunk_embedding_index (pre-stored BGE-M3 embeddings, 1024-dim, unit-normalized).
+    Retrieve each chunk's stored embedding from Neo4j TextChunk nodes by
+    (document_id, chunk_id), score by cosine similarity to the query embedding,
+    and return the top K most similar chunks.
     """
     t0 = now_ms()
 
     if not chunk_records:
         raise RuntimeError("No chunk candidates available for reranking.")
 
-    # Build lookup: (doc_id, chunk_id) -> (key, text, triple)
+    # Build candidate lookup: (doc_id, chunk_id) -> (key, text, triple)
     cand_lookup: Dict[Tuple[str, str], Tuple[Tuple[str, str], str, Dict[str, Any]]] = {}
     for key, text, t in chunk_records:
         doc_id = _norm_id(t.get("document_id"))
@@ -743,28 +744,33 @@ def query_chunk_embeddings_from_neo4j(
         if doc_id and chunk_id:
             cand_lookup[(doc_id, chunk_id)] = (key, text, t)
 
-    # Normalize query so dot product == cosine similarity (stored chunks are unit vectors)
+    if not cand_lookup:
+        raise RuntimeError("No valid (doc_id, chunk_id) pairs found in chunk candidates.")
+
+    # Batch-retrieve embeddings for all candidate chunks from Neo4j
+    cypher = """
+    UNWIND $pairs AS item
+    MATCH (c:TextChunk {document_id: item.doc_id, chunk_id: item.chunk_id})
+    RETURN item.doc_id AS doc_id, item.chunk_id AS chunk_id, c.embedding AS embedding
+    """
+    pairs = [{"doc_id": doc_id, "chunk_id": chunk_id} for (doc_id, chunk_id) in cand_lookup.keys()]
+    rows = run_cypher_with_retry(cypher, {"pairs": pairs})
+
+    # Normalize query embedding once (stored embeddings are unit-normalized)
     q_emb_norm = normalize_vector(q_emb_query)
 
-    # Query vector index with safety margin on k
-    cypher = """
-    CALL db.index.vector.queryNodes('chunk_embedding_index', $k, $q_emb)
-    YIELD node AS c, score
-    RETURN c.document_id AS doc_id, c.chunk_id AS chunk_id, score AS vec_score
-    ORDER BY score DESC
-    LIMIT $k
-    """
-    rows = run_cypher_with_retry(cypher, {"k": top_k * 10, "q_emb": q_emb_norm})
-
-    # Match index results back to our candidates
+    # Score each chunk by cosine similarity to query
     scored: List[Tuple[Tuple[str, str], str, Dict[str, Any], float]] = []
     for row in rows:
         doc_id = _norm_id(row.get("doc_id"))
         chunk_id = _norm_id(row.get("chunk_id"))
-        if (doc_id, chunk_id) in cand_lookup:
+        emb = row.get("embedding")
+        if (doc_id, chunk_id) in cand_lookup and emb:
             key, text, t = cand_lookup[(doc_id, chunk_id)]
-            scored.append((key, text, t, float(row.get("vec_score", 0.0))))
+            score = cos_sim(q_emb_norm, emb)
+            scored.append((key, text, t, score))
 
+    # Sort by similarity score descending, return top K
     scored.sort(key=lambda x: x[3], reverse=True)
     took = dur_ms(t0)
     _log(f"[ChunkRerank] Scored {len(scored)} candidates in {took:.0f} ms | picked top {min(top_k, len(scored))}")
@@ -900,8 +906,8 @@ def process_question(qid: int, question_text: str, answers_file: Path):
         _log(f"[Step 5] Collected {len(chunk_records)} chunk candidates (pre-rerank)")
         chunks_ranked = query_chunk_embeddings_from_neo4j(chunk_records, q_emb_query, top_k=MAX_CHUNKS_FINAL)
         t_step5 = dur_ms(t5)
-        chunk_ids_sent = [str(k[1]) for k, _, _ in chunk_records]
         _log(f"[Step 5] Chunk rerank | duration_ms={t_step5:.0f} | selected={len(chunks_ranked)}")
+        chunk_ids_sent = [str(k[0][1]) for k in chunks_ranked]
         _log(f"[Agent 2] Chunk IDs sent to LLM: {chunk_ids_sent}")
 
         # Step 6: Rerank triples
