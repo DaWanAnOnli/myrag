@@ -25,7 +25,7 @@ NEO4J_PASS = os.getenv("NEO4J_PASS", "password")
 
 # Neo4j retry/timeout controls
 NEO4J_TX_TIMEOUT_S = float(os.getenv("NEO4J_TX_TIMEOUT_S", "60"))
-NEO4J_MAX_ATTEMPTS = int(os.getenv("NEO4J_MAX_ATTEMPTS", "100000"))
+NEO4J_MAX_ATTEMPTS = int(os.getenv("NEO4J_MAX_ATTEMPTS", "5"))
 
 # LM Studio LLM (local)
 LMSTUDIO_BASE_URL = os.getenv("LMSTUDIO_BASE_URL", "http://localhost:1234/v1")
@@ -414,7 +414,7 @@ def run_cypher_with_retry(cypher: str, params: Dict[str, Any]) -> List[Any]:
             last_e = e
             if attempts >= NEO4J_MAX_ATTEMPTS:
                 break
-            wait_s = random.uniform(5, 10)
+            wait_s = min(10.0, 0.5 * (2.0 ** (attempts - 1))) + random.uniform(0, 1)
             time.sleep(wait_s)
     raise RuntimeError(f"Neo4j query failed after {NEO4J_MAX_ATTEMPTS} attempts (qid={qid}): {last_e}")
 
@@ -636,17 +636,26 @@ def entity_centric_retrieval(
     all_matched_keys: Set[str] = set()
     all_matched_ids: Set[str] = set()
 
-    for e in query_entities:
-        text = (e.get("text") or "").strip()
-        if not text:
-            continue
-        e_emb = embed_text(text)
-        matches = search_similar_entities_by_embedding(e_emb, k=ENTITY_MATCH_TOP_K)
-        keys = [m.get("key") for m in matches if m.get("key")]
-        ids  = [m.get("elem_id") for m in matches if m.get("elem_id")]
-        all_matched_keys.update(keys)
-        all_matched_ids.update(ids)
-        _log(f"[EntityRetrieval] '{text}' -> matched {len(keys)} KG keys")
+    # Batch-embed all entity texts in one lock hold
+    entity_texts = [e.get("text", "").strip() for e in query_entities]
+    entity_texts = [t for t in entity_texts if t]
+    if entity_texts:
+        with _bge_lock:
+            all_embs = _bge_model.encode(
+                entity_texts,
+                batch_size=len(entity_texts),
+                convert_to_numpy=True,
+                normalize_embeddings=False,
+                show_progress_bar=False
+            )
+        for text, e_emb in zip(entity_texts, all_embs):
+            e_emb_list = e_emb.tolist()
+            matches = search_similar_entities_by_embedding(e_emb_list, k=ENTITY_MATCH_TOP_K)
+            keys = [m.get("key") for m in matches if m.get("key")]
+            ids  = [m.get("elem_id") for m in matches if m.get("elem_id")]
+            all_matched_keys.update(keys)
+            all_matched_ids.update(ids)
+            _log(f"[EntityRetrieval] '{text}' -> matched {len(keys)} KG keys")
 
     if not (all_matched_keys or all_matched_ids):
         _log("[EntityRetrieval] No KG entity matches found.")
